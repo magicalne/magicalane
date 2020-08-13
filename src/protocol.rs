@@ -165,7 +165,6 @@ fn protocol_encode_test() {
     buf.put_u8(0);
     buf.put_slice(b"pw0\0localhost\0");
     buf.put_u16(2345);
-    buf.put_u8(b'\0');
     buf.put_slice(b"111");
     assert_eq!(vec, buf);
 }
@@ -176,7 +175,6 @@ fn protocol_parser_test() {
     buf.put_u8(0);
     buf.put_slice(b"pwd\0localhost\0");
     buf.put_u16(23456);
-    buf.put_u8(b'\0');
     buf.put_slice(b"asdfadsfadfadsf");
 
     let result = Protocol::parse(&buf);

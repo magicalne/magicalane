@@ -3,8 +3,7 @@ use tracing::Level;
 use tracing::log::info;
 // use tracing_futures::Instrument as _;
 use std::path::PathBuf;
-use lib::server::MLEServerConfig;
-use lib::client::MLEClientConfig;
+use lib::{server::MLEServerConfig, client::MLEClientConfig};
 use anyhow::Result;
 
 #[derive(StructOpt, Debug)]
@@ -50,7 +49,7 @@ async fn main() -> Result<()> {
             let file_appender = tracing_appender::rolling::hourly(".", "magicalane-client.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
             let subscriber = tracing_subscriber::fmt()
-                .with_max_level(Level::TRACE)
+                .with_max_level(Level::DEBUG)
                 .with_writer(non_blocking)
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
@@ -62,7 +61,7 @@ async fn main() -> Result<()> {
             let file_appender = tracing_appender::rolling::hourly(".", "magicalane-server.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
             let subscriber = tracing_subscriber::fmt()
-                .with_max_level(Level::TRACE)
+                .with_max_level(Level::DEBUG)
                 .with_writer(non_blocking)
                 .finish();
             tracing::subscriber::set_global_default(subscriber)

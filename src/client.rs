@@ -96,26 +96,27 @@ async fn http_tunnel(upgraded: Upgraded, host: String, port: u16, config: MLECli
     -> Result<()> {
     // Connect to remote server
     let password = config.password.clone();
-    let (mut server_wr, mut server_rd) = quic_conn(config).await?;
-    let protocol = Protocol::new(Kind::TCP, password, host, port, None);
-    let buf = protocol.encode()?;
-    debug!("quic protocol: {:?}", &buf.to_vec());
-    server_wr.write(&buf).await?;
+
     // Proxying data
     let amounts = {
         let (mut client_rd, mut client_wr) = tokio::io::split(upgraded);
         let mut buf = Vec::with_capacity(1024);
         let n = client_rd.read_buf(&mut buf).await?;
         debug!("read from client: {:?} len: {:?}", String::from_utf8_lossy(&buf[..n]), n);
-        server_wr.write(&buf[..n]).await;
+
+        let (mut proxy_wr, mut proxy_rd) = quic_conn(config).await?;
+        let protocol = Protocol::new(Kind::TCP, password, host, port, Some(buf[0..n].to_owned()));
+        buf = protocol.encode()?.to_vec();
+        debug!("quic protocol: {:?}", &buf.to_vec());
+        proxy_wr.write(&buf).await?;
         debug!("send to proxy server");
         buf.clear();
-        let n = server_rd.read_buf(&mut buf).await?;
+        let n = proxy_rd.read_buf(&mut buf).await?;
         debug!("read from proxy {} bytes", n);
         client_wr.write_all(&mut buf[..n]).await?;
         debug!("write back to client");
-        let client_to_server = tokio::io::copy(&mut client_rd, &mut server_wr);
-        let server_to_client = tokio::io::copy(&mut server_rd, &mut client_wr);
+        let client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
+        let server_to_client = tokio::io::copy(&mut proxy_rd, &mut client_wr);
 
         try_join(client_to_server, server_to_client).await
     };

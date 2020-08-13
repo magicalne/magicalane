@@ -1,3 +1,6 @@
+mod proxy;
+mod application;
+mod transport;
 pub mod client;
 pub mod server;
 pub mod error;

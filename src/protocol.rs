@@ -15,6 +15,7 @@ use nom::{
 use tracing::error;
 use crate::error::MagicalaneError;
 use nom::error::{ErrorKind, ParseError};
+use std::net::{ToSocketAddrs, SocketAddr};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -49,6 +50,7 @@ impl Protocol {
             payload,
         }
     }
+
     pub fn encode(&self) -> Result<BytesMut> {
         let mut bytes = BytesMut::new();
         bytes.put_u8(match self.kind {
@@ -66,6 +68,7 @@ impl Protocol {
         }
         Ok(bytes)
     }
+
     pub fn parse(i: &[u8]) -> Result<Self, MagicalaneError> {
         match protocol_parser(&i) {
             Ok((_, Protocol)) => {
@@ -78,6 +81,13 @@ impl Protocol {
         }
     }
 
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        let uri = format!("{}:{}", self.host.as_ref().unwrap().clone(), self.port);
+        if let Ok(mut socket) = uri.to_socket_addrs() {
+            return socket.next()
+        }
+        None
+    }
 }
 
 fn parse_kind(i: &[u8]) -> Result<Kind, MagicalaneError> {
@@ -107,7 +117,7 @@ fn protocol_parser(i: &[u8]) -> IResult<&[u8], Protocol> {
             Err(MagicalaneError::ParsePasswordFail)
     });
     let (i, o) = terminated(
-        take_while(|c| is_alphanumeric(c) || c == b'.'),
+        take_while(|c| is_alphanumeric(c) || c == b'.' || c == b'-'),
         tag(split)
     )(i)?;
     let host = String::from_utf8(o.to_vec())

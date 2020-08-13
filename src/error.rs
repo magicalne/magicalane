@@ -27,5 +27,7 @@ pub enum MagicalaneError {
     #[error("Parse port failed.")]
     ParsePortFail,
     #[error("Parse error")]
-    ParseError
+    ParseError,
+    #[error("Poll from server lost error.")]
+    PollServerDriverLostError
 }

@@ -4,29 +4,33 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+
 use anyhow::{anyhow, bail, Context as context1, Result};
-use tracing::{error, info, debug, info_span};
-use tracing_futures::Instrument;
-
-use quinn_proto::{PrivateKey, CertificateChain};
-use quinn::generic::ServerConfig;
-use quinn_proto::crypto::rustls::TlsSession;
 use futures_util::future::try_join;
-
-use crate::ALPN_QUIC;
-use std::net::{Ipv4Addr, IpAddr, ToSocketAddrs};
+use futures_util::TryFutureExt;
 use quinn::{Endpoint, Incoming};
-use tokio::stream::{StreamExt};
+use quinn::generic::ServerConfig;
+use quinn_proto::{CertificateChain, PrivateKey};
+use quinn_proto::crypto::rustls::TlsSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use futures_util::TryFutureExt;
-use crate::protocol::{Protocol, Kind};
+use tokio::stream::StreamExt;
+use tracing::{debug, error, info, info_span};
+use tracing_futures::Instrument;
+
+use crate::ALPN_QUIC;
 use crate::error::MagicalaneError;
+use crate::protocol::{Kind, Protocol};
+use futures_core::Future;
+use futures::task::{Context, Poll};
+use bytes::BytesMut;
+use std::pin::Pin;
 
 pub struct Server {
     config: MLEServerConfig,
     endpoint: Endpoint,
-    incoming: Incoming
+    incoming: Incoming,
 }
 
 impl Server {
@@ -112,12 +116,12 @@ async fn proxy(
                     let _ = server_wr.write_all(&payload).await?;
                     debug!("send payload to remote");
                 }
-                let mut buf = Vec::with_capacity(102400);
-                let n = server_rd.read_buf(&mut buf).await?;
-                debug!("read from remote: {:?} len: {:?}", String::from_utf8_lossy(&buf[..n]), n);
-                send.write_all(&buf[..n]).await;
-                send.flush().await?;
-                debug!("write back to client");
+                // let mut buf = Vec::with_capacity(102400);
+                // let n = server_rd.read_buf(&mut buf).await?;
+                // debug!("read from remote: {:?} len: {:?}", String::from_utf8_lossy(&buf[..n]), n);
+                // send.write_all(&buf[..n]).await;
+                // send.flush().await?;
+                // debug!("write back to client");
 
                 let client_to_server = tokio::io::copy(&mut recv, &mut server_wr);
                 let server_to_client = tokio::io::copy(&mut server_rd, &mut send);
@@ -133,10 +137,10 @@ async fn proxy(
                         error!("tunnel error: {}", e);
                     }
                 };
-            },
+            }
             Ok(Kind::UDP) => {
                 unimplemented!()
-            },
+            }
             _ => {}
         }
     }
@@ -144,20 +148,46 @@ async fn proxy(
     Ok(())
 }
 
+struct ProxyTunnelConnecting<I1, O1, I2, O2>
+    where I1: AsyncReadExt,
+          O1: AsyncWriteExt,
+          I2: AsyncReadExt,
+          O2: AsyncWriteExt,
+{
+    i1: I1,
+    o1: O1,
+    i2: I2,
+    o2: O2,
+    buf: BytesMut
+}
+
+impl <I1, O1, I2, O2> Future for ProxyTunnelConnecting<I1, O1, I2, O2>
+    where I1: AsyncReadExt,
+          O1: AsyncWriteExt,
+          I2: AsyncReadExt,
+          O2: AsyncWriteExt,
+{
+    type Output = u64;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        unimplemented!()
+    }
+}
+
 pub struct MLEServerConfig {
     port: u16,
     password: String,
-    quinn_server_conf: ServerConfig<TlsSession>
+    quinn_server_conf: ServerConfig<TlsSession>,
 }
 
 impl MLEServerConfig {
     pub fn new(port: u16, password: String, cert: Option<PathBuf>, key: Option<PathBuf>)
-        -> Result<Self> {
+               -> Result<Self> {
         let quinn_server_conf = config(cert, key)?;
         Ok(MLEServerConfig {
             port,
             password,
-            quinn_server_conf
+            quinn_server_conf,
         })
     }
 
@@ -174,7 +204,7 @@ impl MLEServerConfig {
         Ok(Server {
             config: self,
             endpoint,
-            incoming
+            incoming,
         })
     }
 }

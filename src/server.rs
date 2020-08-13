@@ -251,7 +251,8 @@ fn generate_key_and_cert() -> Result<(Vec<u8>, Vec<u8>)> {
 fn load_private_key(key_path: PathBuf) -> Result<PrivateKey> {
     info!("Loading private key.");
     let key = fs::read(&key_path).context("failed to read private key")?;
-    let key = if key_path.extension().map_or(false, |x| x == "der") {
+    let key = if key_path.extension()
+        .map_or(false, |x| x == "der" || x == "key") {
         quinn::PrivateKey::from_der(&key)?
     } else {
         quinn::PrivateKey::from_pem(&key)?
@@ -262,10 +263,12 @@ fn load_private_key(key_path: PathBuf) -> Result<PrivateKey> {
 fn load_private_cert(cert_path: PathBuf) -> Result<CertificateChain> {
     info!("Loading private cert.");
     let cert_chain = fs::read(&cert_path).context("failed to read certificate chain")?;
-    let cert_chain = if cert_path.extension().map_or(false, |x| x == "der") {
+    let cert_chain = if cert_path.extension()
+        .map_or(false, |x| x == "der" || x == "crt") {
         quinn::CertificateChain::from_certs(quinn::Certificate::from_der(&cert_chain))
     } else {
         quinn::CertificateChain::from_pem(&cert_chain)?
     };
     Ok(cert_chain)
 }
+

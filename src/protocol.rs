@@ -71,9 +71,9 @@ impl Protocol {
 
     pub fn parse(i: &[u8]) -> Result<Self, MagicalaneError> {
         match protocol_parser(&i) {
-            Ok((_, Protocol)) => {
-                Ok(Protocol)
-            },
+            Ok((_, protocol)) => {
+                Ok(protocol)
+            }
             Err(err) => {
                 error!("parse error: {:?}", err);
                 Err(MagicalaneError::ParseError)

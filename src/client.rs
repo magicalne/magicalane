@@ -20,25 +20,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 type HttpClient = Client<hyper::client::HttpConnector>;
 
 pub struct MLEClient {
-    config: MLEClientConfig,
+    client_config: MLEClientConfig,
+    quic_config: ClientConfig<TlsSession>
 }
 
 impl MLEClient {
     pub async fn run(&self) -> Result<()> {
-        run(self.config.clone()).await
+        run(self.client_config.clone(), self.quic_config.clone()).await
     }
 }
 
-async fn run(config: MLEClientConfig) -> Result<()> {
+async fn run(config: MLEClientConfig, quic_config: ClientConfig<TlsSession>) -> Result<()> {
     //http proxy
     let addr = SocketAddr::from(([127, 0, 0, 1], config.http_proxy_port));
     let http_client = HttpClient::new();
     let make_service = make_service_fn(move |_| {
         let client = http_client.clone();
         let config = config.clone();
+        let quic_config = quic_config.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |req|
-                http_proxy(client.clone(), req, config.clone())))
+                http_proxy(client.clone(), req, config.clone(), quic_config.clone())))
         }
     });
     let http_proxy_server = Server::bind(&addr).serve(make_service);
@@ -49,7 +51,11 @@ async fn run(config: MLEClientConfig) -> Result<()> {
     Ok(())
 }
 
-async fn http_proxy(client: HttpClient, req: Request<Body>, config: MLEClientConfig)
+async fn http_proxy(
+    client: HttpClient,
+    req: Request<Body>,
+    config: MLEClientConfig,
+    quic_config: ClientConfig<TlsSession>)
     -> Result<Response<Body>, hyper::Error> {
     info!("req: {:?}", req);
     if Method::CONNECT == req.method() {
@@ -76,7 +82,8 @@ async fn http_proxy(client: HttpClient, req: Request<Body>, config: MLEClientCon
                         upgraded,
                         host,
                         port,
-                        config
+                        config,
+                        quic_config
                     ).await {
                         error!("server io error: {}", e);
                     };
@@ -92,7 +99,13 @@ async fn http_proxy(client: HttpClient, req: Request<Body>, config: MLEClientCon
 
 // Create a TCP connection to host:port, build a tunnel between the connection and
 // the upgraded connection
-async fn http_tunnel(upgraded: Upgraded, host: String, port: u16, config: MLEClientConfig)
+async fn http_tunnel(
+    upgraded: Upgraded,
+    host: String,
+    port: u16,
+    config: MLEClientConfig,
+    quic_config: ClientConfig<TlsSession>
+)
     -> Result<()> {
     // Connect to remote server
     let password = config.password.clone();
@@ -104,7 +117,7 @@ async fn http_tunnel(upgraded: Upgraded, host: String, port: u16, config: MLECli
         let n = client_rd.read_buf(&mut buf).await?;
         debug!("read from client: {:?} len: {:?}", String::from_utf8_lossy(&buf[..n]), n);
 
-        let (mut proxy_wr, mut proxy_rd) = quic_conn(config).await?;
+        let (mut proxy_wr, mut proxy_rd) = quic_conn(config, quic_config).await?;
         let protocol = Protocol::new(Kind::TCP, password, host, port, Some(buf[0..n].to_owned()));
         buf = protocol.encode()?.to_vec();
         debug!("quic protocol: {:?}", &buf.to_vec());
@@ -136,21 +149,21 @@ async fn http_tunnel(upgraded: Upgraded, host: String, port: u16, config: MLECli
     Ok(())
 }
 
-async fn quic_conn(config: MLEClientConfig)
+async fn quic_conn(config: MLEClientConfig, quic_config: ClientConfig<TlsSession>)
                    -> Result<(SendStream<TlsSession>, RecvStream<TlsSession>)> {
-    // let remote = (config.server_host.as_str(), config.server_port)
-    //     .to_socket_addrs()?
-    //     .next()
-    //     .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
-    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+    let remote = (config.server_host.as_str(), config.server_port)
+        .to_socket_addrs()?
+        .filter(|add| add.is_ipv4())
+        .next()
+        .ok_or_else(|| anyhow!("couldn't resolve to an address"))?;
     debug!("client connect to remote addr: {:?}", &remote);
     let mut endpoint = quinn::Endpoint::builder();
-    endpoint.default_client_config(quic_config(config.local)?);
+    endpoint.default_client_config(quic_config);
     debug!("quic client config finished.");
     let (endpoint, _) = endpoint.bind(&"[::]:0".parse().unwrap())?;
     debug!("client bind local endpoint");
     let new_conn = endpoint
-        .connect(&remote, "localhost")?
+        .connect(&remote, config.server_host.as_str())?
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     debug!("client create a new connection");
@@ -190,9 +203,11 @@ impl MLEClientConfig {
         })
     }
 
-    pub fn client(self) -> Result<MLEClient> {
+    pub fn build(self) -> Result<MLEClient> {
+        let quic_config = quic_config(self.local)?;
         Ok(MLEClient {
-            config: self,
+            client_config: self,
+            quic_config
         })
     }
 }
@@ -229,4 +244,13 @@ fn quic_config(local: bool) -> Result<ClientConfig<TlsSession>> {
         }
     }
     Ok(client_config.build())
+}
+
+#[test]
+fn test() -> Result<()>{
+    let remote = ("localhost", 12345)
+        .to_socket_addrs()?.filter(|add| add.is_ipv4()).next();
+    dbg!(&remote);
+
+    Ok(())
 }

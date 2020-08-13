@@ -35,9 +35,8 @@ pub struct Server {
 
 impl Server {
     pub async fn run(&mut self) -> Result<()> {
-        info!("in loop");
         while let Some(conn) = self.incoming.next().await {
-            info!("connection incoming");
+            debug!("connection incoming");
             tokio::spawn(
                 handle_connection(conn).unwrap_or_else(move |e| {
                     error!("connection failed: {reason}", reason = e.to_string())
@@ -116,12 +115,6 @@ async fn proxy(
                     let _ = server_wr.write_all(&payload).await?;
                     debug!("send payload to remote");
                 }
-                // let mut buf = Vec::with_capacity(102400);
-                // let n = server_rd.read_buf(&mut buf).await?;
-                // debug!("read from remote: {:?} len: {:?}", String::from_utf8_lossy(&buf[..n]), n);
-                // send.write_all(&buf[..n]).await;
-                // send.flush().await?;
-                // debug!("write back to client");
 
                 let client_to_server = tokio::io::copy(&mut recv, &mut server_wr);
                 let server_to_client = tokio::io::copy(&mut server_rd, &mut send);
@@ -147,32 +140,31 @@ async fn proxy(
     info!("complete");
     Ok(())
 }
-
-struct ProxyTunnelConnecting<I1, O1, I2, O2>
-    where I1: AsyncReadExt,
-          O1: AsyncWriteExt,
-          I2: AsyncReadExt,
-          O2: AsyncWriteExt,
-{
-    i1: I1,
-    o1: O1,
-    i2: I2,
-    o2: O2,
-    buf: BytesMut
-}
-
-impl <I1, O1, I2, O2> Future for ProxyTunnelConnecting<I1, O1, I2, O2>
-    where I1: AsyncReadExt,
-          O1: AsyncWriteExt,
-          I2: AsyncReadExt,
-          O2: AsyncWriteExt,
-{
-    type Output = u64;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unimplemented!()
-    }
-}
+//
+// struct ProxyTunnelConnecting<I1, O1, I2, O2>
+//     where I1: AsyncReadExt,
+//           O1: AsyncWriteExt,
+//           I2: AsyncReadExt,
+//           O2: AsyncWriteExt,
+// {
+//     i1: I1,
+//     o1: O1,
+//     i2: I2,
+//     o2: O2,
+// }
+//
+// impl <I1, O1, I2, O2> Future for ProxyTunnelConnecting<I1, O1, I2, O2>
+//     where I1: AsyncReadExt,
+//           O1: AsyncWriteExt,
+//           I2: AsyncReadExt,
+//           O2: AsyncWriteExt,
+// {
+//     type Output = u64;
+//
+//     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         unimplemented!()
+//     }
+// }
 
 pub struct MLEServerConfig {
     port: u16,

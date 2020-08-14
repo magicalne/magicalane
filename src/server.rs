@@ -189,7 +189,7 @@ impl MLEServerConfig {
         endpoint.listen(config);
 
         let port = self.port;
-        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
         let (endpoint, incoming) = endpoint.bind(&socket)?;
         info!("listening on {}", endpoint.local_addr()?);
 
@@ -252,7 +252,7 @@ fn load_private_key(key_path: PathBuf) -> Result<PrivateKey> {
     info!("Loading private key.");
     let key = fs::read(&key_path).context("failed to read private key")?;
     let key = if key_path.extension()
-        .map_or(false, |x| x == "der" || x == "key") {
+        .map_or(false, |x| x == "der") {
         quinn::PrivateKey::from_der(&key)?
     } else {
         quinn::PrivateKey::from_pem(&key)?
@@ -271,4 +271,3 @@ fn load_private_cert(cert_path: PathBuf) -> Result<CertificateChain> {
     };
     Ok(cert_chain)
 }
-

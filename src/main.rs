@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
             password,
             local,
             verbose } => {
-            let file_appender = tracing_appender::rolling::hourly(".", "magicalane-client.log");
+            let file_appender = tracing_appender::rolling::hourly("./log", "magicalane-client.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(is_verbose(verbose))
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
             ca,
             key,
             verbose } => {
-            let file_appender = tracing_appender::rolling::hourly(".", "magicalane-server.log");
+            let file_appender = tracing_appender::rolling::hourly("./log", "magicalane-server.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
             let subscriber = tracing_subscriber::fmt()
                 .with_max_level(is_verbose(verbose))
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 
 fn is_verbose(verbose: bool) -> Level {
     return if verbose {
-        Level::DEBUG
+        Level::TRACE
     } else {
         Level::ERROR
     }

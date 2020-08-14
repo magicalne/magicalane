@@ -1,4 +1,4 @@
 /target
 /.idea
-*log*
+/log
 magicalane.iml

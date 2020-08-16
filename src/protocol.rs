@@ -1,20 +1,14 @@
-use std::io::Cursor;
-
-use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{BytesMut, BufMut};
 use anyhow::Result;
 use nom::{
-    Err::Error as NomError,
     IResult,
     sequence::terminated,
     character::is_alphanumeric,
     number::complete::be_u16,
-    combinator::map_res,
     bytes::complete::{tag, take, take_while},
 };
 use tracing::error;
 use crate::error::MagicalaneError;
-use nom::error::{ErrorKind, ParseError};
 use std::net::{ToSocketAddrs, SocketAddr};
 
 #[derive(Debug, Eq, PartialEq)]

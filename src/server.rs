@@ -20,12 +20,7 @@ use tracing::{debug, error, info, info_span};
 use tracing_futures::Instrument;
 
 use crate::ALPN_QUIC;
-use crate::error::MagicalaneError;
 use crate::protocol::{Kind, Protocol};
-use futures_core::Future;
-use futures::task::{Context, Poll};
-use bytes::BytesMut;
-use std::pin::Pin;
 
 pub struct Server {
     config: MLEServerConfig,

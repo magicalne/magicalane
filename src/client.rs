@@ -11,13 +11,14 @@ use futures_util::future::try_join;
 use hyper::{Body, Client, Method, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
+use quinn::Endpoint;
 use quinn::generic::{ClientConfig, RecvStream, SendStream};
 use quinn_proto::crypto::rustls::TlsSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, info};
 
 use crate::protocol::{Kind, Protocol};
-use quinn::Endpoint;
+use crate::copy;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -134,7 +135,7 @@ async fn http_tunnel(
         let (mut client_rd, mut client_wr) = tokio::io::split(upgraded);
         let mut buf = Vec::with_capacity(1024);
         let n = client_rd.read_buf(&mut buf).await?;
-        debug!("read from client: {:?} len: {:?}", String::from_utf8_lossy(&buf[..n]), n);
+        debug!("read from client {:?} bytes", n);
 
         let (mut proxy_wr, mut proxy_rd) = run_quic_conn(endpoint, socket_addr, server_host).await?;
         let protocol = Protocol::new(Kind::TCP, password, host, port, Some(buf[0..n].to_owned()));
@@ -147,9 +148,10 @@ async fn http_tunnel(
         debug!("read from proxy {} bytes", n);
         client_wr.write_all(&mut buf[..n]).await?;
         debug!("write back to client");
-        let client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
-        let server_to_client = tokio::io::copy(&mut proxy_rd, &mut client_wr);
-
+        // let mut client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
+        // let server_to_client = tokio::io::copy(&mut proxy_rd, &mut client_wr);
+        let client_to_server = copy(&mut client_rd, &mut proxy_wr);
+        let server_to_client = copy(&mut proxy_rd, &mut client_wr);
         try_join(client_to_server, server_to_client).await
     };
 
@@ -162,7 +164,7 @@ async fn http_tunnel(
             );
         }
         Err(e) => {
-            info!("tunnel error: {}", e);
+            error!("tunnel error: {}", e);
         }
     };
     Ok(())
@@ -269,4 +271,18 @@ fn quic_config(local: bool) -> Result<ClientConfig<TlsSession>> {
         }
     }
     Ok(client_config.build())
+}
+
+#[tokio::test]
+async fn test() -> Result<()> {
+    let buf = b"hello";
+    let mut reader: Vec<u8> = Vec::with_capacity(204800);
+    while reader.len() < 204800 {
+        reader.push(b'a');
+    }
+    let mut writer: Vec<u8> = vec![];
+
+    let x = tokio::io::copy(&mut reader, &mut writer).await?;
+    println!(x);
+    Ok(())
 }

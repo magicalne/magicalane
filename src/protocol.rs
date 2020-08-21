@@ -111,7 +111,7 @@ fn protocol_parser(i: &[u8]) -> IResult<&[u8], Protocol> {
             Err(MagicalaneError::ParsePasswordFail)
     });
     let (i, o) = terminated(
-        take_while(|c| is_alphanumeric(c) || c == b'.' || c == b'-'),
+        take_while(|c| is_alphanumeric(c) || c == b'.' || c == b'-' || c == b'_'),
         tag(split)
     )(i)?;
     let host = String::from_utf8(o.to_vec())

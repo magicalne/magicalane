@@ -92,6 +92,6 @@ fn is_verbose(verbose: bool) -> Level {
     return if verbose {
         Level::TRACE
     } else {
-        Level::ERROR
+        Level::INFO
     }
 }

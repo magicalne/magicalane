@@ -16,10 +16,10 @@ use quinn_proto::crypto::rustls::TlsSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::stream::StreamExt;
-use tracing::{debug, error, info, info_span};
+use tracing::{debug, error, warn, info, info_span};
 use tracing_futures::Instrument;
 
-use crate::ALPN_QUIC;
+use crate::{ALPN_QUIC, copy};
 use crate::protocol::{Kind, Protocol};
 
 pub struct Server {
@@ -111,8 +111,10 @@ async fn proxy(
                     debug!("send payload to remote");
                 }
 
-                let client_to_server = tokio::io::copy(&mut recv, &mut server_wr);
-                let server_to_client = tokio::io::copy(&mut server_rd, &mut send);
+                // let client_to_server = tokio::io::copy(&mut recv, &mut server_wr);
+                // let server_to_client = tokio::io::copy(&mut server_rd, &mut send);
+                let client_to_server = copy(&mut recv, &mut server_wr);
+                let server_to_client = copy(&mut server_rd, &mut send);
                 let amounts = try_join(client_to_server, server_to_client).await;
                 match amounts {
                     Ok((from_client, from_server)) => {
@@ -122,7 +124,7 @@ async fn proxy(
                         );
                     }
                     Err(e) => {
-                        error!("tunnel error: {}", e);
+                        warn!("tunnel error: {}", e);
                     }
                 };
             }

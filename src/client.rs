@@ -272,17 +272,3 @@ fn quic_config(local: bool) -> Result<ClientConfig<TlsSession>> {
     }
     Ok(client_config.build())
 }
-
-#[tokio::test]
-async fn test() -> Result<()> {
-    let buf = b"hello";
-    let mut reader: Vec<u8> = Vec::with_capacity(204800);
-    while reader.len() < 204800 {
-        reader.push(b'a');
-    }
-    let mut writer: Vec<u8> = vec![];
-
-    let x = tokio::io::copy(&mut reader, &mut writer).await?;
-    println!(x);
-    Ok(())
-}

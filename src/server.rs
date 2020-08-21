@@ -111,10 +111,10 @@ async fn proxy(
                     debug!("send payload to remote");
                 }
 
-                // let client_to_server = tokio::io::copy(&mut recv, &mut server_wr);
-                // let server_to_client = tokio::io::copy(&mut server_rd, &mut send);
-                let client_to_server = copy(&mut recv, &mut server_wr);
-                let server_to_client = copy(&mut server_rd, &mut send);
+                let client_to_server = tokio::io::copy(&mut recv, &mut server_wr);
+                let server_to_client = tokio::io::copy(&mut server_rd, &mut send);
+                // let client_to_server = copy(&mut recv, &mut server_wr);
+                // let server_to_client = copy(&mut server_rd, &mut send);
                 let amounts = try_join(client_to_server, server_to_client).await;
                 match amounts {
                     Ok((from_client, from_server)) => {

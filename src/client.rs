@@ -148,10 +148,10 @@ async fn http_tunnel(
         debug!("read from proxy {} bytes", n);
         client_wr.write_all(&mut buf[..n]).await?;
         debug!("write back to client");
-        // let mut client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
-        // let server_to_client = tokio::io::copy(&mut proxy_rd, &mut client_wr);
-        let client_to_server = copy(&mut client_rd, &mut proxy_wr);
-        let server_to_client = copy(&mut proxy_rd, &mut client_wr);
+        let mut client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
+        let server_to_client = tokio::io::copy(&mut proxy_rd, &mut client_wr);
+        // let client_to_server = copy(&mut client_rd, &mut proxy_wr);
+        // let server_to_client = copy(&mut proxy_rd, &mut client_wr);
         try_join(client_to_server, server_to_client).await
     };
 

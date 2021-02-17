@@ -1,6 +1,7 @@
+use rcgen::RcgenError;
 use thiserror::Error;
 
-#[derive(Error, Debug, Eq, PartialEq)]
+#[derive(Error, Debug)]
 pub enum MagicalaneError {
     /// Server down
     #[error("Server is down.")]
@@ -29,5 +30,17 @@ pub enum MagicalaneError {
     #[error("Parse error")]
     ParseError,
     #[error("Poll from server lost error.")]
-    PollServerDriverLostError
+    PollServerDriverLostError,
+    #[error("io error: {0}")]
+    IoError(std::io::Error),
+    #[error("generate key or cert error: {0}")]
+    RcgenError(#[from] RcgenError)
 }
+
+impl From<std::io::Error> for MagicalaneError {
+    fn from(v: std::io::Error) -> Self {
+        MagicalaneError::IoError(v)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, MagicalaneError>;

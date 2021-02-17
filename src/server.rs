@@ -7,6 +7,7 @@ use std::{
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 
 use anyhow::{anyhow, bail, Context as context1, Result};
+use futures::StreamExt;
 use futures_util::future::try_join;
 use futures_util::TryFutureExt;
 use quinn::{Endpoint, Incoming};
@@ -96,13 +97,13 @@ async fn proxy(
     let protocol = Protocol::parse(&buf)?;
     debug!("receive protocol: {:?}", &protocol);
     //TODO check pwd
-    let uri = format!("{}:{}", &protocol.host?, protocol.port);
+    let uri = format!("{}:{}", &protocol.host, protocol.port);
     debug!("send request to remote: {:?}, len: {:?}", &uri, uri.len());
     let mut socket = uri.to_socket_addrs()?;
     if let Some(addr) = socket.next() {
         debug!("remote address: {:?}", &addr);
         match protocol.kind {
-            Ok(Kind::TCP) => {
+            Kind::TCP => {
                 let mut server = TcpStream::connect(addr).await?;
                 debug!("connect to remote TCP");
                 let (mut server_rd, mut server_wr) = server.split();
@@ -128,7 +129,7 @@ async fn proxy(
                     }
                 };
             }
-            Ok(Kind::UDP) => {
+            Kind::UDP => {
                 unimplemented!()
             }
             _ => {}

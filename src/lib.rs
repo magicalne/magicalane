@@ -1,92 +1,39 @@
-use tokio::io::{AsyncRead, AsyncWrite};
-use futures::ready;
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tracing::{debug, error, info};
+use std::{fs, path::PathBuf};
 
-pub mod client;
-pub mod server;
 pub mod error;
 pub mod protocol;
+pub mod quic;
 
 pub const ALPN_QUIC: &[&[u8]] = &[b"hq-29"];
 
-#[derive(Debug)]
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Copy<'a, R: ?Sized, W: ?Sized> {
-    reader: &'a mut R,
-    read_done: bool,
-    writer: &'a mut W,
-    pos: usize,
-    cap: usize,
-    amt: u64,
-    buf: Box<[u8]>,
+pub fn generate_key_and_cert_der() -> error::Result<(PathBuf, PathBuf)> {
+    let dirs = directories::ProjectDirs::from("org", "tls", "examples").unwrap();
+    let path = dirs.data_local_dir();
+    let cert_path = path.join("cert.der");
+    let key_path = path.join("key.der");
+    if !cert_path.exists() || !key_path.exists() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = cert.serialize_private_key_der();
+        let cert = cert.serialize_der()?;
+        fs::create_dir_all(&path)?;
+        fs::write(&cert_path, &cert)?;
+        fs::write(&key_path, &key)?;
+    }
+    Ok((key_path, cert_path))
 }
 
-pub fn copy<'a, R, W>(reader: &'a mut R, writer: &'a mut W) -> Copy<'a, R, W>
-    where
-        R: AsyncRead + Unpin + ?Sized,
-        W: AsyncWrite + Unpin + ?Sized,
-{
-    Copy {
-        reader,
-        read_done: false,
-        writer,
-        amt: 0,
-        pos: 0,
-        cap: 0,
-        buf: vec![0; 204800].into_boxed_slice(),
+pub fn generate_key_and_cert_pem() -> error::Result<(PathBuf, PathBuf)> {
+    let dirs = directories::ProjectDirs::from("org", "tls", "examples").unwrap();
+    let path = dirs.data_local_dir();
+    let cert_path = path.join("cert.pem");
+    let key_path = path.join("key.pem");
+    if !cert_path.exists() || !key_path.exists() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = cert.serialize_private_key_pem();
+        let cert = cert.serialize_pem()?;
+        fs::create_dir_all(&path)?;
+        fs::write(&cert_path, &cert)?;
+        fs::write(&key_path, &key)?;
     }
-}
-
-impl<R, W> Future for Copy<'_, R, W>
-    where
-        R: AsyncRead + Unpin + ?Sized,
-        W: AsyncWrite + Unpin + ?Sized,
-{
-    type Output = io::Result<u64>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        loop {
-            // If our buffer is empty, then we need to read some data to
-            // continue.
-            if self.pos == self.cap && !self.read_done {
-                let me = &mut *self;
-                let n = ready!(Pin::new(&mut *me.reader).poll_read(cx, &mut me.buf))?;
-                if n == 0 {
-                    self.read_done = true;
-                } else {
-                    self.pos = 0;
-                    self.cap = n;
-                    // info!("read {:?} bytes", n);
-                }
-            }
-
-            // If our buffer has some data, let's write it out!
-            while self.pos < self.cap {
-                let me = &mut *self;
-                let i = ready!(Pin::new(&mut *me.writer).poll_write(cx, &me.buf[me.pos..me.cap]))?;
-                if i == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero byte into writer",
-                    )));
-                } else {
-                    self.pos += i;
-                    self.amt += i as u64;
-                    // info!("write {:?} bytes, total amount: {:?}, bytes", i, self.amt);
-                }
-            }
-
-            // If we've written all the data and we've seen EOF, flush out the
-            // data and finish the transfer.
-            if self.pos == self.cap && self.read_done {
-                let me = &mut *self;
-                ready!(Pin::new(&mut *me.writer).poll_flush(cx))?;
-                return Poll::Ready(Ok(self.amt));
-            }
-        }
-    }
+    Ok((key_path, cert_path))
 }

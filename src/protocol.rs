@@ -17,15 +17,16 @@ pub enum Kind {
     TCP,
     //1
     UDP,
+    Error
 }
 
 const SPLIT: u8 = b'\0';
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Protocol {
-    pub kind: Result<Kind, MagicalaneError>,
-    pub password: Result<String, MagicalaneError>,
-    pub host: Result<String, MagicalaneError>,
+    pub kind: Kind,
+    pub password: String,
+    pub host: String,
     pub port: u16,
     pub payload: Option<Vec<u8>>,
 }
@@ -37,9 +38,9 @@ impl Protocol {
                port: u16,
                payload: Option<Vec<u8>>) -> Self {
         Protocol {
-            kind: Ok(kind),
-            password: Ok(password),
-            host: Ok(host),
+            kind,
+            password,
+            host,
             port,
             payload,
         }
@@ -48,13 +49,13 @@ impl Protocol {
     pub fn encode(&self) -> Result<BytesMut> {
         let mut bytes = BytesMut::new();
         bytes.put_u8(match self.kind {
-            Ok(Kind::TCP) => 0u8,
-            Ok(Kind::UDP) => 1u8,
+            Kind::TCP => 0u8,
+            Kind::UDP => 1u8,
             _ => 2u8
         });
-        bytes.put_slice(self.password.as_ref().unwrap().clone().as_bytes());
+        bytes.put_slice(self.password.clone().as_bytes());
         bytes.put_u8(SPLIT);
-        bytes.put_slice(self.host.as_ref().unwrap().clone().as_bytes());
+        bytes.put_slice(self.host.clone().as_bytes());
         bytes.put_u8(SPLIT);
         bytes.put_u16(self.port);
         if self.payload.is_some() {
@@ -76,7 +77,7 @@ impl Protocol {
     }
 
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        let uri = format!("{}:{}", self.host.as_ref().unwrap().clone(), self.port);
+        let uri = format!("{}:{}", self.host.clone(), self.port);
         if let Ok(mut socket) = uri.to_socket_addrs() {
             return socket.next()
         }
@@ -84,40 +85,29 @@ impl Protocol {
     }
 }
 
-fn parse_kind(i: &[u8]) -> Result<Kind, MagicalaneError> {
+fn parse_kind(i: &[u8]) -> Kind {
     match i.first() {
         Some(0u8) => {
-            Ok(Kind::TCP)
+            Kind::TCP
         }
         Some(1u8) => {
-            Ok(Kind::UDP)
-        }
-        Some(_) => {
-            Err(MagicalaneError::WrongProtocol)
-        }
-        None => {
-            Err(MagicalaneError::EmptyBuffer)
-        }
+            Kind::UDP
+        },
+        _ => Kind::Error
     }
 }
 
 fn protocol_parser(i: &[u8]) -> IResult<&[u8], Protocol> {
-    let (i,o) = take(1usize)(i)?;
+    let (i, o) = take(1usize)(i)?;
     let kind = parse_kind(o);
     let split = b"\0";
     let (i, o) = terminated(take_while(is_alphanumeric), tag(split))(i)?;
-    let password = String::from_utf8(o.to_vec())
-        .or_else(|_| -> Result<String, MagicalaneError> {
-            Err(MagicalaneError::ParsePasswordFail)
-    });
+    let password = String::from_utf8(o.to_vec()).expect("parse password failed");
     let (i, o) = terminated(
         take_while(|c| is_alphanumeric(c) || c == b'.' || c == b'-' || c == b'_'),
         tag(split)
     )(i)?;
-    let host = String::from_utf8(o.to_vec())
-        .or_else(|_| -> Result<String, MagicalaneError> {
-            Err(MagicalaneError::ParseHostFail)
-    });
+    let host = String::from_utf8(o.to_vec()).expect("parse host failed");
 
     let (i, o) = take(2usize)(i)?;
     let (_, port) = be_u16(o)?;
@@ -173,9 +163,9 @@ fn protocol_parser_test() {
 
     let result = Protocol::parse(&buf);
     let expect = Protocol {
-        kind: Ok(Kind::TCP),
-        password: Ok("pwd".to_string()),
-        host: Ok("localhost".to_string()),
+        kind: Kind::TCP,
+        password: "pwd".to_string(),
+        host: "localhost".to_string(),
         port: 23456,
         payload: Some(b"asdfadsfadfadsf".to_vec()),
     };

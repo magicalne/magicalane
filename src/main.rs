@@ -5,8 +5,6 @@ use anyhow::Result;
 use structopt::StructOpt;
 use tracing::Level;
 
-use lib::{client::MLEClientConfig, server::MLEServerConfig};
-
 #[derive(StructOpt, Debug)]
 enum Mode {
     Client {},
@@ -46,7 +44,6 @@ enum Opt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-
     let opt: Opt = Opt::from_args();
     match opt {
         Opt::Client {
@@ -64,8 +61,6 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
-            MLEClientConfig::new(server_host, server_port, http_proxy_port, password, local)?
-                .build()?.run().await?
         },
         Opt::Server {
             port,
@@ -81,8 +76,6 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
-            MLEServerConfig::new(port, password, ca, key)?
-                .server()?.run().await?
         },
     }
     Ok(())

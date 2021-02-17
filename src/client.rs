@@ -15,8 +15,11 @@ use quinn::Endpoint;
 use quinn::generic::{ClientConfig, RecvStream, SendStream};
 use quinn_proto::crypto::rustls::TlsSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info};
-
+use tracing::{debug, error, info, warn};
+use nix::sys::socket;
+use nix::sys::socket::sockopt::SndBuf;
+use nix::sys::socket::sockopt::RcvBuf;
+use std::os::unix::io::AsRawFd;
 use crate::protocol::{Kind, Protocol};
 use crate::copy;
 
@@ -42,7 +45,7 @@ async fn run(config: MLEClientConfig, quic_config: ClientConfig<TlsSession>) -> 
     let make_service = make_service_fn(move |_| {
         let client = http_client.clone();
         let endpoint = endpoint.clone();
-        let socket_addr = socket_addr.clone();
+        let socket_addr = socket_addr;
         let server_host = config.server_host.clone();
         let password = config.password.clone();
         async move {
@@ -146,9 +149,9 @@ async fn http_tunnel(
         buf.clear();
         let n = proxy_rd.read_buf(&mut buf).await?;
         debug!("read from proxy {} bytes", n);
-        client_wr.write_all(&mut buf[..n]).await?;
+        client_wr.write_all(&buf[..n]).await?;
         debug!("write back to client");
-        let mut client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
+        let client_to_server = tokio::io::copy(&mut client_rd, &mut proxy_wr);
         let server_to_client = tokio::io::copy(&mut proxy_rd, &mut client_wr);
         // let client_to_server = copy(&mut client_rd, &mut proxy_wr);
         // let server_to_client = copy(&mut proxy_rd, &mut client_wr);
@@ -164,7 +167,7 @@ async fn http_tunnel(
             );
         }
         Err(e) => {
-            error!("tunnel error: {}", e);
+            warn!("tunnel error: {}", e);
         }
     };
     Ok(())
@@ -229,7 +232,21 @@ fn make_client_endpoint(server_host: &str, server_port: u16, quic_config: Client
     let mut endpoint = quinn::Endpoint::builder();
     endpoint.default_client_config(quic_config);
     debug!("quic client config finished.");
-    let (endpoint, _) = endpoint.bind(&"[::]:0".parse().unwrap())?;
+    let socket = std::net::UdpSocket::bind("[::]:0")
+        .map_err(|_| anyhow!("couldn't bind to udp"))?;
+    let fd = socket.as_raw_fd();
+    let recv_buf_size = socket::getsockopt(fd, RcvBuf)?;
+    let send_buf_size = socket::getsockopt(fd, SndBuf)?;
+    println!("RcvBuf: {:?}, SndBuf: {:?}", recv_buf_size, send_buf_size);
+    let buf_size = 50 * 1024 * 1024 as usize;
+    socket::setsockopt(fd, RcvBuf, &(buf_size))
+        .expect("setsockopt for RcvBuf failed");
+    let recv_buf_size = socket::getsockopt(fd, RcvBuf)?;
+    let send_buf_size = socket::getsockopt(fd, SndBuf)?;
+    socket::setsockopt(fd, SndBuf, &(buf_size))
+        .expect("setsockopt for SndBuf failed");
+    println!("now RcvBuf: {:?}, SndBuf: {:?}", recv_buf_size, send_buf_size);
+    let (endpoint, _) = endpoint.with_socket(socket)?;
     debug!("client bind local endpoint");
     Ok((endpoint, remote))
 }

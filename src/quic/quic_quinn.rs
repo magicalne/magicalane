@@ -45,7 +45,7 @@ impl<B: Buf, S: Session> super::SendStream<B> for SendStream<B, S> {
         self.stream
             .finish()
             .poll_unpin(cx)
-            .map_err(|err| super::QuicError::QuinnWriteError(err))
+            .map_err(super::QuicError::QuinnWriteError)
     }
 
     fn reset(&mut self, reset_code: u64) {
@@ -205,9 +205,9 @@ where
     fn poll_accept_bidi_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<super::Result<Option<Self::BidiStream>>> {
+    ) -> Poll<super::Result<Self::BidiStream>> {
         match ready!(self.connection.bi_streams.poll_next_unpin(cx)) {
-            Some(Ok((send, recv))) => Poll::Ready(Ok(Some(BidiStream::new(send, recv)))),
+            Some(Ok((send, recv))) => Poll::Ready(Ok(BidiStream::new(send, recv))),
             Some(Err(err)) => Poll::Ready(Err(super::QuicError::QuinnConnectionError(err))),
             None => Poll::Pending,
         }
@@ -223,10 +223,10 @@ where
     fn poll_open_bidi_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<super::Result<Option<Self::BidiStream>>> {
+    ) -> Poll<super::Result<Self::BidiStream>> {
         let mut open = self.connection.connection.open_bi();
         match ready!(open.poll_unpin(cx)) {
-            Ok((send, recv)) => Poll::Ready(Ok(Some(BidiStream::new(send, recv)))),
+            Ok((send, recv)) => Poll::Ready(Ok(BidiStream::new(send, recv))),
             Err(err) => Poll::Ready(Err(super::QuicError::QuinnConnectionError(err))),
         }
     }

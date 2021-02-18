@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, task::{Context, Poll}};
+use std::{path::PathBuf, task::{Context, Poll}};
 
 use bytes::Buf;
 use thiserror::Error;
@@ -61,10 +61,10 @@ pub trait BidiStream<B: Buf>: SendStream<B> + RecvStream {
 pub trait Connection<B: Buf> {
     type SendStream: SendStream<B>;
     type RecvStream: RecvStream;
-    type BidiStream: SendStream<B> + RecvStream;
+    type BidiStream: BidiStream<B>;
 
-    fn poll_accept_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::BidiStream>>>;
+    fn poll_accept_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream>>;
     fn poll_accept_recv_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::RecvStream>>>;
-    fn poll_open_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::BidiStream>>>;
+    fn poll_open_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream>>;
     fn poll_open_send_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::SendStream>>>;
 }

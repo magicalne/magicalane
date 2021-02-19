@@ -1,4 +1,4 @@
-use quinn::ParseError;
+use quinn::{ParseError, crypto::rustls::TLSError};
 use rcgen::RcgenError;
 use thiserror::Error;
 
@@ -42,6 +42,8 @@ pub enum MagicalaneError {
     QuinnEndpointError(#[from] quinn::EndpointError),
     #[error("Quinn connection error: {0}")]
     QuinnConnectionError(#[from] quinn::ConnectionError),
+    #[error("TLSError: {0}")]
+    TLSError(#[from] TLSError),
 }
 
 impl From<std::io::Error> for MagicalaneError {

@@ -1,7 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::{Path, PathBuf}};
 
 use bytes::Bytes;
 use futures::future;
+use quinn::{CertificateChain, PrivateKey};
 
 pub mod error;
 pub mod protocol;
@@ -42,6 +43,28 @@ pub fn generate_key_and_cert_pem() -> error::Result<(PathBuf, PathBuf)> {
     Ok((key_path, cert_path))
 }
 
+fn load_private_key(key_path: PathBuf) -> error::Result<PrivateKey> {
+    let key = fs::read(&key_path)?;
+    let key = if key_path.extension()
+        .map_or(false, |x| x == "der") {
+        quinn::PrivateKey::from_der(&key)?
+    } else {
+        quinn::PrivateKey::from_pem(&key)?
+    };
+    Ok(key)
+}
+
+fn load_private_cert(cert_path: PathBuf) -> error::Result<CertificateChain> {
+    let cert_chain = fs::read(&cert_path)?;
+    let cert_chain = if cert_path.extension()
+        .map_or(false, |x| x == "der" || x == "crt") {
+        quinn::CertificateChain::from_certs(quinn::Certificate::from_der(&cert_chain))
+    } else {
+        quinn::CertificateChain::from_pem(&cert_chain)?
+    };
+    Ok(cert_chain)
+}
+
 pub struct Connection<C: quic::Connection<Bytes>> {
     connection: C
 }
@@ -73,7 +96,7 @@ pub struct ConnectionStream<S> {
 impl<S: quic::BidiStream<Bytes>> ConnectionStream<S> {
     pub fn new(stream: S) -> Self {
         Self {
-            stream
+           stream 
         }
     }
 }

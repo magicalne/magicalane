@@ -3,7 +3,7 @@ use std::{path::PathBuf, task::{Context, Poll}};
 use bytes::Buf;
 use thiserror::Error;
 
-mod quic_quinn;
+pub mod quic_quinn;
 
 pub enum KeyPemPair {
     Empty,
@@ -30,8 +30,6 @@ pub enum QuicError {
     QuinnConnectingError(#[from] quinn::ConnectError),
     #[error("Quinn connection error: {0}")]
     QuinnConnectionError(#[from] quinn::ConnectionError),
-    #[error("Quinn endpoint error: {0}")]
-    QuinnEndpointError(#[from] quinn::EndpointError),
 }
 
 pub type Result<T> = std::result::Result<T, QuicError>;

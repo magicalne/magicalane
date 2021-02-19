@@ -27,7 +27,7 @@ impl<B: Buf, S: Session> SendStream<B, S> {
 impl<B: Buf, S: Session> super::SendStream<B> for SendStream<B, S> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<()>> {
         if let Some(ref mut data) = self.writing {
-            ready!(self.stream.write_all(data.chunk()).poll_unpin(cx));
+            ready!(self.stream.write_all(data.chunk()).poll_unpin(cx))?;
         }
         self.writing = None;
         Poll::Ready(Ok(()))

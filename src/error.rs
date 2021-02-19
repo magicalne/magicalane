@@ -1,3 +1,4 @@
+use quinn::ParseError;
 use rcgen::RcgenError;
 use thiserror::Error;
 
@@ -33,8 +34,14 @@ pub enum MagicalaneError {
     PollServerDriverLostError,
     #[error("io error: {0}")]
     IoError(std::io::Error),
-    #[error("generate key or cert error: {0}")]
-    RcgenError(#[from] RcgenError)
+    #[error("Generate key or cert error: {0}")]
+    RcgenError(#[from] RcgenError),
+    #[error("Parse key or cert error: {0}")]
+    CertParseError(#[from] ParseError),
+    #[error("Quinn endpoint error: {0}")]
+    QuinnEndpointError(#[from] quinn::EndpointError),
+    #[error("Quinn connection error: {0}")]
+    QuinnConnectionError(#[from] quinn::ConnectionError),
 }
 
 impl From<std::io::Error> for MagicalaneError {

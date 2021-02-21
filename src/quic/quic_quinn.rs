@@ -3,12 +3,14 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures::{ready, FutureExt, StreamExt};
 use quinn::{
     crypto::Session,
     VarInt,
 };
+
+use crate::error::{Error, Result};
 
 pub struct SendStream<B: Buf, S: Session> {
     stream: quinn::generic::SendStream<S>,
@@ -25,7 +27,7 @@ impl<B: Buf, S: Session> SendStream<B, S> {
 }
 
 impl<B: Buf, S: Session> super::SendStream<B> for SendStream<B, S> {
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<()>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if let Some(ref mut data) = self.writing {
             ready!(self.stream.write_all(data.chunk()).poll_unpin(cx))?;
         }
@@ -33,19 +35,19 @@ impl<B: Buf, S: Session> super::SendStream<B> for SendStream<B, S> {
         Poll::Ready(Ok(()))
     }
 
-    fn send_data(&mut self, data: B) -> super::Result<()> {
+    fn send_data(&mut self, data: B) -> Result<()> {
         if self.writing.is_some() {
-            return Err(super::QuicError::SendStreamNotReadyError);
+            return Err(Error::SendStreamNotReadyError);
         }
         self.writing = Some(data);
         Ok(())
     }
 
-    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<()>> {
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.stream
             .finish()
             .poll_unpin(cx)
-            .map_err(super::QuicError::QuinnWriteError)
+            .map_err(Error::QuinnWriteError)
     }
 
     fn reset(&mut self, reset_code: u64) {
@@ -76,17 +78,11 @@ impl<S: Session> RecvStream<S> {
 const READ_BUF_SIZE: usize = 1024 * 4;
 
 impl<S: Session> super::RecvStream for RecvStream<S> {
-    type Buf = Bytes;
-
-    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<Option<Self::Buf>>> {
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<usize>>> {
         self.buf.resize(READ_BUF_SIZE, 0);
         match self.stream.read(&mut self.buf).poll_unpin(cx) {
-            Poll::Ready(Ok(Some(n))) => {
-                let buf = self.buf.split_to(n).freeze();
-                Poll::Ready(Ok(Some(buf)))
-            }
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(None)),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(super::QuicError::QuinnReadError(err))),
+            Poll::Ready(Ok(op)) => Poll::Ready(Ok(op)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(Error::QuinnReadError(err))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -123,15 +119,15 @@ where
     B: Buf,
     S: Session,
 {
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<()>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.send.poll_ready(cx)
     }
 
-    fn send_data(&mut self, data: B) -> super::Result<()> {
+    fn send_data(&mut self, data: B) -> Result<()> {
         self.send.send_data(data)
     }
 
-    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<()>> {
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.send.poll_finish(cx)
     }
 
@@ -149,9 +145,8 @@ where
     B: Buf,
     S: Session,
 {
-    type Buf = Bytes;
 
-    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<super::Result<Option<Self::Buf>>> {
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<usize>>> {
         self.recv.poll_data(cx)
     }
 
@@ -205,10 +200,10 @@ where
     fn poll_accept_bidi_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<super::Result<Self::BidiStream>> {
+    ) -> Poll<Result<Self::BidiStream>> {
         match ready!(self.connection.bi_streams.poll_next_unpin(cx)) {
             Some(Ok((send, recv))) => Poll::Ready(Ok(BidiStream::new(send, recv))),
-            Some(Err(err)) => Poll::Ready(Err(super::QuicError::QuinnConnectionError(err))),
+            Some(Err(err)) => Poll::Ready(Err(Error::QuinnConnectionError(err))),
             None => Poll::Pending,
         }
     }
@@ -216,25 +211,25 @@ where
     fn poll_accept_recv_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<super::Result<Option<Self::RecvStream>>> {
+    ) -> Poll<Result<Option<Self::RecvStream>>> {
         todo!()
     }
 
     fn poll_open_bidi_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<super::Result<Self::BidiStream>> {
+    ) -> Poll<Result<Self::BidiStream>> {
         let mut open = self.connection.connection.open_bi();
         match ready!(open.poll_unpin(cx)) {
             Ok((send, recv)) => Poll::Ready(Ok(BidiStream::new(send, recv))),
-            Err(err) => Poll::Ready(Err(super::QuicError::QuinnConnectionError(err))),
+            Err(err) => Poll::Ready(Err(Error::QuinnConnectionError(err))),
         }
     }
 
     fn poll_open_send_stream(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<super::Result<Option<Self::SendStream>>> {
+    ) -> Poll<Result<Option<Self::SendStream>>> {
         todo!()
     }
 }

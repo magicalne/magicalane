@@ -5,7 +5,8 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt;
-use quinn::{Endpoint, ServerConfig, crypto::rustls::TlsSession};
+use quinn::{Endpoint, ServerConfig, crypto::rustls::TlsSession, generic::NewConnection};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
     generate_key_and_cert_der, load_private_cert, load_private_key, quic::quic_quinn::Connection,
@@ -38,7 +39,7 @@ impl QuinnServer {
             let conn = conn.await?;
             let conn: Connection<Bytes, TlsSession> = Connection::new(conn);
             let mut conn = crate::Connection::new(conn);
-            conn.accept().await;
+            let stream = conn.accept().await;
         }
         Ok(())
     }

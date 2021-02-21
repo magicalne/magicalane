@@ -8,7 +8,7 @@ use nom::{
     bytes::complete::{tag, take, take_while},
 };
 use tracing::error;
-use crate::error::MagicalaneError;
+use crate::error::Error;
 use std::net::{ToSocketAddrs, SocketAddr};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -64,14 +64,14 @@ impl Protocol {
         Ok(bytes)
     }
 
-    pub fn parse(i: &[u8]) -> Result<Self, MagicalaneError> {
+    pub fn parse(i: &[u8]) -> Result<Self, Error> {
         match protocol_parser(&i) {
             Ok((_, protocol)) => {
                 Ok(protocol)
             }
             Err(err) => {
                 error!("parse error: {:?}", err);
-                Err(MagicalaneError::ParseError)
+                Err(Error::ParseError)
             },
         }
     }

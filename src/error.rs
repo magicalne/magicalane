@@ -3,7 +3,7 @@ use rcgen::RcgenError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum MagicalaneError {
+pub enum Error {
     /// Server down
     #[error("Server is down.")]
     ServerDown,
@@ -30,26 +30,39 @@ pub enum MagicalaneError {
     ParsePortFail,
     #[error("Parse error")]
     ParseError,
+    #[error("Known protocol kind")]
+    UnknowProtocolKindErrlr,
     #[error("Poll from server lost error.")]
     PollServerDriverLostError,
     #[error("io error: {0}")]
-    IoError(std::io::Error),
+    IoError(#[from] std::io::Error),
     #[error("Generate key or cert error: {0}")]
     RcgenError(#[from] RcgenError),
     #[error("Parse key or cert error: {0}")]
     CertParseError(#[from] ParseError),
-    #[error("Quinn endpoint error: {0}")]
-    QuinnEndpointError(#[from] quinn::EndpointError),
-    #[error("Quinn connection error: {0}")]
-    QuinnConnectionError(#[from] quinn::ConnectionError),
     #[error("TLSError: {0}")]
     TLSError(#[from] TLSError),
+
+    #[error("Send stream error.")]
+    SendStreamError,
+    #[error("Send stream is not ready")]
+    SendStreamNotReadyError,
+    #[error("Empty remote address")]
+    EmptyRemoteAddrError,
+    #[error("Not binded")]
+    NotBindedError,
+    #[error("Not connected")]
+    NotConnectedError,
+    #[error("Quinn read error: {0}")]
+    QuinnReadError(#[from] quinn::ReadError),
+    #[error("Quinn write error: {0}")]
+    QuinnWriteError(#[from] quinn::WriteError),
+    #[error("Quinn endpoint error: {0}")]
+    QuinnEndpointError(#[from] quinn::EndpointError),
+    #[error("Quinn connect error: {0}")]
+    QuinnConnectingError(#[from] quinn::ConnectError),
+    #[error("Quinn connection error: {0}")]
+    QuinnConnectionError(#[from] quinn::ConnectionError),
 }
 
-impl From<std::io::Error> for MagicalaneError {
-    fn from(v: std::io::Error) -> Self {
-        MagicalaneError::IoError(v)
-    }
-}
-
-pub type Result<T> = std::result::Result<T, MagicalaneError>;
+pub type Result<T> = std::result::Result<T, Error>;

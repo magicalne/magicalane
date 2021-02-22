@@ -3,7 +3,7 @@ use std::{fs, future::Future, path::PathBuf, task::Poll};
 use bytes::{Buf, Bytes, BytesMut};
 use error::{Error, Result};
 use futures::{future, ready, FutureExt};
-use quic::RecvStream;
+use stream::RecvStream;
 use quinn::{CertificateChain, PrivateKey};
 
 use protocol::Protocol;
@@ -12,8 +12,8 @@ use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, net::{TcpStream, UdpSocke
 pub mod error;
 pub mod protocol;
 pub mod quic;
+pub mod stream;
 pub mod server1;
-pub mod transport;
 
 pub const ALPN_QUIC: &[&[u8]] = &[b"hq-29"];
 

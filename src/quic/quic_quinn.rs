@@ -5,10 +5,8 @@ use std::{
 
 use bytes::{Buf, BytesMut};
 use futures::{ready, FutureExt, StreamExt};
-use quinn::{
-    crypto::Session,
-    VarInt,
-};
+use quinn::{crypto::Session, VarInt};
+use tokio::io::AsyncRead;
 
 use crate::error::{Error, Result};
 
@@ -145,7 +143,6 @@ where
     B: Buf,
     S: Session,
 {
-
     fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<usize>>> {
         self.recv.poll_data(cx)
     }
@@ -197,10 +194,7 @@ where
 
     type BidiStream = BidiStream<B, S>;
 
-    fn poll_accept_bidi_stream(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Self::BidiStream>> {
+    fn poll_accept_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream>> {
         match ready!(self.connection.bi_streams.poll_next_unpin(cx)) {
             Some(Ok((send, recv))) => Poll::Ready(Ok(BidiStream::new(send, recv))),
             Some(Err(err)) => Poll::Ready(Err(Error::QuinnConnectionError(err))),
@@ -215,10 +209,7 @@ where
         todo!()
     }
 
-    fn poll_open_bidi_stream(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Self::BidiStream>> {
+    fn poll_open_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream>> {
         let mut open = self.connection.connection.open_bi();
         match ready!(open.poll_unpin(cx)) {
             Ok((send, recv)) => Poll::Ready(Ok(BidiStream::new(send, recv))),

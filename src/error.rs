@@ -10,6 +10,8 @@ pub enum Error {
     /// First byte of protocol is not implemented.
     #[error("Wrong protocol.")]
     WrongProtocol,
+    #[error("Wrong password.")]
+    WrongPassword,
     /// Buffer is empty.
     #[error("Empty buffer.")]
     EmptyBuffer,
@@ -31,7 +33,7 @@ pub enum Error {
     #[error("Parse error")]
     ParseError,
     #[error("Known protocol kind")]
-    UnknowProtocolKindErrlr,
+    UnknowProtocolKindError,
     #[error("Poll from server lost error.")]
     PollServerDriverLostError,
     #[error("io error: {0}")]

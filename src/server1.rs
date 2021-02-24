@@ -5,13 +5,14 @@ use std::{
 
 use bytes::Bytes;
 use futures::StreamExt;
-use quinn::{Endpoint, ServerConfig, crypto::rustls::TlsSession, generic::NewConnection};
+use quinn::{
+    crypto::rustls::TlsSession,
+    generic::{Connecting, NewConnection},
+    Endpoint, ServerConfig,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{
-    generate_key_and_cert_der, load_private_cert, load_private_key, quic::quic_quinn::Connection,
-    ALPN_QUIC,
-};
+use crate::{ALPN_QUIC, error::Result, generate_key_and_cert_der, load_private_cert, load_private_key, quic::quic_quinn::Connection, stream::QuinnBidiStream};
 
 pub struct QuinnServer {
     key_cert: Option<(PathBuf, PathBuf)>,
@@ -36,10 +37,23 @@ impl QuinnServer {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), self.port);
         let (endpoint, mut incoming) = endpoint_builder.bind(&addr)?;
         while let Some(conn) = incoming.next().await {
-            let conn = conn.await?;
-            let conn: Connection<Bytes, TlsSession> = Connection::new(conn);
-            let mut conn = crate::Connection::new(conn);
-            let stream = conn.accept().await;
+            tokio::spawn(async move { Self::accept_connection(conn).await });
+        }
+        Ok(())
+    }
+
+    async fn accept_connection(conn: Connecting<TlsSession>) -> Result<()> {
+        let conn = conn.await?;
+        let NewConnection {
+            connection,
+            uni_streams,
+            mut bi_streams,
+            datagrams,
+            ..
+        } = conn;
+        // One quic connection matches one proxy(tcp/udp) connection.
+        while let Some(Ok((send, recv))) = bi_streams.next().await {
+            let bidi = QuinnBidiStream::new(send, recv);
         }
         Ok(())
     }

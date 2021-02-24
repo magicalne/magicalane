@@ -1,8 +1,11 @@
 use std::{
+    marker::Unpin,
     pin::Pin,
     task::{Context, Poll},
+    u128,
 };
 
+use bytes::BytesMut;
 use futures::{future::poll_fn, ready, FutureExt};
 use quinn::{
     crypto::Session,
@@ -10,9 +13,7 @@ use quinn::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{
-        unix::SocketAddr, TcpStream as TokioTcpStream, ToSocketAddrs, UdpSocket as TokioUdpSocket,
-    },
+    net::{TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket},
 };
 
 use crate::{
@@ -142,15 +143,64 @@ impl RecvStream for UdpSocket {
     }
 }
 
-pub struct ProxyStream<T> {
+pub trait ProxyStream: SendStream + RecvStream {}
+impl<T> ProxyStream for T where T: SendStream + RecvStream {}
+
+pub struct ProxyStreamPair<T> {
     src: T,
-    dst: T,
+    buf: BytesMut,
+    dst: StreamType,
 }
 
-impl<T: SendStream + RecvStream> ProxyStream<T> {
-    pub fn new(src: T, dst: T) -> Self {
-        Self {
-            src, dst
+enum StreamType {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+}
+
+
+
+impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
+    pub async fn init_proxy(mut bidi: T, pwd: &str) -> Result<Self> {
+        let mut buf = BytesMut::with_capacity(1024);
+        if let Some(n) = poll_fn(|cx| Pin::new(&mut bidi).poll_recv(cx, &mut buf)).await? {
+            let protocol = Protocol::parse(&buf)?;
+            if pwd == protocol.password {
+                match &protocol.kind {
+                    Kind::TCP => Ok(Self {
+                        src: bidi,
+                        dst: StreamType::Tcp(TcpStream::connect(&protocol.host, protocol.port).await?),
+                        // dst: Box::new(TcpStream::connect(&protocol.host, protocol.port).await?),
+                        buf,
+                    }),
+                    Kind::UDP => Ok(Self {
+                        src: bidi,
+                        dst: StreamType::Udp(UdpSocket::connect(&protocol.host, protocol.port).await?),
+                        // dst: Box::new(UdpSocket::connect(&protocol.host, protocol.port).await?),
+                        buf,
+                    }),
+                    Kind::Error => Err(Error::WrongProtocol),
+                }
+            } else {
+                Err(Error::WrongPassword)
+            }
+        } else {
+            Err(Error::NotConnectedError)
         }
     }
+
+    // pub fn poll_src_to_dst(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
+    //     if self.buf.len() > 0 {//send left buf
+    //         match ready!(&self.dst..poll_send(cx, &self.buf)) {
+    //             Ok(_) => {}
+    //             Err(_) => {}
+    //         }
+    //     }
+    //     match ready!(Pin::new(&mut self.src).poll_recv(cx, &mut self.buf)) {
+    //         Some(n) => {
+
+    //         },
+    //         None => {}
+    //     }
+    //     todo!()
+    // }
 }

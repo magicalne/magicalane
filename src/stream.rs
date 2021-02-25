@@ -1,9 +1,4 @@
-use std::{
-    marker::Unpin,
-    pin::Pin,
-    task::{Context, Poll},
-    u128,
-};
+use std::{future::Future, marker::Unpin, pin::Pin, sync::Arc, task::{Context, Poll}};
 
 use bytes::BytesMut;
 use futures::{future::poll_fn, ready, FutureExt};
@@ -148,8 +143,9 @@ impl<T> ProxyStream for T where T: SendStream + RecvStream {}
 
 pub struct ProxyStreamPair<T> {
     src: T,
-    buf: BytesMut,
     dst: StreamType,
+    src_buf: BytesMut,
+    dst_buf: BytesMut,
 }
 
 enum StreamType {
@@ -157,26 +153,51 @@ enum StreamType {
     Udp(UdpSocket),
 }
 
+impl SendStream for StreamType {
+    fn poll_send(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<()>> {
+        match self.get_mut() {
+            StreamType::Tcp(s) => Pin::new(s).poll_send(cx, buf),
+            StreamType::Udp(s) => Pin::new(s).poll_send(cx, buf),
+        }
+    }
+}
 
+impl RecvStream for StreamType {
+    fn poll_recv(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<Option<usize>>> {
+        match self.get_mut() {
+            StreamType::Tcp(s) => Pin::new(s).poll_recv(cx, buf),
+            StreamType::Udp(s) => Pin::new(s).poll_recv(cx, buf),
+        }
+    }
+}
 
 impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
-    pub async fn init_proxy(mut bidi: T, pwd: &str) -> Result<Self> {
+    pub async fn init_proxy(mut bidi: T, pwd: String) -> Result<Self> {
         let mut buf = BytesMut::with_capacity(1024);
+        let dst_buf = BytesMut::with_capacity(1024);
         if let Some(n) = poll_fn(|cx| Pin::new(&mut bidi).poll_recv(cx, &mut buf)).await? {
             let protocol = Protocol::parse(&buf)?;
             if pwd == protocol.password {
                 match &protocol.kind {
                     Kind::TCP => Ok(Self {
                         src: bidi,
-                        dst: StreamType::Tcp(TcpStream::connect(&protocol.host, protocol.port).await?),
-                        // dst: Box::new(TcpStream::connect(&protocol.host, protocol.port).await?),
-                        buf,
+                        dst: StreamType::Tcp(
+                            TcpStream::connect(&protocol.host, protocol.port).await?,
+                        ),
+                        src_buf: buf,
+                        dst_buf
                     }),
                     Kind::UDP => Ok(Self {
                         src: bidi,
-                        dst: StreamType::Udp(UdpSocket::connect(&protocol.host, protocol.port).await?),
-                        // dst: Box::new(UdpSocket::connect(&protocol.host, protocol.port).await?),
-                        buf,
+                        dst: StreamType::Udp(
+                            UdpSocket::connect(&protocol.host, protocol.port).await?,
+                        ),
+                        src_buf: buf,
+                        dst_buf
                     }),
                     Kind::Error => Err(Error::WrongProtocol),
                 }
@@ -188,19 +209,56 @@ impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
         }
     }
 
-    // pub fn poll_src_to_dst(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
-    //     if self.buf.len() > 0 {//send left buf
-    //         match ready!(&self.dst..poll_send(cx, &self.buf)) {
-    //             Ok(_) => {}
-    //             Err(_) => {}
-    //         }
-    //     }
-    //     match ready!(Pin::new(&mut self.src).poll_recv(cx, &mut self.buf)) {
-    //         Some(n) => {
+    pub fn poll_src_to_dst(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
+        if self.src_buf.is_empty() {
+            ready!(Pin::new(&mut self.src).poll_recv(cx, &mut self.src_buf))?;
+        }
+        if !self.src_buf.is_empty() {
+            match ready!(Pin::new(&mut self.dst).poll_send(cx, &self.src_buf)) {
+                Ok(()) => {
+                    let n = self.src_buf.len();
+                    self.src_buf.clear();
+                    Poll::Ready(Ok(n))
+                }
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        } else {
+            Poll::Pending
+        }
+    }
 
-    //         },
-    //         None => {}
-    //     }
-    //     todo!()
-    // }
+    pub fn poll_src_from_dst(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
+        if self.dst_buf.is_empty() {
+            ready!(Pin::new(&mut self.dst).poll_recv(cx, &mut self.dst_buf))?;
+        }
+        if !self.dst_buf.is_empty() {
+            match ready!(Pin::new(&mut self.src).poll_send(cx, &self.dst_buf)) {
+                Ok(()) => {
+                    let n = self.dst_buf.len();
+                    self.dst_buf.clear();
+                    Poll::Ready(Ok(n))
+                }
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<T: SendStream + RecvStream + Unpin> Future for ProxyStreamPair<T> {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let p1 = self.poll_src_to_dst(cx);
+        let p2 = self.poll_src_from_dst(cx);
+        match (p1, p2) {
+            (Poll::Ready(Err(err)), _) => Poll::Ready(Err(err)),
+            (_, Poll::Ready(Err(err))) => Poll::Ready(Err(err)),
+            (Poll::Ready(Ok(_)), Poll::Ready(Ok(_))) => Poll::Pending,
+            (Poll::Ready(Ok(_)), Poll::Pending) => Poll::Pending,
+            (Poll::Pending, Poll::Ready(Ok(_))) => Poll::Pending,
+            (Poll::Pending, Poll::Pending) => Poll::Pending
+        }
+    }
 }

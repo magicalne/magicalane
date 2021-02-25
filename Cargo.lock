@@ -680,7 +680,6 @@ dependencies = [
  "crc",
  "directories",
  "directories-next",
- "err-derive",
  "futures",
  "futures-core",
  "futures-util",

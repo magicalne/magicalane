@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytes = "1"
-err-derive = "0.2.3"
+# err-derive = "0.2.3"
 libc = "0.2.69"
 mio = "0.6"
 quinn = "0.6.1"

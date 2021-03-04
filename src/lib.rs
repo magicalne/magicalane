@@ -1,4 +1,4 @@
-use std::{fs, future::Future, path::PathBuf, task::Poll};
+use std::{fs, future::Future, path::{Path, PathBuf}, task::Poll};
 
 use bytes::{Buf, Bytes, BytesMut};
 use error::{Error, Result};
@@ -14,6 +14,7 @@ pub mod protocol;
 pub mod quic;
 pub mod stream;
 pub mod server1;
+pub mod client1;
 
 pub const ALPN_QUIC: &[&[u8]] = &[b"hq-29"];
 
@@ -49,8 +50,8 @@ pub fn generate_key_and_cert_pem() -> Result<(PathBuf, PathBuf)> {
     Ok((key_path, cert_path))
 }
 
-fn load_private_key(key_path: PathBuf) -> Result<PrivateKey> {
-    let key = fs::read(&key_path)?;
+fn load_private_key(key_path: &Path) -> Result<PrivateKey> {
+    let key = fs::read(key_path)?;
     let key = if key_path.extension().map_or(false, |x| x == "der") {
         quinn::PrivateKey::from_der(&key)?
     } else {
@@ -59,8 +60,8 @@ fn load_private_key(key_path: PathBuf) -> Result<PrivateKey> {
     Ok(key)
 }
 
-fn load_private_cert(cert_path: PathBuf) -> Result<CertificateChain> {
-    let cert_chain = fs::read(&cert_path)?;
+fn load_private_cert(cert_path: &Path) -> Result<CertificateChain> {
+    let cert_chain = fs::read(cert_path)?;
     let cert_chain = if cert_path
         .extension()
         .map_or(false, |x| x == "der" || x == "crt")

@@ -1,4 +1,4 @@
-use std::{future::Future, marker::Unpin, pin::Pin, sync::Arc, task::{Context, Poll}};
+use std::{cell::RefCell, future::Future, marker::Unpin, pin::Pin, rc::Rc, sync::Arc, task::{Context, Poll}};
 
 use bytes::BytesMut;
 use futures::{future::poll_fn, ready, FutureExt};
@@ -39,6 +39,20 @@ impl<S: Session> QuinnBidiStream<S> {
             send_stream,
             recv_stream,
         }
+    }
+
+    pub async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.send_stream.write_all(buf).await?;
+        Ok(())
+    }
+
+    pub async fn write_finish(&mut self) -> Result<()> {
+        Ok(self.send_stream.finish().await?)
+    }
+
+
+    pub async fn read_all(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
+        Ok(self.recv_stream.read(buf).await?)
     }
 }
 
@@ -180,8 +194,9 @@ impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
         let mut buf = BytesMut::with_capacity(1024);
         let dst_buf = BytesMut::with_capacity(1024);
         if let Some(n) = poll_fn(|cx| Pin::new(&mut bidi).poll_recv(cx, &mut buf)).await? {
+            dbg!(n);
             let protocol = Protocol::parse(&buf)?;
-            if pwd == protocol.password {
+            if pwd.as_str() == protocol.password {
                 match &protocol.kind {
                     Kind::TCP => Ok(Self {
                         src: bidi,
@@ -189,7 +204,7 @@ impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
                             TcpStream::connect(&protocol.host, protocol.port).await?,
                         ),
                         src_buf: buf,
-                        dst_buf
+                        dst_buf,
                     }),
                     Kind::UDP => Ok(Self {
                         src: bidi,
@@ -197,7 +212,7 @@ impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
                             UdpSocket::connect(&protocol.host, protocol.port).await?,
                         ),
                         src_buf: buf,
-                        dst_buf
+                        dst_buf,
                     }),
                     Kind::Error => Err(Error::WrongProtocol),
                 }
@@ -258,7 +273,7 @@ impl<T: SendStream + RecvStream + Unpin> Future for ProxyStreamPair<T> {
             (Poll::Ready(Ok(_)), Poll::Ready(Ok(_))) => Poll::Pending,
             (Poll::Ready(Ok(_)), Poll::Pending) => Poll::Pending,
             (Poll::Pending, Poll::Ready(Ok(_))) => Poll::Pending,
-            (Poll::Pending, Poll::Pending) => Poll::Pending
+            (Poll::Pending, Poll::Pending) => Poll::Pending,
         }
     }
 }

@@ -33,7 +33,9 @@ pub enum Error {
     #[error("Parse error")]
     ParseError,
     #[error("Known protocol kind")]
-    UnknowProtocolKindError,
+    UnknownProtocolKindError,
+    #[error("Unknown remote host")]
+    UnknownRemoteHost,
     #[error("Poll from server lost error.")]
     PollServerDriverLostError,
     #[error("io error: {0}")]
@@ -44,6 +46,10 @@ pub enum Error {
     CertParseError(#[from] ParseError),
     #[error("TLSError: {0}")]
     TLSError(#[from] TLSError),
+
+    ///cert
+    #[error("webpki error")]
+    WebPkiError,
 
     #[error("Send stream error.")]
     SendStreamError,

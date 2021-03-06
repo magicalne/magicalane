@@ -63,7 +63,7 @@ impl Server {
                     while let Some(Ok((send, recv))) = bi_stream.next().await {
                         let pwd = pwd.clone();
                         let bidi = QuinnBidiStream::new(send, recv);
-                        let proxy = ProxyStreamPair::init_proxy(bidi, pwd).await;
+                        let proxy = ProxyStreamPair::proxy_out(bidi, pwd).await;
                         dbg!("connected");
                         if let Ok(proxy) = proxy {
                             match proxy.await {

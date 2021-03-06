@@ -15,6 +15,7 @@ pub mod quic;
 pub mod stream;
 pub mod server1;
 pub mod client1;
+pub mod socks;
 
 pub const ALPN_QUIC: &[&[u8]] = &[b"hq-29"];
 

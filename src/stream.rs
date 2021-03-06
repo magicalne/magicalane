@@ -2,10 +2,7 @@ use std::{cell::RefCell, future::Future, marker::Unpin, pin::Pin, rc::Rc, sync::
 
 use bytes::BytesMut;
 use futures::{future::poll_fn, ready, FutureExt};
-use quinn::{
-    crypto::Session,
-    generic::{RecvStream as QuinnRecvStream, SendStream as QuinnSendStream},
-};
+use quinn::{crypto::{Session, rustls::TlsSession}, generic::{RecvStream as QuinnRecvStream, SendStream as QuinnSendStream}};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket},
@@ -165,6 +162,7 @@ pub struct ProxyStreamPair<T> {
 enum StreamType {
     Tcp(TcpStream),
     Udp(UdpSocket),
+    Quic(QuinnBidiStream<TlsSession>)
 }
 
 impl SendStream for StreamType {
@@ -172,6 +170,7 @@ impl SendStream for StreamType {
         match self.get_mut() {
             StreamType::Tcp(s) => Pin::new(s).poll_send(cx, buf),
             StreamType::Udp(s) => Pin::new(s).poll_send(cx, buf),
+            StreamType::Quic(s) => Pin::new(s).poll_send(cx, buf),
         }
     }
 }
@@ -185,12 +184,13 @@ impl RecvStream for StreamType {
         match self.get_mut() {
             StreamType::Tcp(s) => Pin::new(s).poll_recv(cx, buf),
             StreamType::Udp(s) => Pin::new(s).poll_recv(cx, buf),
+            StreamType::Quic(s) => Pin::new(s).poll_recv(cx, buf),
         }
     }
 }
 
 impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
-    pub async fn init_proxy(mut bidi: T, pwd: String) -> Result<Self> {
+    pub async fn proxy_out(mut bidi: T, pwd: String) -> Result<Self> {
         let mut buf = BytesMut::with_capacity(1024);
         let dst_buf = BytesMut::with_capacity(1024);
         if let Some(n) = poll_fn(|cx| Pin::new(&mut bidi).poll_recv(cx, &mut buf)).await? {
@@ -222,6 +222,19 @@ impl<T: SendStream + RecvStream + Unpin> ProxyStreamPair<T> {
         } else {
             Err(Error::NotConnectedError)
         }
+    }
+
+    pub async fn proxy_in(src: T, mut dst: QuinnBidiStream<TlsSession>, buf: &[u8]) -> Result<Self> {
+        let src_buf = BytesMut::with_capacity(1024);
+        let dst_buf = BytesMut::with_capacity(1024);
+        poll_fn(|cx| Pin::new(&mut dst).poll_send(cx, &buf)).await?;
+        Ok(Self {
+            src,
+            dst: StreamType::Quic(dst),
+            src_buf,
+            dst_buf
+        })
+        
     }
 
     pub fn poll_src_to_dst(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize>> {
@@ -270,6 +283,8 @@ impl<T: SendStream + RecvStream + Unpin> Future for ProxyStreamPair<T> {
         match (p1, p2) {
             (Poll::Ready(Err(err)), _) => Poll::Ready(Err(err)),
             (_, Poll::Ready(Err(err))) => Poll::Ready(Err(err)),
+            (Poll::Ready(Ok(0)), Poll::Ready(Ok(_))) => Poll::Ready(Ok(())),
+            (Poll::Ready(Ok(_)), Poll::Ready(Ok(0))) => Poll::Ready(Ok(())),
             (Poll::Ready(Ok(_)), Poll::Ready(Ok(_))) => Poll::Pending,
             (Poll::Ready(Ok(_)), Poll::Pending) => Poll::Pending,
             (Poll::Pending, Poll::Ready(Ok(_))) => Poll::Pending,

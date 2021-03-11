@@ -64,6 +64,7 @@ impl Method {
     }
 }
 
+#[derive(Debug)]
 pub enum Version {
     V4,
     V5,
@@ -86,6 +87,7 @@ impl Version {
     }
 }
 
+#[derive(Debug)]
 pub enum Command {
     Connect,
     Bind,
@@ -111,6 +113,7 @@ impl Command {
     }
 }
 
+#[derive(Debug)]
 pub enum Addr<'a> {
     IPV4(&'a [u8]),
     IPV6(&'a [u8]),
@@ -141,6 +144,7 @@ impl<'a> Addr<'a> {
     }
 }
 
+#[derive(Debug)]
 pub struct Request<'a> {
     pub ver: Version,
     pub cmd: Command,
@@ -285,5 +289,14 @@ mod tests {
         assert_eq!(expect.chunk(), buf.chunk());
         
         Ok(())
+    }
+
+    #[test]
+    fn test() {
+        let vec = vec![0; 1];
+        let mut buf = vec.into_boxed_slice();
+        dbg!(buf.len());
+        let arr = [1,2,3,34,1,1];
+        buf[0..arr.len()].clone_from_slice(&arr);
     }
 }

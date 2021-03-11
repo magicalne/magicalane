@@ -677,9 +677,11 @@ dependencies = [
  "structopt",
  "thiserror",
  "tokio 1.2.0",
+ "tokio-trace",
  "tracing",
  "tracing-appender",
  "tracing-futures",
+ "tracing-log",
  "tracing-subscriber",
  "unwrap",
  "url",
@@ -1534,6 +1536,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-trace"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0660d8a4599af2d56ee3e4dde82835a6f26c80e4d60a35d639f97d2729658b31"
+dependencies = [
+ "cfg-if 0.1.10",
+ "log",
+ "tokio-trace-core",
+]
+
+[[package]]
+name = "tokio-trace-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9c8a256d6956f7cb5e2bdfe8b1e8022f1a09206c6c2b1ba00f3b746b260c613"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1605,6 +1627,17 @@ checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
 dependencies = [
  "pin-project",
  "tracing",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6923477a48e41c1951f1999ef8bb5a3023eb723ceadafe78ffb65dc366761e3"
+dependencies = [
+ "lazy_static",
+ "log",
+ "tracing-core",
 ]
 
 [[package]]

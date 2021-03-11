@@ -1,12 +1,15 @@
 use quinn::{ParseError, crypto::rustls::TLSError};
 use rcgen::RcgenError;
 use thiserror::Error;
+use tracing::dispatcher::SetGlobalDefaultError;
 
 #[derive(Error, Debug)]
 pub enum Error {
     /// Server down
     #[error("Server is down.")]
     ServerDown,
+    #[error("SetGlobalDefaultError")]
+    SetGlobalDefaultError(#[from] SetGlobalDefaultError),
     /// First byte of protocol is not implemented.
     #[error("Wrong protocol.")]
     WrongProtocol,

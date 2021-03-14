@@ -1,14 +1,24 @@
 use std::{
+    fs,
     marker::PhantomData,
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    path::Path,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, BytesMut};
 use futures::{ready, FutureExt, StreamExt};
-use quinn::{crypto::Session, VarInt};
+use quinn::{
+    crypto::{rustls::TlsSession, Session},
+    Endpoint, NewConnection, VarInt,
+};
 use tokio::io::AsyncRead;
+use tracing::{error, trace};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    ALPN_QUIC,
+};
 
 pub struct SendStream<B: Buf, S: Session> {
     stream: quinn::generic::SendStream<S>,
@@ -222,5 +232,63 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Self::SendStream>>> {
         todo!()
+    }
+}
+
+pub struct QuicQuinnClient<'a> {
+    host: &'a str,
+    port: u16,
+    cert_path: Option<&'a str>,
+}
+
+impl<'a> QuicQuinnClient<'a> {
+    pub fn new(host: &'a str, port: u16, cert_path: Option<&'a str>) -> Self {
+        Self {
+            host,
+            port,
+            cert_path,
+        }
+    }
+
+    pub async fn connect(&mut self) -> Result<quinn::generic::Connection<TlsSession>> {
+        let mut client_config = quinn::ClientConfigBuilder::default();
+        client_config.protocols(ALPN_QUIC);
+        client_config.enable_keylog();
+        // let dirs = directories_next::ProjectDirs::from("org", "tls", "examples").unwrap();
+        //"/home/magicalne/.local/share/examples/cert.der"
+        let a = self.cert_path.map(|path| {
+            fs::read(path)
+                .map(|cert| quinn::Certificate::from_der(&cert))
+                .map(|cert| {
+                    match cert {
+                        Ok(cert) => {
+                            if let Err(err) = client_config.add_certificate_authority(cert) {
+                                error!("Client add cert failed: {:?}.", err);
+                            }
+                        }
+                        Err(err) => {
+                            error!("Client parse cert error: {:?}.", err);
+                        }
+                    }
+                })
+        });
+        let config = client_config.build();
+        let remote = (self.host, self.port)
+            .to_socket_addrs()?
+            .find(|add| add.is_ipv4())
+            .ok_or(Error::UnknownRemoteHost)?;
+        trace!("Connect remote: {:?}", &remote);
+        let mut endpoint_builder = Endpoint::builder();
+        endpoint_builder.default_client_config(config);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        // Bind this endpoint to a UDP socket on the given client address.
+        let (endpoint, incoming) = endpoint_builder.bind(&addr)?;
+        trace!("Client bind endpoint: {:?}", &endpoint);
+        trace!("Client bind incoming: {:?}", &incoming);
+
+        // Connect to the server passing in the server name which is supposed to be in the server certificate.
+        let connection = endpoint.connect(&remote, self.host)?.await?;
+        let NewConnection { connection, .. } = connection;
+        Ok(connection)
     }
 }

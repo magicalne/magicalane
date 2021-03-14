@@ -50,9 +50,19 @@ pub enum Error {
     #[error("TLSError: {0}")]
     TLSError(#[from] TLSError),
 
+    #[error("Stream read close.")]
+    StreamClose,
+    #[error("Stream write zero.")]
+    StreamWriteZero,
+
+    #[error("Cannot recv proxy streams")]
+    RecvProxyStreamError,
     ///cert
     #[error("webpki error")]
     WebPkiError,
+
+    #[error("Socks stream proccess failed")]
+    SocksStreamProcessFailed,
 
     #[error("Send stream error.")]
     SendStreamError,

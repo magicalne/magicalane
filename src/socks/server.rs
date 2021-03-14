@@ -1,10 +1,14 @@
-use std::{pin::Pin, task::{Context, Poll}, vec};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    vec,
+};
 
 use crate::{
-    error::Result,
+    error::{Error, Result},
     socks::protocol::{Rep, Reply, Request},
 };
-use futures::{ready, Future};
+use futures::{future::poll_fn, ready, Future};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -66,11 +70,8 @@ impl SocksStream {
         }
     }
 
-    async fn read(&mut self) -> Result<()> {
-        let mut buf = vec![0; 1024];
-        let m = self.stream.read(&mut buf).await?;
-        trace!("read: {:?}, buf: {:?}", m, &buf);
-        Ok(())
+    fn get_stream(self) -> TcpStream {
+        self.stream
     }
 
     fn poll_negotiation_read(
@@ -84,7 +85,8 @@ impl SocksStream {
                 let buf = buf.filled();
                 let len = buf.len();
                 trace!("Negotiation read buf: {:?}, {:?}", len, &buf);
-                me.buf[0..VERSION_METHOD_MESSAGE.len()].copy_from_slice(&VERSION_METHOD_MESSAGE[..]);
+                me.buf[0..VERSION_METHOD_MESSAGE.len()]
+                    .copy_from_slice(&VERSION_METHOD_MESSAGE[..]);
                 *me.index = VERSION_METHOD_MESSAGE.len();
                 *me.state = SocksState::NegotiationWrite;
                 trace!("Update state to {:?}", me.state);
@@ -179,27 +181,29 @@ impl Future for SocksStream {
     type Output = Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // let me = self.project();
         loop {
-            let me = Pin::new(&mut *self);
-            match me.state {
+            // let me = Pin::new(&mut *self);
+            match self.state {
                 SocksState::NegotiationRead => {
-                    let _ = ready!(me.poll_negotiation_read(cx));
+                    let _ = ready!(self.as_mut().poll_negotiation_read(cx));
                 }
                 SocksState::NegotiationWrite => {
-                    let _ = ready!(me.poll_negotiation_write(cx));
+                    let _ = ready!(self.as_mut().poll_negotiation_write(cx));
                 }
                 SocksState::SubNegotiationRead => {
-                    let _ = ready!(me.poll_sub_negotiation_read(cx));
+                    let _ = ready!(self.as_mut().poll_sub_negotiation_read(cx));
                 }
                 SocksState::SubNegotiationWrite => {
-                    let _ = ready!(me.poll_sub_negotiation_write(cx));
+                    let _ = ready!(self.as_mut().poll_sub_negotiation_write(cx));
                 }
                 SocksState::Processing => {
+                    return Poll::Ready(Ok(()))
                 }
                 SocksState::ReplyOnError => {
-                    let _ = ready!(self.project().stream.poll_shutdown(cx));
+                    let _ = ready!(self.as_mut().project().stream.poll_shutdown(cx));
                     trace!("Stop");
-                    return Poll::Ready(Ok(()));
+                    return Poll::Ready(Err(Error::SocksStreamProcessFailed));
                 }
             };
         }

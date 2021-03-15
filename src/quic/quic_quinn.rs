@@ -1,24 +1,12 @@
-use std::{
-    fs,
-    marker::PhantomData,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
-    path::Path,
-    task::{Context, Poll},
-};
+use std::{borrow::Cow, fs, marker::PhantomData, net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs}, path::{Path, PathBuf}, pin::Pin, task::{Context, Poll}};
 
-use bytes::{Buf, BytesMut};
-use futures::{ready, FutureExt, StreamExt};
-use quinn::{
-    crypto::{rustls::TlsSession, Session},
-    Endpoint, NewConnection, VarInt,
-};
+use bytes::{Buf, BufMut, BytesMut};
+use futures::{FutureExt, Stream, StreamExt, ready};
+use quinn::{Endpoint, NewConnection, VarInt, crypto::{rustls::TlsSession, Session}, generic::ServerConfig};
 use tokio::io::AsyncRead;
 use tracing::{error, trace};
 
-use crate::{
-    error::{Error, Result},
-    ALPN_QUIC,
-};
+use crate::{ALPN_QUIC, error::{Error, Result}, generate_key_and_cert_der, load_private_cert, load_private_key};
 
 pub struct SendStream<B: Buf, S: Session> {
     stream: quinn::generic::SendStream<S>,
@@ -250,17 +238,17 @@ impl<'a> QuicQuinnClient<'a> {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<quinn::generic::Connection<TlsSession>> {
+    pub async fn connect(&mut self, password: &str) -> Result<quinn::generic::Connection<TlsSession>> {
         let mut client_config = quinn::ClientConfigBuilder::default();
         client_config.protocols(ALPN_QUIC);
         client_config.enable_keylog();
         // let dirs = directories_next::ProjectDirs::from("org", "tls", "examples").unwrap();
         //"/home/magicalne/.local/share/examples/cert.der"
-        let a = self.cert_path.map(|path| {
-            fs::read(path)
-                .map(|cert| quinn::Certificate::from_der(&cert))
-                .map(|cert| {
-                    match cert {
+        self.cert_path
+            .map(|path| {
+                fs::read(path)
+                    .map(|cert| quinn::Certificate::from_der(&cert))
+                    .map(|cert| match cert {
                         Ok(cert) => {
                             if let Err(err) = client_config.add_certificate_authority(cert) {
                                 error!("Client add cert failed: {:?}.", err);
@@ -269,9 +257,13 @@ impl<'a> QuicQuinnClient<'a> {
                         Err(err) => {
                             error!("Client parse cert error: {:?}.", err);
                         }
-                    }
+                    })
+            })
+            .map(|r| {
+                r.map_err(|err| {
+                    error!("Client config cert with error: {:?}.", err);
                 })
-        });
+            });
         let config = client_config.build();
         let remote = (self.host, self.port)
             .to_socket_addrs()?
@@ -289,6 +281,82 @@ impl<'a> QuicQuinnClient<'a> {
         // Connect to the server passing in the server name which is supposed to be in the server certificate.
         let connection = endpoint.connect(&remote, self.host)?.await?;
         let NewConnection { connection, .. } = connection;
+        validate_password(&connection, password).await?;
         Ok(connection)
+    }
+}
+
+async fn validate_password(
+    conn: &quinn::generic::Connection<TlsSession>,
+    password: &str,
+) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let mut buf = BytesMut::new();
+    buf.put_u8(password.len() as u8);
+    buf.put_slice(password.as_bytes());
+    send.write_all(&buf).await?;
+    trace!("Sent password validation request.");
+    match recv.read(&mut buf).await? {
+        Some(n) => {
+            trace!("Password validate successfully. n: {:?}", n);
+            Ok(())
+        }
+        None => {
+            trace!("Close connection due to wrong password.");
+            Err(Error::WrongPassword)
+        }
+    }
+}
+
+pub struct QuinnServer {
+    incoming: quinn::generic::Incoming<TlsSession>,
+    password: String
+}
+
+impl QuinnServer {
+
+    pub async fn new(
+        key_cert: Option<(PathBuf, PathBuf)>,
+        port: u16,
+        password: String,
+    ) -> Result<Self> {
+        let mut endpoint_builder = Endpoint::builder();
+        let server_config = ServerConfig::default();
+        let mut server_config = quinn::ServerConfigBuilder::new(server_config);
+        server_config.enable_keylog();
+        let (key, cert) = key_cert.unwrap_or(generate_key_and_cert_der()?);
+        let key = load_private_key(key.as_path())?;
+        let cert_chain = load_private_cert(cert.as_path())?;
+        server_config.certificate(cert_chain, key)?;
+        server_config.protocols(ALPN_QUIC);
+        endpoint_builder.listen(server_config.build());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
+        let (_, incoming) = endpoint_builder.bind(&addr)?;
+        Ok(Self { password, incoming })
+    }
+}
+
+impl Stream for QuinnServer {
+    type Item = Result<quinn::generic::Connection<TlsSession>>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match ready!(Pin::new(&mut self.incoming).poll_next_unpin(cx)) {
+            Some(mut c) => {
+                match ready!(c.poll_unpin(cx)) {
+                    Ok(quinn::generic::NewConnection {
+                        connection, ..
+                    }) => {
+                        Poll::Ready(Some(Ok(connection)))
+                    },
+                    Err(err) => {
+                        Poll::Ready(Some(Err(Error::QuinnConnectionError(err))))
+                    }
+                }
+            }
+            None => Poll::Ready(None)
+        }
     }
 }

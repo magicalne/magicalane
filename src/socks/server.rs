@@ -21,8 +21,8 @@ pub struct SocksServer {
 }
 
 impl SocksServer {
-    pub async fn new(port: Option<u16>) -> Result<Self> {
-        let port = port.unwrap_or(1080);
+    pub async fn new(socks_port: Option<u16>) -> Result<Self> {
+        let port = socks_port.unwrap_or(1080);
         let addr = ("0.0.0.0", port);
         let tcp = TcpListener::bind(addr).await?;
         info!("Socks server bind local port: {:?}", port);
@@ -33,8 +33,10 @@ impl SocksServer {
         while let Ok((stream, from)) = self.tcp.accept().await {
             trace!("Accept new stream from : {:?}", from);
             tokio::spawn(async {
-                let stream = SocksStream::new(stream);
-                let _ = stream.await;
+                let socks_stream = SocksStream::new(stream);
+                let _ = socks_stream.await;
+                
+                
             });
         }
         Ok(())
@@ -61,6 +63,7 @@ struct SocksStream {
 }
 
 impl SocksStream {
+
     fn new(stream: TcpStream) -> Self {
         Self {
             stream,

@@ -44,7 +44,4 @@ impl QuinnClient {
         let bidi = QuinnBidiStream::new(send, recv);
         Ok(Self { password, bidi })
     }
-
-    
-
 }

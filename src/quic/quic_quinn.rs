@@ -1,12 +1,28 @@
-use std::{borrow::Cow, fs, marker::PhantomData, net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs}, path::{Path, PathBuf}, pin::Pin, task::{Context, Poll}};
+use std::{
+    borrow::Cow,
+    fs,
+    marker::PhantomData,
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
+    usize,
+};
 
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{FutureExt, Stream, StreamExt, ready};
-use quinn::{Endpoint, NewConnection, VarInt, crypto::{rustls::TlsSession, Session}, generic::ServerConfig};
+use futures::{ready, FutureExt, Stream, StreamExt};
+use quinn::{
+    crypto::{rustls::TlsSession, Session},
+    generic::ServerConfig,
+    Endpoint, NewConnection, VarInt,
+};
 use tokio::io::AsyncRead;
 use tracing::{error, trace};
 
-use crate::{ALPN_QUIC, error::{Error, Result}, generate_key_and_cert_der, load_private_cert, load_private_key};
+use crate::{
+    error::{Error, Result},
+    generate_key_and_cert_der, load_private_cert, load_private_key, ALPN_QUIC,
+};
 
 pub struct SendStream<B: Buf, S: Session> {
     stream: quinn::generic::SendStream<S>,
@@ -163,64 +179,53 @@ where
     }
 }
 
-pub struct Connection<B: Buf, S: Session> {
-    connection: quinn::generic::NewConnection<S>,
-    _phantom_data: PhantomData<B>,
+const PASSWORD_VALIDATE_RESPONSE: [u8; 1] = [0];
+
+pub struct Connection {
+    connection: quinn::generic::Connection<TlsSession>,
+    password: String,
 }
 
-impl<B, S> Connection<B, S>
-where
-    B: Buf,
-    S: Session,
-{
-    pub fn new(conn: quinn::generic::NewConnection<S>) -> Self {
+impl Connection {
+    pub fn new(conn: quinn::generic::Connection<TlsSession>, password: String) -> Self {
         Self {
             connection: conn,
-            _phantom_data: PhantomData,
-        }
-    }
-}
-
-impl<B, S> super::Connection<B> for Connection<B, S>
-where
-    B: Buf,
-    S: Session,
-{
-    type SendStream = SendStream<B, S>;
-
-    type RecvStream = RecvStream<S>;
-
-    type BidiStream = BidiStream<B, S>;
-
-    fn poll_accept_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream>> {
-        match ready!(self.connection.bi_streams.poll_next_unpin(cx)) {
-            Some(Ok((send, recv))) => Poll::Ready(Ok(BidiStream::new(send, recv))),
-            Some(Err(err)) => Poll::Ready(Err(Error::QuinnConnectionError(err))),
-            None => Poll::Pending,
+            password,
         }
     }
 
-    fn poll_accept_recv_stream(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Self::RecvStream>>> {
-        todo!()
-    }
-
-    fn poll_open_bidi_stream(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream>> {
-        let mut open = self.connection.connection.open_bi();
-        match ready!(open.poll_unpin(cx)) {
-            Ok((send, recv)) => Poll::Ready(Ok(BidiStream::new(send, recv))),
-            Err(err) => Poll::Ready(Err(Error::QuinnConnectionError(err))),
+    pub async fn validate_password(&mut self) -> Result<()> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        let mut buf = BytesMut::new();
+        match recv.read(&mut buf).await? {
+            Some(n) => {
+                trace!(
+                    "Recv {:?} bytes from client: {:?}.",
+                    n,
+                    self.connection.remote_address()
+                );
+                if let Some(len) = buf.get(0) {
+                    let len = *len as usize;
+                    if len != buf.len() + 1 {
+                        return Err(Error::ParsePasswordFail);
+                    } else {
+                        let buf = &buf[1..1 + len];
+                        if len != self.password.len() || buf != self.password.as_bytes() {
+                            Err(Error::WrongPassword)
+                        } else {
+                            trace!("Password is validate.");
+                            send.write_all(&PASSWORD_VALIDATE_RESPONSE).await?;
+                            Ok(())
+                        }
+                    }
+                } else {
+                    Err(Error::ParsePasswordFail)
+                }
+            }
+            None => Err(Error::NotConnectedError),
         }
     }
 
-    fn poll_open_send_stream(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Self::SendStream>>> {
-        todo!()
-    }
 }
 
 pub struct QuicQuinnClient<'a> {
@@ -238,7 +243,10 @@ impl<'a> QuicQuinnClient<'a> {
         }
     }
 
-    pub async fn connect(&mut self, password: &str) -> Result<quinn::generic::Connection<TlsSession>> {
+    pub async fn connect(
+        &mut self,
+        password: &str,
+    ) -> Result<quinn::generic::Connection<TlsSession>> {
         let mut client_config = quinn::ClientConfigBuilder::default();
         client_config.protocols(ALPN_QUIC);
         client_config.enable_keylog();
@@ -310,11 +318,10 @@ async fn validate_password(
 
 pub struct QuinnServer {
     incoming: quinn::generic::Incoming<TlsSession>,
-    password: String
+    password: String,
 }
 
 impl QuinnServer {
-
     pub async fn new(
         key_cert: Option<(PathBuf, PathBuf)>,
         port: u16,
@@ -337,26 +344,20 @@ impl QuinnServer {
 }
 
 impl Stream for QuinnServer {
-    type Item = Result<quinn::generic::Connection<TlsSession>>;
+    type Item = Result<Connection>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         match ready!(Pin::new(&mut self.incoming).poll_next_unpin(cx)) {
-            Some(mut c) => {
-                match ready!(c.poll_unpin(cx)) {
-                    Ok(quinn::generic::NewConnection {
-                        connection, ..
-                    }) => {
-                        Poll::Ready(Some(Ok(connection)))
-                    },
-                    Err(err) => {
-                        Poll::Ready(Some(Err(Error::QuinnConnectionError(err))))
-                    }
+            Some(mut c) => match ready!(c.poll_unpin(cx)) {
+                Ok(quinn::generic::NewConnection { connection, .. }) => {
+                    Poll::Ready(Some(Ok(Connection::new(connection, self.password.clone()))))
                 }
-            }
-            None => Poll::Ready(None)
+                Err(err) => Poll::Ready(Some(Err(Error::QuinnConnectionError(err)))),
+            },
+            None => Poll::Ready(None),
         }
     }
 }

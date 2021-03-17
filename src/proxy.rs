@@ -1,4 +1,7 @@
-use std::{pin::Pin, task::{Context, Poll}};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use futures::{ready, Future};
@@ -6,6 +9,21 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, error, info, trace};
 
 use crate::error::{Error, Result};
+
+pub struct ProxyOpenConnection<R: AsyncRead, W: AsyncWrite> {
+    read: R,
+    write: W,
+}
+
+impl<R, W> ProxyOpenConnection<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn new(r: R, w: W) {
+        
+    }
+}
 
 struct ProxyStream<R: AsyncRead, W: AsyncWrite> {
     reader: R,
@@ -121,9 +139,7 @@ where
                     };
                 }
             });
-            self.pool.retain(|p| {
-                !p.finish
-            });
+            self.pool.retain(|p| !p.finish);
             //TODO: Optmized with drain filter once it's stable.
             // self.as_ref().pool.drain_filter(|p| {
             //     if let Poll::Ready(res) = Pin::new(p).poll_next_(cx) {

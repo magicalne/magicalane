@@ -1,41 +1,56 @@
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-    vec,
-};
+use std::{pin::Pin, sync::Arc, task::{Context, Poll}, vec};
 
 use crate::{
     error::{Error, Result},
-    socks::protocol::{Rep, Reply, Request},
+    quic::quic_quinn::QuicQuinnClient,
+    socks::protocol::{
+        Rep, Reply, Request, get_remote_addr_buf
+    },
 };
 use futures::{future::poll_fn, ready, Future};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream},
-};
+use quinn::{crypto::rustls::TlsSession, generic::Connection};
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf, ReadHalf}, net::{TcpListener, TcpStream}};
 use tracing::{debug, error, info, trace};
 
 use super::protocol::VERSION_METHOD_MESSAGE;
 pub struct SocksServer {
     tcp: TcpListener,
+    conn: Arc<Connection<TlsSession>>
 }
 
 impl SocksServer {
-    pub async fn new(socks_port: Option<u16>) -> Result<Self> {
+    pub async fn new(
+        socks_port: Option<u16>,
+        proxy_host: &str,
+        proxy_port: u16,
+        cert_path: Option<&str>,
+        passwd: String
+    ) -> Result<Self> {
+        let mut quic = QuicQuinnClient::new(proxy_host, proxy_port, cert_path);
+        let conn = quic.connect(&passwd).await?;
+
         let port = socks_port.unwrap_or(1080);
         let addr = ("0.0.0.0", port);
         let tcp = TcpListener::bind(addr).await?;
         info!("Socks server bind local port: {:?}", port);
-        Ok(Self { tcp })
+        Ok(Self { tcp, conn: Arc::new(conn) })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         while let Ok((stream, from)) = self.tcp.accept().await {
             trace!("Accept new stream from : {:?}", from);
-            tokio::spawn(async {
+            let conn = self.conn.clone();
+            tokio::spawn(async move {
                 let socks_stream = SocksStream::new(stream);
                 let _ = socks_stream.await;
-                
+                match conn.open_bi().await {
+                    Ok((send, recv)) => {
+
+                    }
+                    Err(err) => {
+
+                    }
+                }
                 
             });
         }
@@ -60,6 +75,7 @@ struct SocksStream {
     state: SocksState,
     buf: Box<[u8]>,
     index: usize,
+    remote_addr: Option<Vec<u8>>
 }
 
 impl SocksStream {
@@ -70,6 +86,7 @@ impl SocksStream {
             state: SocksState::NegotiationRead,
             buf: vec![0; 4096].into_boxed_slice(),
             index: 0,
+            remote_addr: None
         }
     }
 
@@ -136,6 +153,8 @@ impl SocksStream {
                 trace!("Sub negotiation read buf: {:?}, {:?}", len, &buf);
                 if let Ok(req) = Request::new(buf) {
                     trace!("Read request: {:?}", &req);
+                    let remote_addr = get_remote_addr_buf(&req.addr, req.port);
+                    *me.remote_addr = Some(remote_addr);
                     let reply = Reply::v5(Rep::Suceeded, req.addr, req.port);
                     let buf = reply.encode();
                     me.buf[0..buf.len()].copy_from_slice(&buf);

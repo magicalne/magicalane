@@ -128,7 +128,7 @@ impl<'a> Addr<'a> {
                     Some((Addr::IPV4(&buf[1..5]), 5))
                 }
                 4 => {
-                    Some((Addr::IPV4(&buf[1..17]), 17))
+                    Some((Addr::IPV6(&buf[1..17]), 17))
                 }
                 3 => {
                     let size = buf.get(1).map(|l| -> usize { *l as usize });
@@ -173,6 +173,30 @@ impl<'a> Request<'a> {
         Ok(Self {
             ver, cmd, addr, port
         })
+    }
+}
+
+pub fn get_remote_addr_buf(addr: &Addr, port: &[u8]) -> Vec<u8> {
+    match addr {
+        Addr::IPV4(v4) => {
+            let mut buf = Vec::with_capacity(6);
+            buf[0..4].copy_from_slice(v4);
+            buf[4..6].copy_from_slice(port);
+            buf
+        }
+        Addr::IPV6(v6) => {
+            let mut buf = Vec::with_capacity(18);
+            buf[0..16].copy_from_slice(v6);
+            buf[16..18].copy_from_slice(port);
+            buf
+        }
+        Addr::DomainName(n, domain) => {
+            let n = *n;
+            let mut buf = Vec::with_capacity(n+2);
+            buf[0..n].copy_from_slice(domain);
+            buf[n..n+2].copy_from_slice(port);
+            buf
+        }
     }
 }
 

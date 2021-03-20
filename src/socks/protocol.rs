@@ -1,4 +1,9 @@
-use bytes::{BufMut, BytesMut};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    u16,
+};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 //https://tools.ietf.org/html/rfc1928
@@ -75,7 +80,7 @@ impl Version {
         match b {
             VERSION_V4 => Ok(Version::V4),
             VERSION_V5 => Ok(Version::V5),
-            _ => Err(Error::UnsupportedVersion)
+            _ => Err(Error::UnsupportedVersion),
         }
     }
 
@@ -100,7 +105,7 @@ impl Command {
             CONNECT => Ok(Command::Connect),
             BIND => Ok(Command::Bind),
             UDP_ASSOCIATE => Ok(Command::UDPAsociate),
-            _ => Err(Error::UnsupportedCommand)
+            _ => Err(Error::UnsupportedCommand),
         }
     }
 
@@ -108,32 +113,59 @@ impl Command {
         match self {
             Command::Connect => CONNECT,
             Command::Bind => BIND,
-            Command::UDPAsociate => UDP_ASSOCIATE
+            Command::UDPAsociate => UDP_ASSOCIATE,
         }
     }
 }
 
 #[derive(Debug)]
-pub enum Addr<'a> {
-    IPV4(&'a [u8]),
-    IPV6(&'a [u8]),
-    DomainName(usize, &'a[u8]),
+pub enum Addr {
+    SocketAddr(SocketAddr),
+    DomainName(Vec<u8>, u16),
 }
 
-impl<'a> Addr<'a> {
-    fn decode(buf: &'a [u8]) -> Result<(Self, usize)> {
+impl Addr {
+    pub fn decode(buf: & [u8]) -> Result<Self> {
         buf.get(0)
             .and_then(|tp| match *tp {
                 1 => {
-                    Some((Addr::IPV4(&buf[1..5]), 5))
+                    //1 flag, 4 bytes ipv4, 2 bytes port
+                    if buf.len() >= 7 {
+                        let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+                        let mut port: u16 = ((buf[5] as u16) << 8) | (buf[6] as u16);
+                        Some(Self::SocketAddr(SocketAddr::V4(SocketAddrV4::new(
+                            ip, port,
+                        ))))
+                    } else {
+                        None
+                    }
                 }
                 4 => {
-                    Some((Addr::IPV6(&buf[1..17]), 17))
+                    //1 flat, 16 bytes ipv6, 2 bytes port
+                    if buf.len() >= 19 {
+                        let port = (buf[17] as u16) << 8 | (buf[18] as u16);
+                        let ip = Ipv6Addr::new(
+                            (buf[1] as u16) << 8 | (buf[2] as u16),
+                            (buf[3] as u16) << 8 | (buf[4] as u16),
+                            (buf[5] as u16) << 8 | (buf[6] as u16),
+                            (buf[7] as u16) << 8 | (buf[8] as u16),
+                            (buf[9] as u16) << 8 | (buf[10] as u16),
+                            (buf[11] as u16) << 8 | (buf[12] as u16),
+                            (buf[13] as u16) << 8 | (buf[14] as u16),
+                            (buf[15] as u16) << 8 | (buf[16] as u16),
+                        );
+                        Some(Self::SocketAddr(SocketAddr::V6(SocketAddrV6::new(
+                            ip, port, 0, 0,
+                        ))))
+                    } else {
+                        None
+                    }
                 }
                 3 => {
                     let size = buf.get(1).map(|l| -> usize { *l as usize });
                     if let Some(size) = size {
-                        Some((Addr::DomainName(size, &buf[2..(2 + size)]), 2+size))
+                        let port = (buf[1 + size] as u16) << 8 | (buf[2 + size] as u16);
+                        Some(Self::DomainName(Vec::from(&buf[2..(2 + size)]), port))
                     } else {
                         None
                     }
@@ -142,18 +174,40 @@ impl<'a> Addr<'a> {
             })
             .ok_or(Error::InvalidateAddress)
     }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        match self {
+            Addr::SocketAddr(addr) => match addr {
+                SocketAddr::V4(ipv4) => {
+                    buf.put_u8(1);
+                    buf.put_slice(&ipv4.ip().octets());
+                    buf.put_u16(ipv4.port());
+                }
+                SocketAddr::V6(ipv6) => {
+                    buf.put_u8(4);
+                    buf.put_slice(&ipv6.ip().octets());
+                    buf.put_u16(ipv6.port());
+                }
+            },
+            Addr::DomainName(domain, port) => {
+                buf.put_u8(3);
+                buf.put_u8(domain.len() as u8);
+                buf.put_slice(domain);
+                buf.put_u16(*port);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct Request<'a> {
+pub struct Request {
     pub ver: Version,
     pub cmd: Command,
-    pub addr: Addr<'a>,
-    pub port: &'a [u8],
+    pub addr: Addr,
 }
 
-impl<'a> Request<'a> {
-    pub fn new(buf: &'a [u8]) -> Result<Self> {
+impl Request {
+    pub fn new(buf: &[u8]) -> Result<Self> {
         let ver = buf
             .get(0)
             .and_then(|v| if *v == 5 { Some(Version::V5) } else { None })
@@ -168,35 +222,8 @@ impl<'a> Request<'a> {
             })
             .ok_or(Error::UnsupportedCommand)?;
         let buf = &buf[3..];
-        let (addr, index) = Addr::decode(&buf)?;
-        let port = &buf[index..index+2];
-        Ok(Self {
-            ver, cmd, addr, port
-        })
-    }
-}
-
-pub fn get_remote_addr_buf(addr: &Addr, port: &[u8]) -> Vec<u8> {
-    match addr {
-        Addr::IPV4(v4) => {
-            let mut buf = Vec::with_capacity(6);
-            buf[0..4].copy_from_slice(v4);
-            buf[4..6].copy_from_slice(port);
-            buf
-        }
-        Addr::IPV6(v6) => {
-            let mut buf = Vec::with_capacity(18);
-            buf[0..16].copy_from_slice(v6);
-            buf[16..18].copy_from_slice(port);
-            buf
-        }
-        Addr::DomainName(n, domain) => {
-            let n = *n;
-            let mut buf = Vec::with_capacity(n+2);
-            buf[0..n].copy_from_slice(domain);
-            buf[n..n+2].copy_from_slice(port);
-            buf
-        }
+        let addr = Addr::decode(&buf)?;
+        Ok(Self { ver, cmd, addr })
     }
 }
 
@@ -223,7 +250,7 @@ pub enum Rep {
     TTLExpired,
     CommandNotSupported,
     AddressTypeNotSuported,
-    Unassigned
+    Unassigned,
 }
 
 impl Rep {
@@ -238,7 +265,7 @@ impl Rep {
             Rep::TTLExpired => 6,
             Rep::CommandNotSupported => 7,
             Rep::AddressTypeNotSuported => 8,
-            Rep::Unassigned => 9
+            Rep::Unassigned => 9,
         }
     }
 }
@@ -246,15 +273,15 @@ impl Rep {
 pub struct Reply<'a> {
     ver: Version,
     rep: Rep,
-    addr: Addr<'a>,
-    port: &'a [u8]
+    addr: &'a Addr,
 }
 
 impl<'a> Reply<'a> {
-    pub fn v5(rep: Rep, addr: Addr<'a>, port: &'a [u8]) -> Self {
+    pub fn v5(rep: Rep, addr: &'a Addr) -> Self {
         Self {
             ver: Version::V5,
-            rep, addr, port
+            rep,
+            addr,
         }
     }
 
@@ -263,22 +290,7 @@ impl<'a> Reply<'a> {
         buf.put_u8(self.ver.encode());
         buf.put_u8(self.rep.encode());
         buf.put_u8(0); //reserved
-        match self.addr {
-            Addr::IPV4(addr) => {
-                buf.put_u8(1);
-                buf.put_slice(addr);
-            }
-            Addr::IPV6(addr) => {
-                buf.put_u8(4);
-                buf.put_slice(addr);
-            }
-            Addr::DomainName(size, addr) => {
-                buf.put_u8(3);
-                buf.put_u8(size as u8);
-                buf.put_slice(addr)
-            }
-        }
-        buf.put_slice(self.port);
+        self.addr.encode(&mut buf);
         buf
     }
 }
@@ -301,7 +313,7 @@ mod tests {
         buf.put_slice(&[192, 168, 1, 1]);
         buf.put_u16(1080);
         let req = Request::new(&buf)?;
-        let reply = Reply::v5(Rep::Suceeded, req.addr, req.port);
+        let reply = Reply::v5(Rep::Suceeded, req.addr);
         let buf = reply.encode();
         let mut expect = BytesMut::new();
         expect.put_u8(5);
@@ -311,7 +323,7 @@ mod tests {
         expect.put_slice(&[192, 168, 1, 1]);
         expect.put_u16(1080);
         assert_eq!(expect.chunk(), buf.chunk());
-        
+
         Ok(())
     }
 
@@ -320,7 +332,7 @@ mod tests {
         let vec = vec![0; 1];
         let mut buf = vec.into_boxed_slice();
         dbg!(buf.len());
-        let arr = [1,2,3,34,1,1];
+        let arr = [1, 2, 3, 34, 1, 1];
         buf[0..arr.len()].clone_from_slice(&arr);
     }
 }

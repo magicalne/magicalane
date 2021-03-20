@@ -17,9 +17,7 @@ use tracing::error;
 
 use crate::{
     error::{Error, Result},
-    generate_key_and_cert_der, load_private_cert, load_private_key,
     quic::quic_quinn::QuinnServer,
-    stream::{ProxyStreamPair, QuinnBidiStream},
     ALPN_QUIC,
 };
 

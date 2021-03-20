@@ -11,16 +11,67 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{ready, FutureExt, Stream, StreamExt};
-use quinn::{Endpoint, NewConnection, VarInt, crypto::{rustls::TlsSession, Session}, generic::{RecvStream, SendStream, ServerConfig}};
-use tokio::io::AsyncRead;
+use quinn::{
+    crypto::{rustls::TlsSession, Session},
+    generic::{RecvStream, SendStream, ServerConfig},
+    Endpoint, NewConnection, VarInt,
+};
+use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpStream};
 use tracing::{error, trace};
 
 use crate::{
     error::{Error, Result},
-    generate_key_and_cert_der, load_private_cert, load_private_key, ALPN_QUIC,
+    generate_key_and_cert_der, load_private_cert, load_private_key,
+    socks::protocol::Addr,
+    ALPN_QUIC,
 };
 
 const PASSWORD_VALIDATE_RESPONSE: [u8; 1] = [0];
+
+#[pin_project::pin_project]
+pub struct QuinnStream<S: Session> {
+    #[pin]
+    send: SendStream<S>,
+    #[pin]
+    recv: RecvStream<S>
+}
+
+impl<S> QuinnStream<S> where S: Session {
+
+    pub fn new(send: SendStream<S>, recv: RecvStream<S>) -> Self {
+        Self {
+            send, recv
+        }
+    }
+}
+
+impl<S> AsyncRead for QuinnStream<S> where S: Session {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.project().recv.poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for QuinnStream<S> where S: Session {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.project().send.poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.project().send.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.project().send.poll_shutdown(cx)
+    }
+}
 
 pub struct Connection {
     connection: quinn::generic::Connection<TlsSession>,
@@ -56,6 +107,7 @@ impl Connection {
                         } else {
                             trace!("Password is validate.");
                             send.write_all(&PASSWORD_VALIDATE_RESPONSE).await?;
+                            send.finish().await?;
                             Ok(())
                         }
                     }
@@ -66,51 +118,56 @@ impl Connection {
             None => Err(Error::NotConnectedError),
         }
     }
+
+    pub async fn open_remote(&mut self) -> Result<()> {
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        let mut buf = BytesMut::with_capacity(128);
+        match recv.read(&mut buf).await? {
+            Some(n) => match Addr::decode(&buf[..n])? {
+                Addr::SocketAddr(ip) => {
+                    TcpStream::connect(ip).await?;
+                    Ok(())
+                }
+                Addr::DomainName(domain, port) => {
+                    let domain = std::str::from_utf8(&domain)?;
+                    let socket = (domain, port);
+                    if let Ok(remote) = TcpStream::connect(socket).await {
+                        buf.clear();
+                        buf.put_u8(0);
+                        send.write_all(&buf[0..1]).await?;
+                    }
+                    Ok(())
+                }
+            },
+            None => Err(Error::NotConnectedError),
+        }
+    }
 }
 
 impl Stream for Connection {
     type Item = Result<(SendStream<TlsSession>, RecvStream<TlsSession>)>;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.connection.open_bi().poll_unpin(cx)) {
-            Ok((send, recv)) => {
-                Poll::Ready(Some(Ok((send, recv))))
-            }
-            Err(err) => {
-                Poll::Ready(Some(Err(Error::QuinnConnectionError(err))))
-            }
+            Ok((send, recv)) => Poll::Ready(Some(Ok((send, recv)))),
+            Err(err) => Poll::Ready(Some(Err(Error::QuinnConnectionError(err)))),
         }
     }
 }
 
-pub struct QuicQuinnClient<'a> {
-    host: &'a str,
-    port: u16,
-    cert_path: Option<&'a str>,
+pub struct QuicQuinnClient {
+    conn: quinn::generic::Connection<TlsSession>,
+    buf: BytesMut,
 }
 
-impl<'a> QuicQuinnClient<'a> {
-    pub fn new(host: &'a str, port: u16, cert_path: Option<&'a str>) -> Self {
-        Self {
-            host,
-            port,
-            cert_path,
-        }
-    }
-
-    pub async fn connect(
-        &mut self,
-        password: &str,
-    ) -> Result<quinn::generic::Connection<TlsSession>> {
+impl QuicQuinnClient {
+    pub async fn new(host: &str, port: u16, cert_path: Option<&str>) -> Result<Self> {
         let mut client_config = quinn::ClientConfigBuilder::default();
         client_config.protocols(ALPN_QUIC);
         client_config.enable_keylog();
         // let dirs = directories_next::ProjectDirs::from("org", "tls", "examples").unwrap();
         //"/home/magicalne/.local/share/examples/cert.der"
-        self.cert_path
+        cert_path
             .map(|path| {
                 fs::read(path)
                     .map(|cert| quinn::Certificate::from_der(&cert))
@@ -131,7 +188,7 @@ impl<'a> QuicQuinnClient<'a> {
                 })
             });
         let config = client_config.build();
-        let remote = (self.host, self.port)
+        let remote = (host, port)
             .to_socket_addrs()?
             .find(|add| add.is_ipv4())
             .ok_or(Error::UnknownRemoteHost)?;
@@ -145,31 +202,50 @@ impl<'a> QuicQuinnClient<'a> {
         trace!("Client bind incoming: {:?}", &incoming);
 
         // Connect to the server passing in the server name which is supposed to be in the server certificate.
-        let connection = endpoint.connect(&remote, self.host)?.await?;
+        let connection = endpoint.connect(&remote, host)?.await?;
         let NewConnection { connection, .. } = connection;
-        send_passwd(&connection, password).await?;
-        Ok(connection)
+        Ok(Self {
+            conn: connection,
+            buf: BytesMut::with_capacity(128),
+        })
     }
-}
 
-async fn send_passwd(
-    conn: &quinn::generic::Connection<TlsSession>,
-    password: &str,
-) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    let mut buf = BytesMut::new();
-    buf.put_u8(password.len() as u8);
-    buf.put_slice(password.as_bytes());
-    send.write_all(&buf).await?;
-    trace!("Sent password validation request.");
-    match recv.read(&mut buf).await? {
-        Some(n) => {
-            trace!("Password validate successfully. n: {:?}", n);
-            Ok(())
+    pub async fn send_passwd(&mut self, password: &str) -> Result<()> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        let mut buf = &mut self.buf;
+        buf.put_u8(password.len() as u8);
+        buf.put_slice(password.as_bytes());
+        send.write_all(&buf[0..password.len() + 1]).await?;
+        trace!("Sent password validation request.");
+        match recv.read(&mut buf).await? {
+            Some(n) => {
+                trace!("Password validate successfully. n: {:?}", n);
+                Ok(())
+            }
+            None => {
+                trace!("Close connection due to wrong password.");
+                Err(Error::WrongPassword)
+            }
         }
-        None => {
-            trace!("Close connection due to wrong password.");
-            Err(Error::WrongPassword)
+    }
+
+    pub async fn open_remote(&mut self, buf: &[u8]) -> Result<()> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        send.write_all(buf).await?;
+        trace!("Sent open remote request.");
+        match recv.read(&mut self.buf).await? {
+            Some(1) => {
+                trace!("Open remote successfully.");
+                Ok(())
+            }
+            Some(n) => {
+                trace!("Cannot open remote: {:?}", &self.buf[..n]);
+                Err(Error::OpenRemoteAddrError)
+            }
+            None => {
+                trace!("Connection is closed.");
+                Err(Error::NotConnectedError)
+            }
         }
     }
 }

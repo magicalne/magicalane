@@ -1,3 +1,5 @@
+use std::str::Utf8Error;
+
 use quinn::{ParseError, crypto::rustls::TLSError};
 use rcgen::RcgenError;
 use thiserror::Error;
@@ -15,6 +17,8 @@ pub enum Error {
     WrongProtocol,
     #[error("Wrong password.")]
     WrongPassword,
+    #[error("Failed to open remote addr")]
+    OpenRemoteAddrError,
     /// Buffer is empty.
     #[error("Empty buffer.")]
     EmptyBuffer,
@@ -63,6 +67,11 @@ pub enum Error {
 
     #[error("Socks stream proccess failed")]
     SocksStreamProcessFailed,
+    #[error("Socks protocol: {0}")]
+    SocksError(#[from] crate::socks::protocol::Error),
+
+    #[error("Utf8 error")]
+    Utf8Error(#[from] Utf8Error),
 
     #[error("Send stream error.")]
     SendStreamError,

@@ -13,39 +13,40 @@ use bytes::{Buf, BufMut, BytesMut};
 use futures::{ready, FutureExt, Stream, StreamExt};
 use quinn::{
     crypto::{rustls::TlsSession, Session},
-    generic::{RecvStream, SendStream, ServerConfig},
-    Endpoint, NewConnection, VarInt,
+    generic::ServerConfig,
+    Endpoint, NewConnection, RecvStream, SendStream, VarInt,
 };
-use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpStream};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
 use tracing::{error, trace};
 
 use crate::{
     error::{Error, Result},
     generate_key_and_cert_der, load_private_cert, load_private_key,
     socks::protocol::Addr,
+    stream::Transfer,
     ALPN_QUIC,
 };
 
 const PASSWORD_VALIDATE_RESPONSE: [u8; 1] = [0];
 
 #[pin_project::pin_project]
-pub struct QuinnStream<S: Session> {
+pub struct QuinnStream {
     #[pin]
-    send: SendStream<S>,
+    send: SendStream,
     #[pin]
-    recv: RecvStream<S>
+    recv: RecvStream,
 }
 
-impl<S> QuinnStream<S> where S: Session {
-
-    pub fn new(send: SendStream<S>, recv: RecvStream<S>) -> Self {
-        Self {
-            send, recv
-        }
+impl QuinnStream {
+    pub fn new(send: SendStream, recv: RecvStream) -> Self {
+        Self { send, recv }
     }
 }
 
-impl<S> AsyncRead for QuinnStream<S> where S: Session {
+impl AsyncRead for QuinnStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -55,7 +56,7 @@ impl<S> AsyncRead for QuinnStream<S> where S: Session {
     }
 }
 
-impl<S> AsyncWrite for QuinnStream<S> where S: Session {
+impl AsyncWrite for QuinnStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -119,33 +120,45 @@ impl Connection {
         }
     }
 
-    pub async fn open_remote(&mut self) -> Result<()> {
+    pub async fn open_remote(&mut self) -> Result<Transfer> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let mut buf = BytesMut::with_capacity(128);
-        match recv.read(&mut buf).await? {
+        let remote = match recv.read(&mut buf).await? {
             Some(n) => match Addr::decode(&buf[..n])? {
-                Addr::SocketAddr(ip) => {
-                    TcpStream::connect(ip).await?;
-                    Ok(())
-                }
+                Addr::SocketAddr(ip) => Some(TcpStream::connect(ip).await),
                 Addr::DomainName(domain, port) => {
                     let domain = std::str::from_utf8(&domain)?;
                     let socket = (domain, port);
-                    if let Ok(remote) = TcpStream::connect(socket).await {
-                        buf.clear();
-                        buf.put_u8(0);
-                        send.write_all(&buf[0..1]).await?;
-                    }
-                    Ok(())
+                    Some(TcpStream::connect(socket).await)
                 }
             },
+            None => None,
+        };
+        match remote {
+            Some(remote) => {
+                buf.clear();
+                match remote {
+                    Ok(remote) => {
+                        buf.put_u8(0);
+                        send.write_all(&buf[0..1]).await?;
+                        let transfer = Transfer::new(send, recv, remote);
+                        Ok(transfer)
+                    }
+                    Err(err) => {
+                        buf.put_u8(0);
+                        send.write_all(&buf[0..1]).await?;
+                        trace!("Failed to open remote: {:?}", &err);
+                        Err(Error::IoError(err))
+                    }
+                }
+            }
             None => Err(Error::NotConnectedError),
         }
     }
 }
 
 impl Stream for Connection {
-    type Item = Result<(SendStream<TlsSession>, RecvStream<TlsSession>)>;
+    type Item = Result<(SendStream, RecvStream)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.connection.open_bi().poll_unpin(cx)) {
@@ -198,8 +211,7 @@ impl QuicQuinnClient {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         // Bind this endpoint to a UDP socket on the given client address.
         let (endpoint, incoming) = endpoint_builder.bind(&addr)?;
-        trace!("Client bind endpoint: {:?}", &endpoint);
-        trace!("Client bind incoming: {:?}", &incoming);
+        trace!("Client bind endpoint");
 
         // Connect to the server passing in the server name which is supposed to be in the server certificate.
         let connection = endpoint.connect(&remote, host)?.await?;
@@ -229,14 +241,14 @@ impl QuicQuinnClient {
         }
     }
 
-    pub async fn open_remote(&mut self, buf: &[u8]) -> Result<()> {
+    pub async fn open_remote(&mut self, buf: &[u8]) -> Result<(SendStream, RecvStream)> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         send.write_all(buf).await?;
         trace!("Sent open remote request.");
         match recv.read(&mut self.buf).await? {
             Some(1) => {
                 trace!("Open remote successfully.");
-                Ok(())
+                Ok((send, recv))
             }
             Some(n) => {
                 trace!("Cannot open remote: {:?}", &self.buf[..n]);

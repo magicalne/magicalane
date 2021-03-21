@@ -7,13 +7,9 @@ use std::{
     sync::Arc,
 };
 
-use futures::{ready, Future, StreamExt};
-use quinn::{
-    crypto::rustls::TlsSession,
-    generic::{Connecting, Incoming, NewConnection},
-    Endpoint, ServerConfig,
-};
-use tracing::error;
+use futures::{Future, StreamExt, future::try_join, ready};
+
+use tracing::{error, trace};
 
 use crate::{
     error::{Error, Result},
@@ -41,7 +37,13 @@ impl Server {
                 Ok(mut conn) => {
                     tokio::spawn(async move {
                         if let Ok(()) = conn.validate_password().await {
-                            //init proxy stream
+                            tokio::spawn(async move {
+                                if let Ok(mut transfer) = conn.open_remote().await {
+                                    if let Err(err) = transfer.copy().await {
+                                        error!("Transfer error: {:?}", err);
+                                    }
+                                }
+                            });
                         }
                     });
                 }

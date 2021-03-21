@@ -10,21 +10,6 @@ use tracing::{debug, error, info, trace};
 
 use crate::error::{Error, Result};
 
-pub struct ProxyOpenConnection<R: AsyncRead, W: AsyncWrite> {
-    read: R,
-    write: W,
-}
-
-impl<R, W> ProxyOpenConnection<R, W>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    pub fn new(r: R, w: W) {
-        
-    }
-}
-
 struct ProxyStream<R: AsyncRead, W: AsyncWrite> {
     reader: R,
     read_done: bool,

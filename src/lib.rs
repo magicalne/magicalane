@@ -3,7 +3,6 @@ use std::{fs, future::Future, path::{Path, PathBuf}, task::Poll};
 use bytes::{Buf, Bytes, BytesMut};
 use error::{Error, Result};
 use futures::{future, ready, FutureExt};
-use stream::RecvStream;
 use quinn::{CertificateChain, PrivateKey};
 
 use protocol::Protocol;
@@ -14,7 +13,6 @@ pub mod protocol;
 pub mod quic;
 pub mod stream;
 pub mod server1;
-pub mod client1;
 pub mod socks;
 pub mod proxy;
 

@@ -118,7 +118,7 @@ impl Command {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Addr {
     SocketAddr(SocketAddr),
     DomainName(Vec<u8>, u16),
@@ -132,7 +132,7 @@ impl Addr {
                     //1 flag, 4 bytes ipv4, 2 bytes port
                     if buf.len() >= 7 {
                         let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
-                        let mut port: u16 = ((buf[5] as u16) << 8) | (buf[6] as u16);
+                        let port: u16 = ((buf[5] as u16) << 8) | (buf[6] as u16);
                         Some(Self::SocketAddr(SocketAddr::V4(SocketAddrV4::new(
                             ip, port,
                         ))))

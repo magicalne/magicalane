@@ -88,6 +88,7 @@ impl Connection {
     }
 
     pub async fn validate_password(&mut self) -> Result<()> {
+        trace!("Validate password");
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let mut buf = BytesMut::new();
         match recv.read(&mut buf).await? {
@@ -174,7 +175,7 @@ pub struct QuicQuinnClient {
 }
 
 impl QuicQuinnClient {
-    pub async fn new(host: &str, port: u16, cert_path: Option<&str>) -> Result<Self> {
+    pub async fn new(host: &str, port: u16, cert_path: Option<PathBuf>) -> Result<Self> {
         let mut client_config = quinn::ClientConfigBuilder::default();
         client_config.protocols(ALPN_QUIC);
         client_config.enable_keylog();

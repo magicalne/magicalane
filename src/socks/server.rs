@@ -1,20 +1,14 @@
-use std::{
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    vec,
-};
+use std::{path::PathBuf, sync::Arc, vec};
 
 use crate::{
-    error::{Error, Result},
+    error::{Result},
     stream::Transfer,
     quic::quic_quinn::QuicQuinnClient,
     socks::protocol::{Rep, Reply, Request},
 };
 use bytes::BytesMut;
-use futures::{future::poll_fn, ready, Future};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -31,7 +25,7 @@ impl SocksServer {
         socks_port: Option<u16>,
         proxy_host: &str,
         proxy_port: u16,
-        cert_path: Option<&str>,
+        cert_path: Option<PathBuf>,
         passwd: String,
     ) -> Result<Self> {
         let mut quic = QuicQuinnClient::new(proxy_host, proxy_port, cert_path).await?;

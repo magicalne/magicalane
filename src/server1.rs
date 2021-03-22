@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::{Future, StreamExt, future::try_join, ready};
+use futures::{future::try_join, ready, Future, StreamExt};
 
 use tracing::{error, trace};
 
@@ -33,6 +33,7 @@ impl Server {
 
     pub async fn run(&mut self) -> Result<()> {
         while let Some(conn) = self.quinn_server.next().await {
+            trace!("Receive connection");
             match conn {
                 Ok(mut conn) => {
                     tokio::spawn(async move {
@@ -44,6 +45,8 @@ impl Server {
                                     }
                                 }
                             });
+                        } else {
+                            error!("Validate password failed.");
                         }
                     });
                 }

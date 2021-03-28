@@ -32,29 +32,7 @@ impl Server {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        while let Some(conn) = self.quinn_server.next().await {
-            trace!("Receive connection");
-            match conn {
-                Ok(mut conn) => {
-                    tokio::spawn(async move {
-                        if let Ok(()) = conn.validate_password().await {
-                            tokio::spawn(async move {
-                                if let Ok(mut transfer) = conn.open_remote().await {
-                                    if let Err(err) = transfer.copy().await {
-                                        error!("Transfer error: {:?}", err);
-                                    }
-                                }
-                            });
-                        } else {
-                            error!("Validate password failed.");
-                        }
-                    });
-                }
-                Err(err) => {
-                    error!("Connection error: {:?}", err);
-                }
-            }
-        }
+        self.quinn_server.run().await?;
         Ok(())
     }
 }

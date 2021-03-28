@@ -3,6 +3,7 @@ use std::str::Utf8Error;
 use quinn::{ParseError, crypto::rustls::TLSError};
 use rcgen::RcgenError;
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tracing::dispatcher::SetGlobalDefaultError;
 
 #[derive(Error, Debug)]
@@ -53,6 +54,9 @@ pub enum Error {
     CertParseError(#[from] ParseError),
     #[error("TLSError: {0}")]
     TLSError(#[from] TLSError),
+
+    #[error("Recvive error from channel: {0}")]
+    OneshotRecvError(#[from] oneshot::error::RecvError),
 
     #[error("Stream read close.")]
     StreamClose,

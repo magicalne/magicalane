@@ -1,25 +1,25 @@
 use std::{
-    borrow::Cow,
     fs,
-    marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     pin::Pin,
     task::{Context, Poll},
-    usize,
+    u8, usize,
 };
 
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{ready, FutureExt, Stream, StreamExt};
+use futures::{ready, AsyncReadExt, FutureExt, Stream, StreamExt, TryStreamExt};
 use quinn::{
     crypto::{rustls::TlsSession, Session},
-    generic::ServerConfig,
-    Endpoint, NewConnection, RecvStream, SendStream, VarInt,
+    generic::{Connecting, ServerConfig},
+    Endpoint, NewConnection, RecvStream, SendStream,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
+    sync::{mpsc, oneshot},
 };
+use tokio_trace::log::warn;
 use tracing::{error, trace};
 
 use crate::{
@@ -31,46 +31,129 @@ use crate::{
 };
 
 const PASSWORD_VALIDATE_RESPONSE: [u8; 1] = [0];
+const OPEN_REMOTE_FAILED_RESPONSE: [u8; 1] = [0];
 
-#[pin_project::pin_project]
-pub struct QuinnStream {
-    #[pin]
-    send: SendStream,
-    #[pin]
-    recv: RecvStream,
+pub struct QuinnStream<'a> {
+    send: &'a mut SendStream,
+    recv: &'a mut RecvStream,
 }
 
-impl QuinnStream {
-    pub fn new(send: SendStream, recv: RecvStream) -> Self {
+impl<'a> QuinnStream<'a> {
+    pub fn new(send: &'a mut SendStream, recv: &'a mut RecvStream) -> Self {
         Self { send, recv }
     }
-}
 
-impl AsyncRead for QuinnStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        self.project().recv.poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for QuinnStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.project().send.poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().send.poll_flush(cx)
+    pub async fn send_open_remote(&mut self, buf: &[u8]) -> Result<()> {
+        self.send.write_all(buf).await?;
+        let mut buf = [0; 1];
+        match self.recv.read(&mut buf).await? {
+            Some(n) => {
+                trace!("Read {:?} bytes", n);
+                if OPEN_REMOTE_FAILED_RESPONSE == buf {
+                    trace!("Open remote failed");
+                    Err(Error::OpenRemoteAddrError)
+                } else {
+                    trace!("Open remote successfully.");
+                    Ok(())
+                }
+            }
+            None => {
+                trace!("Connection is closed");
+                Err(Error::NotConnectedError)
+            }
+        }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.project().send.poll_shutdown(cx)
+    pub async fn send_password(&mut self, passwd: &[u8]) -> Result<()> {
+        self.send.write_all(passwd).await?;
+        let mut buf = [0; 1];
+        match self.recv.read(&mut buf).await? {
+            Some(n) => {
+                trace!("Read {:?} bytes", n);
+                return if PASSWORD_VALIDATE_RESPONSE == buf[..n] {
+                    warn!("Wrong password");
+                    Err(Error::WrongPassword)
+                } else {
+                    trace!("Password is validate.");
+                    Ok(())
+                };
+            }
+            None => {
+                trace!("Connection is closed.");
+                Err(Error::NotConnectedError)
+            }
+        }
+    }
+
+    pub async fn validate_password(&mut self, password: &str) -> Result<()> {
+        trace!("Validate password");
+        let mut buf = vec![0; 1024];
+        match self.recv.read(&mut buf).await? {
+            Some(n) => {
+                trace!("Recv {:?} bytes from client.", n,);
+                if let Some(len) = buf.get(0) {
+                    let len = *len as usize;
+                    if len > buf.len() {
+                        trace!("buf: {:?}", buf);
+                        return Err(Error::ParsePasswordFail);
+                    } else {
+                        let buf = &buf[1..1 + len];
+                        if len != password.len() || buf != password.as_bytes() {
+                            error!("Wrong password: {:?}", buf);
+                            Err(Error::WrongPassword)
+                        } else {
+                            trace!("Password is validate.");
+                            self.send.write_all(&PASSWORD_VALIDATE_RESPONSE).await?;
+                            self.send.finish().await?;
+                            Ok(())
+                        }
+                    }
+                } else {
+                    error!("Wrong password");
+                    Err(Error::ParsePasswordFail)
+                }
+            }
+            None => {
+                trace!("Connection is closed");
+                Err(Error::NotConnectedError)
+            }
+        }
+    }
+
+    pub async fn open_remote(&mut self) -> Result<TcpStream> {
+        let mut buf = vec![0; 1024];
+        let remote = match self.recv.read(&mut buf).await? {
+            Some(n) => match Addr::decode(&buf[..n])? {
+                Addr::SocketAddr(ip) => Some(TcpStream::connect(ip).await),
+                Addr::DomainName(domain, port) => {
+                    let domain = std::str::from_utf8(&domain)?;
+                    let socket = (domain, port);
+                    Some(TcpStream::connect(socket).await)
+                }
+            },
+            None => None,
+        };
+        trace!("Connect remote: {:?}", &remote);
+        match remote {
+            Some(remote) => {
+                buf.clear();
+                match remote {
+                    Ok(remote) => {
+                        buf.put_u8(0);
+                        self.send.write_all(&buf[0..1]).await?;
+                        trace!("Connection is setup. Notify client.");
+                        Ok(remote)
+                    }
+                    Err(err) => {
+                        buf.put_u8(0);
+                        self.send.write_all(&buf[0..1]).await?;
+                        trace!("Failed to open remote: {:?}", &err);
+                        Err(Error::IoError(err))
+                    }
+                }
+            }
+            None => Err(Error::NotConnectedError),
+        }
     }
 }
 
@@ -123,7 +206,7 @@ impl Connection {
 
     pub async fn open_remote(&mut self) -> Result<Transfer> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
-        let mut buf = BytesMut::with_capacity(128);
+        let mut buf = vec![0; 1024];
         let remote = match recv.read(&mut buf).await? {
             Some(n) => match Addr::decode(&buf[..n])? {
                 Addr::SocketAddr(ip) => Some(TcpStream::connect(ip).await),
@@ -135,6 +218,7 @@ impl Connection {
             },
             None => None,
         };
+        trace!("remote: {:?}", &remote);
         match remote {
             Some(remote) => {
                 buf.clear();
@@ -212,7 +296,7 @@ impl QuicQuinnClient {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         // Bind this endpoint to a UDP socket on the given client address.
         let (endpoint, incoming) = endpoint_builder.bind(&addr)?;
-        trace!("Client bind endpoint");
+        trace!("Client bind endpoint: {:?}", &addr);
 
         // Connect to the server passing in the server name which is supposed to be in the server certificate.
         let connection = endpoint.connect(&remote, host)?.await?;
@@ -228,7 +312,9 @@ impl QuicQuinnClient {
         let mut buf = &mut self.buf;
         buf.put_u8(password.len() as u8);
         buf.put_slice(password.as_bytes());
-        send.write_all(&buf[0..password.len() + 1]).await?;
+        let slice = &buf[0..password.len() + 1];
+        trace!("Sending: {:?} bytes, {:?}", slice.len(), slice);
+        send.write_all(slice).await?;
         trace!("Sent password validation request.");
         match recv.read(&mut buf).await? {
             Some(n) => {
@@ -286,7 +372,37 @@ impl QuinnServer {
         endpoint_builder.listen(server_config.build());
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
         let (_, incoming) = endpoint_builder.bind(&addr)?;
+        trace!("Quic server bind: {:?}", &addr);
         Ok(Self { password, incoming })
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        while let Some(connecting) = self.incoming.next().await {
+            trace!("connecting from remote: {:?}", &connecting.remote_address());
+            match connecting.await {
+                Ok(quinn::generic::NewConnection { mut bi_streams, .. }) => {
+                    let password = self.password.clone();
+                    tokio::spawn(async move {
+                        if let Some((mut send, mut recv)) = bi_streams.try_next().await? {
+                            let mut stream = QuinnStream::new(&mut send, &mut recv);
+                            stream.validate_password(&password).await?;
+                        }
+                        while let Some((mut send, mut recv)) = bi_streams.try_next().await? {
+                            let mut stream = QuinnStream::new(&mut send, &mut recv);
+                            let remote = stream.open_remote().await?;
+                            let mut transfer = Transfer::new(send, recv, remote);
+                            transfer.copy().await?;
+                        }
+
+                        Ok::<(), Error>(())
+                    });
+                }
+                Err(err) => {
+                    trace!("Connection error: {:?}", err);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -298,13 +414,183 @@ impl Stream for QuinnServer {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         match ready!(Pin::new(&mut self.incoming).poll_next_unpin(cx)) {
-            Some(mut c) => match ready!(c.poll_unpin(cx)) {
-                Ok(quinn::generic::NewConnection { connection, .. }) => {
-                    Poll::Ready(Some(Ok(Connection::new(connection, self.password.clone()))))
+            Some(mut c) => {
+                trace!("connecting from remote: {:?}", &c.remote_address());
+                match ready!(c.poll_unpin(cx)) {
+                    Ok(quinn::generic::NewConnection { connection, .. }) => {
+                        trace!("Accept new connection: {:?}", &connection.remote_address());
+                        Poll::Ready(Some(Ok(Connection::new(connection, self.password.clone()))))
+                    }
+                    Err(err) => {
+                        trace!("Connection error: {:?}", err);
+                        Poll::Ready(Some(Err(Error::QuinnConnectionError(err))))
+                    }
                 }
-                Err(err) => Poll::Ready(Some(Err(Error::QuinnConnectionError(err)))),
-            },
+            }
             None => Poll::Ready(None),
         }
+    }
+}
+
+pub async fn run_quinn_client_actor(mut actor: QuinnClientActor) {
+    while let Some(recv) = actor.receiver.recv().await {
+        actor.handle(recv).await;
+    }
+}
+
+pub struct QuinnClientActor {
+    receiver: mpsc::Receiver<OpenRemoteMessage>,
+    remote_addr: SocketAddr,
+    endpoint: Endpoint,
+    password: Vec<u8>,
+    server_name: String,
+    connection: Option<quinn::Connection>,
+}
+
+impl QuinnClientActor {
+    pub async fn new(
+        server_name: String,
+        port: u16,
+        cert_path: Option<PathBuf>,
+        password: Vec<u8>,
+        receiver: mpsc::Receiver<OpenRemoteMessage>,
+    ) -> Result<Self> {
+        let mut client_config = quinn::ClientConfigBuilder::default();
+        client_config.protocols(ALPN_QUIC);
+        client_config.enable_keylog();
+        cert_path
+            .map(|path| {
+                fs::read(path)
+                    .map(|cert| quinn::Certificate::from_der(&cert))
+                    .map(|cert| match cert {
+                        Ok(cert) => {
+                            if let Err(err) = client_config.add_certificate_authority(cert) {
+                                error!("Client add cert failed: {:?}.", err);
+                            }
+                        }
+                        Err(err) => {
+                            error!("Client parse cert error: {:?}.", err);
+                        }
+                    })
+            })
+            .map(|r| {
+                r.map_err(|err| {
+                    error!("Client config cert with error: {:?}.", err);
+                })
+            });
+        let config = client_config.build();
+        let remote_addr = (server_name.as_str(), port)
+            .to_socket_addrs()?
+            .find(|add| add.is_ipv4())
+            .ok_or(Error::UnknownRemoteHost)?;
+        trace!("Connect remote: {:?}", &remote_addr);
+        let mut endpoint_builder = Endpoint::builder();
+        endpoint_builder.default_client_config(config);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        // Bind this endpoint to a UDP socket on the given client address.
+        let (endpoint, _) = endpoint_builder.bind(&addr)?;
+        trace!("Client bind endpoint: {:?}", &addr);
+
+        Ok(Self {
+            receiver,
+            remote_addr,
+            endpoint,
+            password,
+            server_name,
+            connection: None,
+        })
+    }
+
+    pub async fn open_conn(&mut self) -> Result<()> {
+        if self.connection.is_none() {
+            let connection = self
+                .endpoint
+                .connect(&self.remote_addr, &self.server_name)?
+                .await?;
+            let NewConnection { connection, .. } = connection;
+            let (mut send, mut recv) = connection.open_bi().await?;
+            let mut stream = QuinnStream::new(&mut send, &mut recv);
+            stream.send_password(&self.password).await?;
+            self.connection = Some(connection);
+        }
+        Ok(())
+    }
+
+    /**
+    Send proxy info to remote server.
+    */
+    pub async fn handle(&mut self, msg: OpenRemoteMessage) {
+        if let Err(err) = self.open_conn().await {
+            let _ = &msg.respond(Err(err));
+            return;
+        }
+        if let Some(connection) = self.connection.as_mut() {
+            match connection.open_bi().await {
+                Ok((mut send, mut recv)) => {
+                    let mut stream = QuinnStream::new(&mut send, &mut recv);
+                    match stream.send_open_remote(&msg.get_buf()).await {
+                        Ok(_) => {
+                            trace!("Open remote successfully.");
+                            let _ = &msg.respond(Ok((send, recv)));
+                        }
+                        Err(err) => {
+                            trace!("Open remote failed");
+                            let _ = &msg.respond(Err(err));
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = &msg.respond(Err(Error::QuinnConnectionError(err)));
+                }
+            }
+        }
+    }
+}
+
+pub struct QuinnClientHandle {
+    sender: mpsc::Sender<OpenRemoteMessage>,
+}
+
+impl QuinnClientHandle {
+    pub async fn new(
+        server_name: String,
+        port: u16,
+        cert_path: Option<PathBuf>,
+        password: Vec<u8>,
+    ) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel(8);
+        let actor = QuinnClientActor::new(server_name, port, cert_path, password, receiver).await?;
+        tokio::spawn(run_quinn_client_actor(actor));
+
+        Ok(Self { sender })
+    }
+
+    pub async fn open_remote(&self, buf: Vec<u8>) -> Result<(SendStream, RecvStream)> {
+        let (send, recv) = oneshot::channel();
+        let msg = OpenRemoteMessage::new(buf, send);
+        let _ = self.sender.send(msg).await;
+        recv.await?
+    }
+}
+
+pub struct OpenRemoteMessage {
+    buf: Vec<u8>,
+    respond_to: oneshot::Sender<Result<(SendStream, RecvStream)>>,
+}
+
+impl OpenRemoteMessage {
+    pub fn new(
+        buf: Vec<u8>,
+        respond_to: oneshot::Sender<Result<(SendStream, RecvStream)>>,
+    ) -> Self {
+        Self { buf, respond_to }
+    }
+
+    pub fn respond(self, response: Result<(SendStream, RecvStream)>) {
+        let _ = self.respond_to.send(response);
+    }
+
+    pub fn get_buf(&self) -> &[u8] {
+        &self.buf[..]
     }
 }

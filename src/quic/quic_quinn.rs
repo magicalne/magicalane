@@ -439,7 +439,7 @@ pub async fn run_quinn_client_actor(mut actor: QuinnClientActor) {
 }
 
 pub struct QuinnClientActor {
-    receiver: mpsc::Receiver<OpenRemoteMessage>,
+    pub receiver: mpsc::Receiver<OpenRemoteMessage>,
     remote_addr: SocketAddr,
     endpoint: Endpoint,
     password: Vec<u8>,
@@ -547,6 +547,7 @@ impl QuinnClientActor {
     }
 }
 
+#[derive(Clone)]
 pub struct QuinnClientHandle {
     sender: mpsc::Sender<OpenRemoteMessage>,
 }

@@ -1,15 +1,28 @@
 use std::{borrow::BorrowMut, path::PathBuf, sync::Arc, vec};
 
-use crate::{error::{Result}, quic::quic_quinn::{QuicQuinnClient, QuinnClientActor, QuinnClientHandle}, socks::protocol::{Rep, Reply, Request}, stream::Transfer};
+use crate::{
+    error::Result,
+    quic::quic_quinn::{QuicQuinnClient, QuinnClientActor, QuinnClientHandle},
+    socks::protocol::{Rep, Reply, Request},
+    stream::Transfer,
+};
 use bytes::BytesMut;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, UdpSocket}, sync::{Mutex, mpsc, oneshot}};
+use futures::future::try_join;
+use quinn::{RecvStream, SendStream};
+use tokio::{
+    io::{copy, AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::{mpsc, oneshot, Mutex},
+};
 use tracing::{debug, error, info, trace};
 
 use super::protocol::{Addr, VERSION_METHOD_MESSAGE};
 pub struct SocksServer {
     tcp: TcpListener,
     quic_client: Arc<Mutex<QuicQuinnClient>>,
-    socks: ActorSocksHandle
+    socks: ActorSocksHandle,
+    quinn: QuinnClientHandle,
+    proxy: ActorProxyHandle,
 }
 
 impl SocksServer {
@@ -20,7 +33,7 @@ impl SocksServer {
         cert_path: Option<PathBuf>,
         passwd: String,
     ) -> Result<Self> {
-        let mut quic = QuicQuinnClient::new(proxy_host, proxy_port, cert_path).await?;
+        let mut quic = QuicQuinnClient::new(proxy_host, proxy_port, cert_path.clone()).await?;
         quic.send_passwd(&passwd).await?;
 
         let port = socks_port.unwrap_or(1080);
@@ -29,10 +42,16 @@ impl SocksServer {
         info!("Socks server bind local port: {:?}", port);
 
         let socks = ActorSocksHandle::new().await?;
+        let server_name = proxy_host.to_string();
+        let password = passwd.into_bytes();
+        let quinn = QuinnClientHandle::new(server_name, port, cert_path, password).await?;
+        let proxy = ActorProxyHandle::default();
         Ok(Self {
             tcp,
             quic_client: Arc::new(Mutex::new(quic)),
-            socks
+            socks,
+            quinn,
+            proxy,
         })
     }
 
@@ -59,7 +78,10 @@ impl SocksServer {
     pub async fn start(&mut self) -> Result<()> {
         while let Ok((stream, from)) = self.tcp.accept().await {
             let trans = Transport::TCP { stream };
-            let r = self.socks.negotiation(trans).await;
+            let addr = self
+                .socks
+                .negotiation(trans, self.quinn.clone(), self.proxy.clone())
+                .await?;
         }
 
         Ok(())
@@ -119,26 +141,107 @@ impl SocksStream {
         trace!("Sub negotiation write buf: {:?}", &buf.len());
         Ok(req.addr)
     }
+}
 
+pub struct ProxyMessage {
+    trans: Transport,
+    recv: RecvStream,
+    send: SendStream,
+}
+
+impl ProxyMessage {
+    pub fn new(trans: Transport, recv: RecvStream, send: SendStream) -> Self {
+        Self { trans, recv, send }
+    }
+}
+
+pub struct ActorProxy {
+    receiver: mpsc::Receiver<ProxyMessage>,
+}
+
+impl ActorProxy {
+    pub fn new(receiver: mpsc::Receiver<ProxyMessage>) -> Self {
+        Self { receiver }
+    }
+
+    pub async fn handle(&mut self, msg: ProxyMessage) {
+        let ProxyMessage {
+            trans,
+            mut recv,
+            mut send,
+        } = msg;
+        match trans {
+            Transport::TCP { mut stream } => {
+                let (mut r, mut s) = stream.split();
+                let c1 = copy(&mut r, &mut send);
+                let c2 = copy(&mut recv, &mut s);
+                if let Ok((i, o)) = try_join(c1, c2).await {
+                    trace!("Read: {:?} bytes, send: {:?} bytes", i, o);
+                }
+            }
+            Transport::UDP { stream } => {
+                todo!()
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ActorProxyHandle {
+    sender: mpsc::Sender<ProxyMessage>,
+}
+
+impl ActorProxyHandle {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(8);
+        let actor = ActorProxy::new(receiver);
+        tokio::spawn(run_proxy_actor(actor));
+        Self { sender }
+    }
+
+    pub async fn proxy(&self, trans: Transport, recv: RecvStream, send: SendStream) {
+        let msg = ProxyMessage::new(trans, recv, send);
+        let _ = self.sender.send(msg).await;
+    }
+}
+
+impl Default for ActorProxyHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn run_proxy_actor(mut actor: ActorProxy) {
+    while let Some(recv) = actor.receiver.recv().await {
+        actor.handle(recv).await;
+    }
 }
 
 pub enum Transport {
-    TCP {
-        stream: TcpStream
-    },
-    UDP {
-        stream: UdpSocket
-    }
+    TCP { stream: TcpStream },
+    UDP { stream: UdpSocket },
 }
 
 pub struct TransportMessage {
     trans: Transport,
+    quinn: QuinnClientHandle,
+    proxy: ActorProxyHandle,
     respond_to: oneshot::Sender<Result<Addr>>,
 }
 
 impl TransportMessage {
-    pub fn new(trans: Transport, respond_to: oneshot::Sender<Result<Addr>>) -> Self {
-        Self { trans, respond_to}
+    pub fn new(
+        trans: Transport,
+        quinn: QuinnClientHandle,
+        proxy: ActorProxyHandle,
+        respond_to: oneshot::Sender<Result<Addr>>,
+    ) -> Self {
+        Self {
+            trans,
+            quinn,
+            proxy,
+            respond_to,
+        }
     }
 }
 
@@ -148,23 +251,31 @@ pub struct ActorSocks {
 
 impl ActorSocks {
     pub fn new(receiver: mpsc::Receiver<TransportMessage>) -> Self {
-        Self {
-            receiver
-        }
+        Self { receiver }
     }
 
     pub async fn handle(&mut self, msg: TransportMessage) {
         let mut trans = msg.trans;
-        let addr = self.negotiation(&mut trans).await;
-        let _ = msg.respond_to.send(addr);
+        let quinn = msg.quinn;
+        let proxy = msg.proxy;
+        match self.negotiation(&mut trans).await {
+            Ok(addr) => {
+                let mut buf = BytesMut::new();
+                addr.encode(&mut buf);
+                if let Ok((send, recv)) = quinn.open_remote(buf.to_vec()).await {
+                    proxy.proxy(trans, recv, send).await;
+                }
+            }
+            Err(err) => {}
+        }
+
+        // let _ = msg.respond_to.send(addr);
     }
 
     async fn negotiation(&mut self, trans: &mut Transport) -> Result<Addr> {
         match *trans {
-            Transport::TCP { ref mut stream } => {
-                self.tcp_negotiation(stream).await
-            }
-            Transport::UDP { ref mut stream } => todo!()
+            Transport::TCP { ref mut stream } => self.tcp_negotiation(stream).await,
+            Transport::UDP { ref mut stream } => todo!(),
         }
     }
 
@@ -189,30 +300,34 @@ impl ActorSocks {
     }
 }
 
+#[derive(Clone)]
 pub struct ActorSocksHandle {
     sender: mpsc::Sender<TransportMessage>,
 }
 
 impl ActorSocksHandle {
-
     pub async fn new() -> Result<Self> {
         let (sender, receiver) = mpsc::channel(8);
         let actor = ActorSocks::new(receiver);
         tokio::spawn(run_socks_actor(actor));
-
         Ok(Self { sender })
     }
 
-    pub async fn negotiation(&self, trans: Transport) -> Result<Addr> {
+    pub async fn negotiation(
+        &self,
+        trans: Transport,
+        quinn: QuinnClientHandle,
+        proxy: ActorProxyHandle,
+    ) -> Result<Addr> {
         let (send, recv) = oneshot::channel();
-        let msg = TransportMessage::new(trans, send);
+        let msg = TransportMessage::new(trans, quinn, proxy, send);
         let _ = self.sender.send(msg).await;
         recv.await?
-    }    
+    }
 }
 
-pub async fn run_socks_actor(mut actor: ActorSocks) {
-    while let Some(recv) = actor.receiver.recv().await {
-        actor.handle(recv).await;
+pub async fn run_socks_actor(mut actor_socks: ActorSocks) {
+    while let Some(recv) = actor_socks.receiver.recv().await {
+        actor_socks.handle(recv).await;
     }
 }

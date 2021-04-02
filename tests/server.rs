@@ -30,6 +30,6 @@ pub async fn client_test() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
     let path = PathBuf::from("/home/magicalne/.local/share/examples/cert.der");
     let mut socks = SocksServer::new(None, "localhost", 3333, Some(path), String::from("pwd")).await?;
-    socks.run().await?;
+    socks.start().await?;
     Ok(())
 }

@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
                 .expect("no global subscriber has been set");
             let mut socks =
                 SocksServer::new(Some(socks_port), &server_host, server_port, ca, password).await?;
-            socks.run().await?;
+            socks.start().await?;
         }
         Opt::Server {
             port,

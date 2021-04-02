@@ -1,4 +1,4 @@
-use std::{borrow::BorrowMut, path::PathBuf, sync::Arc, vec};
+use std::{borrow::BorrowMut, path::PathBuf, sync::Arc, u8, vec};
 
 use crate::{
     error::Result,
@@ -19,7 +19,7 @@ use tracing::{debug, error, info, trace};
 use super::protocol::{Addr, VERSION_METHOD_MESSAGE};
 pub struct SocksServer {
     tcp: TcpListener,
-    quic_client: Arc<Mutex<QuicQuinnClient>>,
+    // quic_client: Arc<Mutex<QuicQuinnClient>>,
     socks: ActorSocksHandle,
     quinn: QuinnClientHandle,
     proxy: ActorProxyHandle,
@@ -33,9 +33,6 @@ impl SocksServer {
         cert_path: Option<PathBuf>,
         passwd: String,
     ) -> Result<Self> {
-        let mut quic = QuicQuinnClient::new(proxy_host, proxy_port, cert_path.clone()).await?;
-        quic.send_passwd(&passwd).await?;
-
         let port = socks_port.unwrap_or(1080);
         let addr = ("0.0.0.0", port);
         let tcp = TcpListener::bind(addr).await?;
@@ -43,37 +40,40 @@ impl SocksServer {
 
         let socks = ActorSocksHandle::new().await?;
         let server_name = proxy_host.to_string();
-        let password = passwd.into_bytes();
-        let quinn = QuinnClientHandle::new(server_name, port, cert_path, password).await?;
+        let capacity = passwd.len();
+        let mut password = Vec::with_capacity(capacity);
+        password.push(capacity as u8);
+        password.append(&mut passwd.into_bytes());
+        let quinn = QuinnClientHandle::new(server_name, proxy_port, cert_path, password).await?;
         let proxy = ActorProxyHandle::default();
         Ok(Self {
             tcp,
-            quic_client: Arc::new(Mutex::new(quic)),
+            // quic_client: Arc::new(Mutex::new(quic)),
             socks,
             quinn,
             proxy,
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        while let Ok((stream, from)) = self.tcp.accept().await {
-            trace!("Accept new stream from : {:?}", from);
-            let quic = Arc::clone(&self.quic_client);
-            tokio::spawn(async move {
-                let mut quic = quic.lock().await;
-                let mut socks_stream = SocksStream::new(stream);
-                if let Ok(remote_addr) = socks_stream.negotiation().await {
-                    let mut buf = BytesMut::new();
-                    remote_addr.encode(&mut buf);
-                    if let Ok((send, recv)) = quic.open_remote(&buf).await {
-                        let mut transfer = Transfer::new(send, recv, socks_stream.stream());
-                        let _ = transfer.copy().await;
-                    }
-                }
-            });
-        }
-        Ok(())
-    }
+    // pub async fn run(&mut self) -> Result<()> {
+    //     while let Ok((stream, from)) = self.tcp.accept().await {
+    //         trace!("Accept new stream from : {:?}", from);
+    //         let quic = Arc::clone(&self.quic_client);
+    //         tokio::spawn(async move {
+    //             let mut quic = quic.lock().await;
+    //             let mut socks_stream = SocksStream::new(stream);
+    //             if let Ok(remote_addr) = socks_stream.negotiation().await {
+    //                 let mut buf = BytesMut::new();
+    //                 remote_addr.encode(&mut buf);
+    //                 if let Ok((send, recv)) = quic.open_remote(&buf).await {
+    //                     let mut transfer = Transfer::new(send, recv, socks_stream.stream());
+    //                     let _ = transfer.copy().await;
+    //                 }
+    //             }
+    //         });
+    //     }
+    //     Ok(())
+    // }
 
     pub async fn start(&mut self) -> Result<()> {
         while let Ok((stream, from)) = self.tcp.accept().await {
@@ -172,12 +172,14 @@ impl ActorProxy {
         } = msg;
         match trans {
             Transport::TCP { mut stream } => {
-                let (mut r, mut s) = stream.split();
-                let c1 = copy(&mut r, &mut send);
-                let c2 = copy(&mut recv, &mut s);
-                if let Ok((i, o)) = try_join(c1, c2).await {
-                    trace!("Read: {:?} bytes, send: {:?} bytes", i, o);
-                }
+                tokio::spawn(async move {
+                    let (mut r, mut s) = stream.split();
+                    let c1 = copy(&mut r, &mut send);
+                    let c2 = copy(&mut recv, &mut s);
+                    if let Ok((i, o)) = try_join(c1, c2).await {
+                        trace!("PROXY Read: {:?} bytes, send: {:?} bytes", i, o);
+                    }
+                });
             }
             Transport::UDP { stream } => {
                 todo!()
@@ -226,21 +228,14 @@ pub struct TransportMessage {
     trans: Transport,
     quinn: QuinnClientHandle,
     proxy: ActorProxyHandle,
-    respond_to: oneshot::Sender<Result<Addr>>,
 }
 
 impl TransportMessage {
-    pub fn new(
-        trans: Transport,
-        quinn: QuinnClientHandle,
-        proxy: ActorProxyHandle,
-        respond_to: oneshot::Sender<Result<Addr>>,
-    ) -> Self {
+    pub fn new(trans: Transport, quinn: QuinnClientHandle, proxy: ActorProxyHandle) -> Self {
         Self {
             trans,
             quinn,
             proxy,
-            respond_to,
         }
     }
 }
@@ -294,8 +289,10 @@ impl ActorSocks {
         let reply = Reply::v5(Rep::Suceeded, &req.addr);
         let reply_buf = reply.encode();
         buf[0..reply_buf.len()].copy_from_slice(&reply_buf);
-        stream.write_all(&reply_buf).await?;
-        trace!("Sub negotiation write buf: {:?}", &buf.len());
+        let buf = &buf[0..reply_buf.len()];
+        stream.write_all(buf).await?;
+        trace!("Sub negotiation buf: {:?}", buf);
+        trace!("Sub negotiation write buf: {:?}", buf.len());
         Ok(req.addr)
     }
 }
@@ -318,11 +315,10 @@ impl ActorSocksHandle {
         trans: Transport,
         quinn: QuinnClientHandle,
         proxy: ActorProxyHandle,
-    ) -> Result<Addr> {
-        let (send, recv) = oneshot::channel();
-        let msg = TransportMessage::new(trans, quinn, proxy, send);
+    ) -> Result<()> {
+        let msg = TransportMessage::new(trans, quinn, proxy);
         let _ = self.sender.send(msg).await;
-        recv.await?
+        Ok(())
     }
 }
 

@@ -65,17 +65,18 @@ impl<'a> QuinnStream<'a> {
     }
 
     pub async fn send_password(&mut self, passwd: &[u8]) -> Result<()> {
+        trace!("Send password: {:?}", passwd);
         self.send.write_all(passwd).await?;
         let mut buf = [0; 1];
         match self.recv.read(&mut buf).await? {
             Some(n) => {
                 trace!("Read {:?} bytes", n);
                 return if PASSWORD_VALIDATE_RESPONSE == buf[..n] {
-                    warn!("Wrong password");
-                    Err(Error::WrongPassword)
-                } else {
                     trace!("Password is validate.");
                     Ok(())
+                } else {
+                    warn!("Wrong password");
+                    Err(Error::WrongPassword)
                 };
             }
             None => {
@@ -102,9 +103,9 @@ impl<'a> QuinnStream<'a> {
                             error!("Wrong password: {:?}", buf);
                             Err(Error::WrongPassword)
                         } else {
-                            trace!("Password is validate.");
                             self.send.write_all(&PASSWORD_VALIDATE_RESPONSE).await?;
                             self.send.finish().await?;
+                            trace!("Password is validate.");
                             Ok(())
                         }
                     }
@@ -139,7 +140,7 @@ impl<'a> QuinnStream<'a> {
                 buf.clear();
                 match remote {
                     Ok(remote) => {
-                        buf.put_u8(0);
+                        buf.put_u8(1);
                         self.send.write_all(&buf[0..1]).await?;
                         trace!("Connection is setup. Notify client.");
                         Ok(remote)
@@ -190,9 +191,9 @@ impl Connection {
                         if len != self.password.len() || buf != self.password.as_bytes() {
                             Err(Error::WrongPassword)
                         } else {
-                            trace!("Password is validate.");
                             send.write_all(&PASSWORD_VALIDATE_RESPONSE).await?;
                             send.finish().await?;
+                            trace!("Password is validate.");
                             Ok(())
                         }
                     }
@@ -388,6 +389,7 @@ impl QuinnServer {
                             stream.validate_password(&password).await?;
                         }
                         while let Some((mut send, mut recv)) = bi_streams.try_next().await? {
+                            trace!("Accept open remote request");
                             let mut stream = QuinnStream::new(&mut send, &mut recv);
                             let remote = stream.open_remote().await?;
                             let mut transfer = Transfer::new(send, recv, remote);
@@ -511,6 +513,7 @@ impl QuinnClientActor {
             let (mut send, mut recv) = connection.open_bi().await?;
             let mut stream = QuinnStream::new(&mut send, &mut recv);
             stream.send_password(&self.password).await?;
+            trace!("Sent password");
             self.connection = Some(connection);
         }
         Ok(())
@@ -520,17 +523,19 @@ impl QuinnClientActor {
     Send proxy info to remote server.
     */
     pub async fn handle(&mut self, msg: OpenRemoteMessage) {
+        trace!("Processing open remote message.");
         if let Err(err) = self.open_conn().await {
+            error!("open connection failed: {:?}", &err);
             let _ = &msg.respond(Err(err));
             return;
         }
         if let Some(connection) = self.connection.as_mut() {
             match connection.open_bi().await {
                 Ok((mut send, mut recv)) => {
+                    trace!("Open remote addr");
                     let mut stream = QuinnStream::new(&mut send, &mut recv);
                     match stream.send_open_remote(&msg.get_buf()).await {
                         Ok(_) => {
-                            trace!("Open remote successfully.");
                             let _ = &msg.respond(Ok((send, recv)));
                         }
                         Err(err) => {
@@ -540,6 +545,7 @@ impl QuinnClientActor {
                     }
                 }
                 Err(err) => {
+                    error!("Not connected");
                     let _ = &msg.respond(Err(Error::QuinnConnectionError(err)));
                 }
             }

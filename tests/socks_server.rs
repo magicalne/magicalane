@@ -13,7 +13,7 @@ pub async fn test() -> Result<()> {
     let server_span = span!(Level::TRACE, "server", %local_addr);
     SocksServer::new(None, "localhost", port, None, "pwd".to_string())
         .await?
-        .run()
+        .start()
         .instrument(server_span.clone())
         .await?;
     Ok(())

@@ -50,7 +50,7 @@ pub fn generate_key_and_cert_pem() -> Result<(PathBuf, PathBuf)> {
     Ok((key_path, cert_path))
 }
 
-fn load_private_key(key_path: &Path) -> Result<PrivateKey> {
+pub fn load_private_key(key_path: &Path) -> Result<PrivateKey> {
     let key = fs::read(key_path)?;
     let key = if key_path.extension().map_or(false, |x| x == "der") {
         quinn::PrivateKey::from_der(&key)?
@@ -60,7 +60,7 @@ fn load_private_key(key_path: &Path) -> Result<PrivateKey> {
     Ok(key)
 }
 
-fn load_private_cert(cert_path: &Path) -> Result<CertificateChain> {
+pub fn load_private_cert(cert_path: &Path) -> Result<CertificateChain> {
     let cert_chain = fs::read(cert_path)?;
     let cert_chain = if cert_path
         .extension()
@@ -71,80 +71,4 @@ fn load_private_cert(cert_path: &Path) -> Result<CertificateChain> {
         quinn::CertificateChain::from_pem(&cert_chain)?
     };
     Ok(cert_chain)
-}
-
-pub struct Connection<C: quic::Connection<Bytes>> {
-    connection: C,
-}
-
-impl<C: quic::Connection<Bytes>> Connection<C> {
-    pub fn new(connection: C) -> Self {
-        Self { connection }
-    }
-
-    pub async fn connect(&mut self) -> Result<ConnectionStream<C::BidiStream>> {
-        let stream = future::poll_fn(|cx| self.connection.poll_open_bidi_stream(cx)).await?;
-        Ok(ConnectionStream::new(stream))
-    }
-
-    pub async fn accept(&mut self) -> Result<ConnectionStream<C::BidiStream>> {
-        let stream = future::poll_fn(|cx| self.connection.poll_accept_bidi_stream(cx)).await?;
-        Ok(ConnectionStream::new(stream))
-    }
-}
-
-pub struct ConnectionStream<S> {
-    stream: S,
-}
-
-impl<S: quic::BidiStream<Bytes>> ConnectionStream<S> {
-    pub fn new(stream: S) -> Self {
-        Self { stream }
-    }
-
-    pub async fn proxy(self) -> Result<()> {
-        let (send, mut recv) = self.stream.split();
-        // if let Some(n) = future::poll_fn(|cx| recv.poll_data(cx)).await? {
-        //     recv
-
-        //     let protocol = Protocol::parse(buf.chunk())?;
-        //     match protocol.kind {
-        //         protocol::Kind::TCP => {
-        //             let addr = (protocol.host.as_str(), protocol.port);
-        //             let stream = TcpStream::connect(addr).await?;
-        //             let (r, s) = stream.into_split();
-        //         }
-        //         protocol::Kind::UDP => {
-        //             let addr = (protocol.host.as_str(), protocol.port);
-        //             let stream = UdpSocket::connect(addr).await?;
-        //             let (r, s) = stream.into_split();
-        //         }
-        //         protocol::Kind::Error => return Err(Error::UnknowProtocolKindErrlr),
-        //     }
-        // }
-        Ok(())
-    }
-}
-
-pub struct Proxy<R: AsyncRead, W: AsyncWrite> {
-    src_recv: R,
-    src_send: W,
-    dst_recv: R,
-    dst_send: W,
-}
-
-#[pin_project::pin_project]
-pub struct TcpRecvStream {
-    #[pin]
-    stream: TcpStream,
-    buf: BytesMut,
-}
-
-impl<'a> TcpRecvStream {
-    pub fn new(stream: TcpStream) -> Self {
-        Self {
-            stream,
-            buf: BytesMut::new(),
-        }
-    }
 }

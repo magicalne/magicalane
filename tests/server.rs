@@ -1,11 +1,6 @@
 use std::{io::stderr, path::PathBuf};
 
-use lib::{
-    error::Result,
-    protocol::{Kind, Protocol},
-    server1::Server,
-    socks::server::SocksServer,
-};
+use lib::{error::Result, generate_key_and_cert_der, protocol::{Kind, Protocol}, server1::Server, socks::server::SocksServer};
 use tracing::{error, info, info_span, Level};
 
 #[tokio::test]
@@ -27,9 +22,17 @@ pub async fn client_test() -> Result<()> {
         .with_max_level(Level::TRACE)
         .with_writer(std::io::stderr)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
-    let path = PathBuf::from("/home/magicalne/.local/share/examples/cert.der");
+        tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
+        let path = PathBuf::from("/Users/magiclane/Library/Application Support/org.tls.examples/cert.der");
+    // let path = PathBuf::from("/home/magicalne/.local/share/examples/cert.der");
     let mut socks = SocksServer::new(None, "localhost", 3333, Some(path), String::from("pwd")).await?;
     socks.start().await?;
+    Ok(())
+}
+
+#[test]
+pub fn generate_cert() -> Result<()> {
+    let (key, cert) = generate_key_and_cert_der()?;
+    dbg!(key, cert);
     Ok(())
 }

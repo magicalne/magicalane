@@ -1,21 +1,19 @@
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
-    path::{Path, PathBuf},
+    path::PathBuf,
     pin::Pin,
     task::{Context, Poll},
     u8, usize,
 };
 
-use bytes::{Buf, BufMut, BytesMut};
-use futures::{ready, AsyncReadExt, FutureExt, Stream, StreamExt, TryStreamExt};
+use bytes::{BufMut, BytesMut};
+use futures::{ready, FutureExt, Stream, StreamExt, TryStreamExt};
 use quinn::{
-    crypto::{rustls::TlsSession, Session},
-    generic::{Connecting, ServerConfig},
-    Endpoint, NewConnection, RecvStream, SendStream,
+    crypto::rustls::TlsSession, generic::ServerConfig, Endpoint, NewConnection, RecvStream,
+    SendStream,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
@@ -264,8 +262,6 @@ impl QuicQuinnClient {
         let mut client_config = quinn::ClientConfigBuilder::default();
         client_config.protocols(ALPN_QUIC);
         client_config.enable_keylog();
-        // let dirs = directories_next::ProjectDirs::from("org", "tls", "examples").unwrap();
-        //"/home/magicalne/.local/share/examples/cert.der"
         cert_path
             .map(|path| {
                 fs::read(path)
@@ -389,13 +385,15 @@ impl QuinnServer {
                             stream.validate_password(&password).await?;
                         }
                         while let Some((mut send, mut recv)) = bi_streams.try_next().await? {
-                            trace!("Accept open remote request");
-                            let mut stream = QuinnStream::new(&mut send, &mut recv);
-                            let remote = stream.open_remote().await?;
-                            let mut transfer = Transfer::new(send, recv, remote);
-                            transfer.copy().await?;
+                            tokio::spawn(async move {
+                                trace!("Accept open remote request");
+                                let mut stream = QuinnStream::new(&mut send, &mut recv);
+                                let remote = stream.open_remote().await?;
+                                let mut transfer = Transfer::new(send, recv, remote);
+                                transfer.copy().await?;
+                                Ok::<(), Error>(())
+                            });
                         }
-
                         Ok::<(), Error>(())
                     });
                 }
@@ -523,13 +521,13 @@ impl QuinnClientActor {
     Send proxy info to remote server.
     */
     pub async fn handle(&mut self, msg: OpenRemoteMessage) {
-        trace!("Processing open remote message.");
         if let Err(err) = self.open_conn().await {
             error!("open connection failed: {:?}", &err);
             let _ = &msg.respond(Err(err));
             return;
         }
         if let Some(connection) = self.connection.as_mut() {
+            trace!("Processing open remote message.");
             match connection.open_bi().await {
                 Ok((mut send, mut recv)) => {
                     trace!("Open remote addr");
@@ -549,6 +547,11 @@ impl QuinnClientActor {
                     let _ = &msg.respond(Err(Error::QuinnConnectionError(err)));
                 }
             }
+            if let Ok((mut send, recv)) = connection.open_bi().await {
+                send.write_all(b"asdfasdf").await.expect("cannot write");
+                let _ = send.finish().await;
+                trace!("Send something....");
+            }
         }
     }
 }
@@ -565,7 +568,7 @@ impl QuinnClientHandle {
         cert_path: Option<PathBuf>,
         password: Vec<u8>,
     ) -> Result<Self> {
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = mpsc::channel(200);
         let actor = QuinnClientActor::new(server_name, port, cert_path, password, receiver).await?;
         tokio::spawn(run_quinn_client_actor(actor));
 

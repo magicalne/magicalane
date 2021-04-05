@@ -173,11 +173,17 @@ impl ActorProxy {
         match trans {
             Transport::TCP { mut stream } => {
                 tokio::spawn(async move {
+                    trace!("Start to proxy...");
                     let (mut r, mut s) = stream.split();
                     let c1 = copy(&mut r, &mut send);
                     let c2 = copy(&mut recv, &mut s);
-                    if let Ok((i, o)) = try_join(c1, c2).await {
-                        trace!("PROXY Read: {:?} bytes, send: {:?} bytes", i, o);
+                    match try_join(c1, c2).await {
+                        Ok((i, o)) => {
+                            trace!("Transport i: {:?} bytes, o: {:?} bytes", i, o);
+                        }
+                        Err(err) => {
+                            error!("Proxy error: {:?}", err);
+                        }
                     }
                 });
             }
@@ -195,7 +201,7 @@ pub struct ActorProxyHandle {
 
 impl ActorProxyHandle {
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = mpsc::channel(200);
         let actor = ActorProxy::new(receiver);
         tokio::spawn(run_proxy_actor(actor));
         Self { sender }
@@ -304,7 +310,7 @@ pub struct ActorSocksHandle {
 
 impl ActorSocksHandle {
     pub async fn new() -> Result<Self> {
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = mpsc::channel(200);
         let actor = ActorSocks::new(receiver);
         tokio::spawn(run_socks_actor(actor));
         Ok(Self { sender })

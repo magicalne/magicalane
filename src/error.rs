@@ -97,6 +97,8 @@ pub enum Error {
     QuinnConnectingError(#[from] quinn::ConnectError),
     #[error("Quinn connection error: {0}")]
     QuinnConnectionError(#[from] quinn::ConnectionError),
+    #[error("QUinn read exact error: {0}")]
+    QuinnReadExactError(#[from] quinn::ReadExactError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

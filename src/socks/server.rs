@@ -1,7 +1,7 @@
 use std::{borrow::BorrowMut, path::PathBuf, sync::Arc, u8, vec};
 
 use crate::{
-    error::Result,
+    error::{Error, Result},
     quic::quic_quinn::{QuicQuinnClient, QuinnClientActor, QuinnClientHandle},
     socks::protocol::{Rep, Reply, Request},
     stream::Transfer,
@@ -48,98 +48,25 @@ impl SocksServer {
         let proxy = ActorProxyHandle::default();
         Ok(Self {
             tcp,
-            // quic_client: Arc::new(Mutex::new(quic)),
             socks,
             quinn,
             proxy,
         })
     }
 
-    // pub async fn run(&mut self) -> Result<()> {
-    //     while let Ok((stream, from)) = self.tcp.accept().await {
-    //         trace!("Accept new stream from : {:?}", from);
-    //         let quic = Arc::clone(&self.quic_client);
-    //         tokio::spawn(async move {
-    //             let mut quic = quic.lock().await;
-    //             let mut socks_stream = SocksStream::new(stream);
-    //             if let Ok(remote_addr) = socks_stream.negotiation().await {
-    //                 let mut buf = BytesMut::new();
-    //                 remote_addr.encode(&mut buf);
-    //                 if let Ok((send, recv)) = quic.open_remote(&buf).await {
-    //                     let mut transfer = Transfer::new(send, recv, socks_stream.stream());
-    //                     let _ = transfer.copy().await;
-    //                 }
-    //             }
-    //         });
-    //     }
-    //     Ok(())
-    // }
-
     pub async fn start(&mut self) -> Result<()> {
         while let Ok((stream, from)) = self.tcp.accept().await {
-            let trans = Transport::TCP { stream };
-            let addr = self
-                .socks
-                .negotiation(trans, self.quinn.clone(), self.proxy.clone())
-                .await?;
+            let socks = self.socks.clone();
+            let quinn = self.quinn.clone();
+            let proxy = self.proxy.clone();
+            tokio::spawn(async move {
+                let trans = Transport::TCP { stream };
+                socks.negotiation(trans, quinn, proxy).await?;
+                Ok::<(), Error>(())
+            });
         }
 
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-enum SocksState {
-    NegotiationRead,
-    NegotiationWrite,
-    SubNegotiationRead,
-    SubNegotiationWrite,
-    Processing,
-    ReplyOnError,
-}
-
-#[pin_project::pin_project]
-struct SocksStream {
-    #[pin]
-    stream: TcpStream,
-    state: SocksState,
-    buf: Box<[u8]>,
-    index: usize,
-    remote_addr: Option<Addr>,
-}
-
-impl SocksStream {
-    fn new(stream: TcpStream) -> Self {
-        Self {
-            stream,
-            state: SocksState::NegotiationRead,
-            buf: vec![0; 4096].into_boxed_slice(),
-            index: 0,
-            remote_addr: None,
-        }
-    }
-
-    pub fn stream(self) -> TcpStream {
-        self.stream
-    }
-
-    pub async fn negotiation(&mut self) -> Result<Addr> {
-        let read = self.stream.read(&mut self.buf).await?;
-        trace!("Negotiation read buf: {:?}, {:?}", read, &self.buf[..read]);
-        self.buf[0..VERSION_METHOD_MESSAGE.len()].copy_from_slice(&VERSION_METHOD_MESSAGE[..]);
-        let i = VERSION_METHOD_MESSAGE.len();
-        self.stream.write_all(&self.buf[..i]).await?;
-        trace!("Negotiation write: {:?}, {:?}", i, &self.buf[..i]);
-
-        let n = self.stream.read(&mut self.buf).await?;
-        trace!("Sub negotiation read buf: {:?}, {:?}", n, &self.buf[..n]);
-        let req = Request::new(&self.buf[..n])?;
-        let reply = Reply::v5(Rep::Suceeded, &req.addr);
-        let buf = reply.encode();
-        self.buf[0..buf.len()].copy_from_slice(&buf);
-        self.stream.write_all(&buf).await?;
-        trace!("Sub negotiation write buf: {:?}", &buf.len());
-        Ok(req.addr)
     }
 }
 

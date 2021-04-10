@@ -3,6 +3,9 @@ use std::{path::PathBuf, task::{Context, Poll}};
 use bytes::Buf;
 
 pub mod quic_quinn;
+pub mod quinn_server;
+pub mod quinn_client;
+pub mod stream;
 use crate::error::Result;
 
 pub enum KeyPemPair {

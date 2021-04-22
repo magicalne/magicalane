@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use futures::AsyncWriteExt;
 use quinn::{RecvStream, SendStream};
 use tokio::{
@@ -11,12 +12,19 @@ use crate::{
 };
 
 const CORRECT_PASSWORD_RESPONSE: u8 = 0;
+const SEND_ADDR_SUCCESS_RESPONSE: u8 = 0;
 
 enum Message {
     SendPassword {
         send: SendStream,
         recv: RecvStream,
         passwd: Vec<u8>,
+        sender: oneshot::Sender<Result<()>>,
+    },
+    SendAddr {
+        send: SendStream,
+        recv: RecvStream,
+        addr: Vec<u8>,
         sender: oneshot::Sender<Result<()>>,
     },
     HandlePasswordValid {
@@ -42,6 +50,20 @@ impl Message {
             send,
             recv,
             passwd,
+            sender,
+        }
+    }
+
+    fn send_addr_req(
+        send: SendStream,
+        recv: RecvStream,
+        addr: Vec<u8>,
+        sender: oneshot::Sender<Result<()>>,
+    ) -> Self {
+        Self::SendAddr {
+            send,
+            recv,
+            addr,
             sender,
         }
     }
@@ -82,7 +104,16 @@ impl StreamActor {
             } => {
                 let res = self.send_passwd(send, recv, passwd).await;
                 let _ = sender.send(res);
-            }
+            },
+            Message::SendAddr {
+                send,
+                recv,
+                addr,
+                sender,
+            } => {
+                let res = self.send_addr(send, recv, addr).await;
+                let _ = sender.send(res);
+            },
             Message::HandlePasswordValid { send, recv, sender } => {
                 let res = self.validate_passwd(send, recv).await;
                 let _ = sender.send(res);
@@ -108,6 +139,23 @@ impl StreamActor {
             Ok(())
         } else {
             Err(Error::WrongPassword)
+        }
+    }
+
+    async fn send_addr(
+        &mut self,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        addr: Vec<u8>,
+    ) -> Result<()> {
+        send.write_all(&addr).await?;
+        send.flush().await?;
+        let mut buf = [0u8; 1];
+        recv.read_exact(&mut buf).await?;
+        if buf[0] == SEND_ADDR_SUCCESS_RESPONSE {
+            Ok(())
+        } else {
+            Err(Error::OpenRemoteAddrError)
         }
     }
 
@@ -186,6 +234,21 @@ impl StreamActorHandler {
     ) -> Result<()> {
         let (sender, respond_to) = oneshot::channel();
         let msg = Message::send_passwd_req(send, recv, passwd, sender);
+        let _ = self.sender.send(msg).await;
+        respond_to.await?
+    }
+
+    pub async fn send_addr(
+        &mut self,
+        send: SendStream,
+        recv: RecvStream,
+        addr: Addr
+    ) -> Result<()> {
+        let (sender, respond_to) = oneshot::channel();
+        let mut buf = BytesMut::new();
+        addr.encode(&mut buf);
+        let addr = buf.to_vec();
+        let msg = Message::send_addr_req(send, recv, addr, sender);
         let _ = self.sender.send(msg).await;
         respond_to.await?
     }

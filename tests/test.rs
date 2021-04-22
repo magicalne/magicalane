@@ -84,6 +84,13 @@ async fn single_client_test() -> Result<()> {
     let passwd = b"pwd";
     let passwd = Vec::from(&passwd[..]);
     stream_handler.send_passwd(send, recv, passwd).await?;
+    for _ in 0..10 {
+        let mut stream_handler = stream_handler.clone();
+        tokio::spawn(async move {
+            //TODO
+            // stream_handler.send_addr(send, recv)
+        });
+    }
     Ok(())
 }
 

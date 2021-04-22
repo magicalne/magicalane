@@ -125,7 +125,7 @@ pub enum Addr {
 }
 
 impl Addr {
-    pub fn decode(buf: & [u8]) -> Result<Self> {
+    pub fn decode(buf: &[u8]) -> Result<Self> {
         buf.get(0)
             .and_then(|tp| match *tp {
                 1 => {

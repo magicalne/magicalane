@@ -313,7 +313,7 @@ mod tests {
         buf.put_slice(&[192, 168, 1, 1]);
         buf.put_u16(1080);
         let req = Request::new(&buf)?;
-        let reply = Reply::v5(Rep::Suceeded, req.addr);
+        let reply = Reply::v5(Rep::Suceeded, &req.addr);
         let buf = reply.encode();
         let mut expect = BytesMut::new();
         expect.put_u8(5);

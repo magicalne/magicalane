@@ -3,10 +3,8 @@ use std::{io::stderr, path::PathBuf};
 use lib::{
     error::{Error, Result},
     generate_key_and_cert_der,
-    protocol::{Kind, Protocol},
-    quic::{quinn_client, quinn_server, stream::StreamActorHandler},
+    quic::{client, quinn_server, stream::StreamActorHandler},
     server1::Server,
-    socks::server::SocksServer,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -34,12 +32,12 @@ pub async fn client_test() -> Result<()> {
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
-    let path =
-        PathBuf::from("/Users/magiclane/Library/Application Support/org.tls.examples/cert.der");
-    // let path = PathBuf::from("/home/magicalne/.local/share/examples/cert.der");
-    let mut socks =
-        SocksServer::new(None, "localhost", 3333, Some(path), String::from("pwd")).await?;
-    socks.start().await?;
+    // let path =
+        // PathBuf::from("/Users/magiclane/Library/Application Support/org.tls.examples/cert.der");
+    let path = PathBuf::from("/home/magicalne/.local/share/examples/cert.der");
+    // let mut socks =
+    //     SocksServer::new(None, "localhost", 3333, Some(path), String::from("pwd")).await?;
+    // socks.start().await?;
     Ok(())
 }
 
@@ -77,7 +75,7 @@ async fn single_client_test() -> Result<()> {
     });
     let (_, cert) = generate_key_and_cert_der()?;
     let mut client =
-        quinn_client::QuinnClient::new("localhost".to_string(), 3334, Some(cert)).await?;
+        client::Client::new("localhost".to_string(), 3334, Some(cert)).await?;
     let connection = client.open_conn().await?;
     let (send, recv) = connection.open_bi().await?;
     let mut stream_handler = StreamActorHandler::new(None);

@@ -1,15 +1,13 @@
 use bytes::BytesMut;
 use futures::AsyncWriteExt;
 use quinn::{RecvStream, SendStream};
+use socks5lib::proto::Addr;
 use tokio::{
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
 
-use crate::{
-    error::{Error, Result},
-    socks::protocol::Addr,
-};
+use crate::error::{Error, Result};
 
 const CORRECT_PASSWORD_RESPONSE: u8 = 0;
 const SEND_ADDR_SUCCESS_RESPONSE: u8 = 0;
@@ -18,7 +16,6 @@ enum Message {
     SendPassword {
         send: SendStream,
         recv: RecvStream,
-        passwd: Vec<u8>,
         sender: oneshot::Sender<Result<()>>,
     },
     SendAddr {
@@ -43,13 +40,11 @@ impl Message {
     fn send_passwd_req(
         send: SendStream,
         recv: RecvStream,
-        passwd: Vec<u8>,
         sender: oneshot::Sender<Result<()>>,
     ) -> Self {
         Self::SendPassword {
             send,
             recv,
-            passwd,
             sender,
         }
     }
@@ -86,25 +81,20 @@ impl Message {
 }
 pub struct StreamActor {
     receiver: mpsc::Receiver<Message>,
-    passwd: Option<Vec<u8>>,
+    passwd: Vec<u8>,
 }
 
 impl StreamActor {
-    fn new(receiver: mpsc::Receiver<Message>, passwd: Option<Vec<u8>>) -> Self {
+    fn new(receiver: mpsc::Receiver<Message>, passwd: Vec<u8>) -> Self {
         Self { receiver, passwd }
     }
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::SendPassword {
-                send,
-                recv,
-                passwd,
-                sender,
-            } => {
-                let res = self.send_passwd(send, recv, passwd).await;
+            Message::SendPassword { send, recv, sender } => {
+                let res = self.send_passwd(send, recv).await;
                 let _ = sender.send(res);
-            },
+            }
             Message::SendAddr {
                 send,
                 recv,
@@ -113,7 +103,7 @@ impl StreamActor {
             } => {
                 let res = self.send_addr(send, recv, addr).await;
                 let _ = sender.send(res);
-            },
+            }
             Message::HandlePasswordValid { send, recv, sender } => {
                 let res = self.validate_passwd(send, recv).await;
                 let _ = sender.send(res);
@@ -125,13 +115,8 @@ impl StreamActor {
         }
     }
 
-    async fn send_passwd(
-        &mut self,
-        mut send: SendStream,
-        mut recv: RecvStream,
-        passwd: Vec<u8>,
-    ) -> Result<()> {
-        send.write_all(&passwd).await?;
+    async fn send_passwd(&mut self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+        send.write_all(&self.passwd).await?;
         send.flush().await?;
         let mut buf = [0u8; 1];
         recv.read_exact(&mut buf).await?;
@@ -162,20 +147,12 @@ impl StreamActor {
     async fn validate_passwd(&mut self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
         let mut buf = vec![0; 128];
         if let Some(n) = recv.read(&mut buf).await? {
-            match self.passwd.as_ref() {
-                Some(pwd) => {
-                    if &buf[..n] == pwd {
-                        let buf = [0u8; 1];
-                        send.write_all(&buf).await?;
-                    } else {
-                        let buf = [1u8; 1];
-                        send.write_all(&buf).await?;
-                    }
-                }
-                None => {
-                    let buf = [1u8; 1];
-                    send.write_all(&buf).await?;
-                }
+            if buf[..n] == self.passwd {
+                let buf = [0u8; 1];
+                send.write_all(&buf).await?;
+            } else {
+                let buf = [1u8; 1];
+                send.write_all(&buf).await?;
             }
         }
         Ok(())
@@ -189,7 +166,7 @@ impl StreamActor {
         let mut buf = vec![0; 1024];
         match recv.read(&mut buf).await? {
             Some(n) => {
-                let addr = Addr::decode(&buf[..n])?;
+                let addr = Addr::new(&buf[..n])?;
                 let tcp_stream = match addr {
                     Addr::SocketAddr(ip) => TcpStream::connect(ip).await?,
                     Addr::DomainName(domain, port) => {
@@ -219,7 +196,7 @@ pub struct StreamActorHandler {
 }
 
 impl StreamActorHandler {
-    pub fn new(passwd: Option<Vec<u8>>) -> Self {
+    pub fn new(passwd: Vec<u8>) -> Self {
         let (sender, receiver) = mpsc::channel(200);
         let actor = StreamActor::new(receiver, passwd);
         tokio::spawn(run_stream_actor(actor));
@@ -230,10 +207,9 @@ impl StreamActorHandler {
         &mut self,
         send: SendStream,
         recv: RecvStream,
-        passwd: Vec<u8>,
     ) -> Result<()> {
         let (sender, respond_to) = oneshot::channel();
-        let msg = Message::send_passwd_req(send, recv, passwd, sender);
+        let msg = Message::send_passwd_req(send, recv, sender);
         let _ = self.sender.send(msg).await;
         respond_to.await?
     }
@@ -242,7 +218,7 @@ impl StreamActorHandler {
         &mut self,
         send: SendStream,
         recv: RecvStream,
-        addr: Addr
+        addr: Addr,
     ) -> Result<()> {
         let (sender, respond_to) = oneshot::channel();
         let mut buf = BytesMut::new();

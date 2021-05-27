@@ -5,12 +5,13 @@ use std::{
 
 use futures::{StreamExt, TryStreamExt};
 use quinn::{Endpoint, ServerConfig};
-use tracing::trace;
+use socks5lib::proxy::Proxy;
+use tracing::{debug, trace};
 
 use crate::{
     error::{Error, Result},
     generate_key_and_cert_der, load_private_cert, load_private_key,
-    stream::Transfer,
+    quic::quic_quinn::QuicStream,
     ALPN_QUIC,
 };
 
@@ -45,7 +46,7 @@ impl QuinnServer {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let stream = StreamActorHandler::new(Some(self.password.clone()));
+        let stream = StreamActorHandler::new(self.password.clone());
         while let Some(connecting) = self.incoming.next().await {
             trace!("connecting from remote: {:?}", &connecting.remote_address());
             let mut stream = stream.clone();
@@ -57,9 +58,12 @@ impl QuinnServer {
                         }
                         while let Some((send, recv)) = bi_streams.try_next().await? {
                             let (send, recv, tcp) = stream.open_remote(send, recv).await?;
-                            let mut transfer = Transfer::new(send, recv, tcp);
+                            let quic_stream = QuicStream::new(recv, send);
+                            let proxy = Proxy::new(quic_stream, tcp);
                             tokio::spawn(async move {
-                                let _ = transfer.copy().await;
+                                if let Err(err) = proxy.await {
+                                    debug!("Proxy stopped due to: {:?}", err);
+                                }
                             });
                         }
                         Ok::<(), Error>(())

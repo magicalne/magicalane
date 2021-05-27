@@ -1,0 +1,175 @@
+use std::{
+    fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    path::PathBuf,
+    u8,
+};
+
+use quinn::{Connection, Endpoint, NewConnection, RecvStream, SendStream};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{error, trace};
+
+use crate::{
+    error::{Error, Result},
+    ALPN_QUIC,
+};
+
+use super::stream::StreamActorHandler;
+
+pub struct Client {
+    remote_addr: SocketAddr,
+    endpoint: Endpoint,
+    server_name: String,
+}
+
+impl Client {
+    pub async fn new(server_name: String, port: u16, cert_path: Option<PathBuf>) -> Result<Self> {
+        let mut client_config = quinn::ClientConfigBuilder::default();
+        client_config.protocols(ALPN_QUIC);
+        client_config.enable_keylog();
+        cert_path
+            .map(|path| {
+                fs::read(path)
+                    .map(|cert| quinn::Certificate::from_der(&cert))
+                    .map(|cert| match cert {
+                        Ok(cert) => {
+                            if let Err(err) = client_config.add_certificate_authority(cert) {
+                                error!("Client add cert failed: {:?}.", err);
+                            }
+                        }
+                        Err(err) => {
+                            error!("Client parse cert error: {:?}.", err);
+                        }
+                    })
+            })
+            .map(|r| {
+                r.map_err(|err| {
+                    error!("Client config cert with error: {:?}.", err);
+                })
+            });
+        let config = client_config.build();
+        let remote_addr = (server_name.as_str(), port)
+            .to_socket_addrs()?
+            .find(|add| add.is_ipv4())
+            .ok_or(Error::UnknownRemoteHost)?;
+        trace!("Connect remote: {:?}", &remote_addr);
+        let mut endpoint_builder = Endpoint::builder();
+        endpoint_builder.default_client_config(config);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        // Bind this endpoint to a UDP socket on the given client address.
+        let (endpoint, _) = endpoint_builder.bind(&addr)?;
+        trace!("Client bind endpoint: {:?}", &addr);
+
+        Ok(Self {
+            remote_addr,
+            endpoint,
+            server_name,
+        })
+    }
+
+    pub async fn open_conn(&mut self) -> Result<Connection> {
+        let connection = self
+            .endpoint
+            .connect(&self.remote_addr, &self.server_name)?
+            .await?;
+        let NewConnection { connection, .. } = connection;
+        Ok(connection)
+    }
+}
+
+struct ClientActor {
+    client: Client,
+    receiver: mpsc::Receiver<Message>,
+    stream_handler: StreamActorHandler,
+    conn: Option<Connection>,
+}
+
+impl ClientActor {
+    fn new(client: Client, receiver: mpsc::Receiver<Message>, passwd: Vec<u8>) -> Self {
+        let stream_handler = StreamActorHandler::new(passwd);
+        Self {
+            client,
+            receiver,
+            stream_handler,
+            conn: None,
+        }
+    }
+
+    async fn handle(&mut self, msg: Message) {
+        match msg {
+            Message::OpenStream { sender } => loop {
+                if self.conn.is_none() {
+                    // Open a new connection.
+                    match self.client.open_conn().await {
+                        Ok(conn) => {
+                            if let Ok((send, recv)) = conn.open_bi().await {
+                                match self.stream_handler.send_passwd(send, recv).await {
+                                    Ok(_) => {
+                                        self.conn = Some(conn);
+                                    }
+                                    Err(err) => {
+                                        trace!("Send password failed: {:?}", err);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            trace!("Cannot connect to quic server: {:?}", err);
+                            continue;
+                        }
+                    }
+                }
+                let conn = self.conn.as_mut().unwrap();
+                match conn.open_bi().await {
+                    Ok(bi) => {
+                        let _ = sender.send(bi);
+                        return;
+                    }
+                    Err(err) => {
+                        trace!("Open stream failed: {:?}", err);
+                        self.conn = None;
+                    }
+                }
+            },
+        }
+    }
+}
+
+enum Message {
+    OpenStream {
+        sender: oneshot::Sender<(SendStream, RecvStream)>,
+    },
+}
+
+#[derive(Clone)]
+pub struct ClientActorHndler {
+    sender: mpsc::Sender<Message>,
+}
+
+impl ClientActorHndler {
+    pub async fn new(
+        server_name: String,
+        port: u16,
+        cert_path: Option<PathBuf>,
+        passwd: Vec<u8>,
+    ) -> Result<Self> {
+        let client = Client::new(server_name, port, cert_path).await?;
+        let (sender, receiver) = mpsc::channel(200);
+        let actor = ClientActor::new(client, receiver, passwd);
+        tokio::spawn(run_client_actor(actor));
+        Ok(Self { sender })
+    }
+
+    pub async fn open_bi(&mut self) -> Result<(SendStream, RecvStream)> {
+        let (sender, respond_to) = oneshot::channel();
+        let msg = Message::OpenStream { sender };
+        let _ = self.sender.send(msg).await;
+        Ok(respond_to.await?)
+    }
+}
+
+async fn run_client_actor(mut actor: ClientActor) {
+    while let Some(msg) = actor.receiver.recv().await {
+        actor.handle(msg).await;
+    }
+}

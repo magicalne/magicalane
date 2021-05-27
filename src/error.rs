@@ -69,10 +69,8 @@ pub enum Error {
     #[error("webpki error")]
     WebPkiError,
 
-    #[error("Socks stream proccess failed")]
-    SocksStreamProcessFailed,
-    #[error("Socks protocol: {0}")]
-    SocksError(#[from] crate::socks::protocol::Error),
+    #[error("Socks lib error: {0}")]
+    Socs5LibError(#[from] socks5lib::error::Error),
 
     #[error("Utf8 error")]
     Utf8Error(#[from] Utf8Error),

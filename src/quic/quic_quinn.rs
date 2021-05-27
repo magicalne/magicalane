@@ -13,7 +13,9 @@ use quinn::{
     crypto::rustls::TlsSession, generic::ServerConfig, Endpoint, NewConnection, RecvStream,
     SendStream,
 };
+use socks5lib::proto::Addr;
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
@@ -23,7 +25,6 @@ use tracing::{error, trace};
 use crate::{
     error::{Error, Result},
     generate_key_and_cert_der, load_private_cert, load_private_key,
-    socks::protocol::Addr,
     stream::Transfer,
     ALPN_QUIC,
 };
@@ -122,7 +123,7 @@ impl<'a> QuinnStream<'a> {
     pub async fn open_remote(&mut self) -> Result<TcpStream> {
         let mut buf = vec![0; 1024];
         let remote = match self.recv.read(&mut buf).await? {
-            Some(n) => match Addr::decode(&buf[..n])? {
+            Some(n) => match Addr::new(&buf[..n])? {
                 Addr::SocketAddr(ip) => Some(TcpStream::connect(ip).await),
                 Addr::DomainName(domain, port) => {
                     let domain = std::str::from_utf8(&domain)?;
@@ -207,7 +208,7 @@ impl Connection {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let mut buf = vec![0; 1024];
         let remote = match recv.read(&mut buf).await? {
-            Some(n) => match Addr::decode(&buf[..n])? {
+            Some(n) => match Addr::new(&buf[..n])? {
                 Addr::SocketAddr(ip) => Some(TcpStream::connect(ip).await),
                 Addr::DomainName(domain, port) => {
                     let domain = std::str::from_utf8(&domain)?;
@@ -445,6 +446,7 @@ pub struct QuinnClientActor {
     password: Vec<u8>,
     server_name: String,
     connection: Option<quinn::Connection>,
+    disconnected: bool
 }
 
 impl QuinnClientActor {
@@ -498,11 +500,12 @@ impl QuinnClientActor {
             password,
             server_name,
             connection: None,
+            disconnected: true
         })
     }
 
     pub async fn open_conn(&mut self) -> Result<()> {
-        if self.connection.is_none() {
+        if self.connection.is_none() || self.disconnected {
             let connection = self
                 .endpoint
                 .connect(&self.remote_addr, &self.server_name)?
@@ -513,6 +516,7 @@ impl QuinnClientActor {
             stream.send_password(&self.password).await?;
             trace!("Sent password");
             self.connection = Some(connection);
+            self.disconnected = false;
         }
         Ok(())
     }
@@ -543,15 +547,19 @@ impl QuinnClientActor {
                     }
                 }
                 Err(err) => {
-                    error!("Not connected");
+                    error!("NNNNNNNNNNNNNot connected");
+                    self.disconnected = true;
                     let _ = &msg.respond(Err(Error::QuinnConnectionError(err)));
                 }
             }
-            if let Ok((mut send, recv)) = connection.open_bi().await {
-                send.write_all(b"asdfasdf").await.expect("cannot write");
-                let _ = send.finish().await;
-                trace!("Send something....");
-            }
+            // if let Ok((mut send, recv)) = connection.open_bi().await {
+            //     &msg.respond(Ok((send, recv)));
+            //     // send.write_all(b"asdfasdf").await.expect("cannot write");
+            //     // let _ = send.finish().await;
+            //     // trace!("Send something....");
+            // }
+        } else {
+            trace!("Quic not connected!")
         }
     }
 }
@@ -576,10 +584,16 @@ impl QuinnClientHandle {
     }
 
     pub async fn open_remote(&self, buf: Vec<u8>) -> Result<(SendStream, RecvStream)> {
-        let (send, recv) = oneshot::channel();
-        let msg = OpenRemoteMessage::new(buf, send);
-        let _ = self.sender.send(msg).await;
-        recv.await?
+        loop {
+            let (send, recv) = oneshot::channel();
+            let msg = OpenRemoteMessage::new(buf.clone(), send);
+            let _ = self.sender.send(msg).await;
+            match recv.await {
+                Ok(Ok(bi_stream)) => return Ok(bi_stream),
+                Ok(Err(err)) => {}
+                Err(err) => return Err(Error::OneshotRecvError(err)),
+            }
+        }
     }
 }
 
@@ -602,5 +616,54 @@ impl OpenRemoteMessage {
 
     pub fn get_buf(&self) -> &[u8] {
         &self.buf[..]
+    }
+}
+
+#[pin_project::pin_project]
+pub struct QuicStream<R, S> {
+    #[pin]
+    recv: R,
+    #[pin]
+    send: S,
+}
+
+impl<R, S> QuicStream<R, S> {
+    pub fn new(recv: R, send: S) -> Self {
+        Self { recv, send }
+    }
+}
+
+impl<R: AsyncRead, W: AsyncWrite> AsyncRead for QuicStream<R, W> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = self.project();
+        me.recv.poll_read(cx, buf)
+    }
+}
+
+impl<R: AsyncRead, W: AsyncWrite> AsyncWrite for QuicStream<R, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        self.project().send.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        self.project().send.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        self.project().send.poll_shutdown(cx)
     }
 }

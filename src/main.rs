@@ -2,7 +2,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use lib::{server1::Server, socks::server::SocksServer};
+use lib::server1::Server;
 use structopt::StructOpt;
 use tracing::Level;
 
@@ -63,9 +63,9 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
-            let mut socks =
-                SocksServer::new(Some(socks_port), &server_host, server_port, ca, password).await?;
-            socks.start().await?;
+            // let mut socks =
+            //     SocksServer::new(Some(socks_port), &server_host, server_port, ca, password).await?;
+            // socks.start().await?;
         }
         Opt::Server {
             port,

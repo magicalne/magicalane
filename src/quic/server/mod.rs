@@ -40,6 +40,8 @@ impl<C> Server<C> {
         let mut server_config = quinn::ServerConfigBuilder::new(server_config);
         server_config.enable_keylog();
         let (key, cert) = key_cert;
+        info!("key path: {:?}", &key);
+        info!("cert path: {:?}", &cert);
         let key = load_private_key(key.as_path())?;
         let cert_chain = load_private_cert(cert.as_path())?;
         server_config.certificate(cert_chain, key)?;

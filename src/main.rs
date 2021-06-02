@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use lib::{
-    generate_key_and_cert_der,
+    generate_key_and_cert_pem,
     quic::{self, server::Server},
     quic_connector,
 };
@@ -94,9 +94,9 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
-            let key_cert = match (ca, key) {
+            let key_cert = match (key, ca) {
                 (Some(key), Some(cert)) => (key, cert),
-                (_, _) => generate_key_and_cert_der("tls", "org", "examples")?,
+                (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
             };
             let connector = LocalConnector;
             let mut server = Server::new(connector, key_cert, port, password)?;

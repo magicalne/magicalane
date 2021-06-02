@@ -8,6 +8,7 @@ use socks5lib::LocalConnector;
 use tracing::Level;
 
 #[tokio::test]
+#[ignore = "integration test"]
 pub async fn server_test() -> Result<()> {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
@@ -22,6 +23,7 @@ pub async fn server_test() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "integration test"]
 pub async fn client_test() -> Result<()> {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::INFO)

@@ -1,8 +1,12 @@
-// use tracing_futures::Instrument as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use lib::server1::Server;
+use lib::{
+    generate_key_and_cert_der,
+    quic::{self, server::Server},
+    quic_connector,
+};
+use socks5lib::LocalConnector;
 use structopt::StructOpt;
 use tracing::Level;
 
@@ -63,9 +67,17 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
-            // let mut socks =
-            //     SocksServer::new(Some(socks_port), &server_host, server_port, ca, password).await?;
-            // socks.start().await?;
+            let quic_client = quic::client::ClientActorHndler::new(
+                server_host.clone(),
+                server_port,
+                ca,
+                password.as_bytes().to_vec(),
+            )
+            .await?;
+            let connector = quic_connector::QuicConnector::new(quic_client);
+            let mut socks_server =
+                socks5lib::server::Server::new(Some(socks_port), connector).await?;
+            socks_server.run().await?;
         }
         Opt::Server {
             port,
@@ -83,10 +95,11 @@ async fn main() -> Result<()> {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
             let key_cert = match (ca, key) {
-                (Some(key), Some(cert)) => Some((key, cert)),
-                (_, _) => None
+                (Some(key), Some(cert)) => (key, cert),
+                (_, _) => generate_key_and_cert_der("tls", "org", "examples")?,
             };
-            let mut server = Server::new(key_cert, port, password).await?;
+            let connector = LocalConnector;
+            let mut server = Server::new(connector, key_cert, port, password)?;
             server.run().await?;
         }
     }
@@ -94,5 +107,9 @@ async fn main() -> Result<()> {
 }
 
 fn is_verbose(verbose: bool) -> Level {
-    if verbose { Level::TRACE } else { Level::INFO }
+    if verbose {
+        Level::TRACE
+    } else {
+        Level::INFO
+    }
 }

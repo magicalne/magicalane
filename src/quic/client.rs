@@ -1,12 +1,17 @@
 use std::{
-    fs,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
+    pin::Pin,
     u8,
 };
 
+use bytes::BytesMut;
+use futures::{future::poll_fn, AsyncWrite};
 use quinn::{Connection, Endpoint, NewConnection, RecvStream, SendStream};
+use socks5lib::proto::Addr;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::io::{poll_read_buf, poll_write_buf};
 use tracing::{error, trace};
 
 use crate::{
@@ -14,7 +19,7 @@ use crate::{
     ALPN_QUIC,
 };
 
-use super::stream::StreamActorHandler;
+use super::{stream::{QuicStream, StreamActorHandler}};
 
 pub struct Client {
     remote_addr: SocketAddr,
@@ -82,6 +87,7 @@ struct ClientActor {
     receiver: mpsc::Receiver<Message>,
     stream_handler: StreamActorHandler,
     conn: Option<Connection>,
+    buf: BytesMut,
 }
 
 impl ClientActor {
@@ -92,12 +98,16 @@ impl ClientActor {
             receiver,
             stream_handler,
             conn: None,
+            buf: BytesMut::new(),
         }
     }
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::OpenStream { sender } => loop {
+            Message::OpenStream {
+                sender,
+                remote_addr,
+            } => loop {
                 if self.conn.is_none() {
                     // Open a new connection.
                     match self.client.open_conn().await {
@@ -109,6 +119,7 @@ impl ClientActor {
                                     }
                                     Err(err) => {
                                         trace!("Send password failed: {:?}", err);
+                                        return;
                                     }
                                 }
                             }
@@ -121,8 +132,35 @@ impl ClientActor {
                 }
                 let conn = self.conn.as_mut().unwrap();
                 match conn.open_bi().await {
-                    Ok(bi) => {
-                        let _ = sender.send(bi);
+                    Ok((mut send, mut recv)) => {
+                        self.buf.clear();
+                        remote_addr.encode(&mut self.buf);
+                        if let Err(err) =
+                            poll_fn(|cx| poll_write_buf(Pin::new(&mut send), cx, &mut self.buf))
+                                .await
+                        {
+                            trace!("Write failed: {:?}", err);
+                            self.conn = None;
+                            continue;
+                        }
+                        if let Err(err) = poll_fn(|cx| Pin::new(&mut send).poll_flush(cx)).await {
+                            trace!("Flush failed: {:?}", err);
+                            self.conn = None;
+                            continue;
+                        }
+                        self.buf.clear();
+                        if let Err(err) =
+                            poll_fn(|cx| poll_read_buf(Pin::new(&mut recv), cx, &mut self.buf))
+                                .await
+                        {
+                            trace!("Read failed: {:?}", err);
+                            self.conn = None;
+                            continue;
+                        }
+                        let _ = match self.buf[0] {
+                            0 => sender.send(Ok((send, recv))),
+                            _ => sender.send(Err(Error::OpenRemoteError)),
+                        };
                         return;
                     }
                     Err(err) => {
@@ -137,7 +175,8 @@ impl ClientActor {
 
 enum Message {
     OpenStream {
-        sender: oneshot::Sender<(SendStream, RecvStream)>,
+        remote_addr: Addr,
+        sender: oneshot::Sender<Result<(SendStream, RecvStream)>>,
     },
 }
 
@@ -160,11 +199,19 @@ impl ClientActorHndler {
         Ok(Self { sender })
     }
 
-    pub async fn open_bi(&mut self) -> Result<(SendStream, RecvStream)> {
+    pub async fn open_bi(self, remote_addr: Addr) -> io::Result<QuicStream> {
         let (sender, respond_to) = oneshot::channel();
-        let msg = Message::OpenStream { sender };
+        let msg = Message::OpenStream {
+            sender,
+            remote_addr,
+        };
         let _ = self.sender.send(msg).await;
-        Ok(respond_to.await?)
+        let (send, recv) = respond_to
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let stream = QuicStream::new(recv, send);
+        return Ok(stream);
     }
 }
 

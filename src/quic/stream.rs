@@ -1,17 +1,18 @@
+use std::{pin::Pin, task::{Context, Poll}};
+
 use bytes::BytesMut;
 use futures::AsyncWriteExt;
 use quinn::{RecvStream, SendStream};
 use socks5lib::proto::Addr;
-use tokio::{
-    net::TcpStream,
-    sync::{mpsc, oneshot},
-};
+use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpStream, sync::{mpsc, oneshot}};
+use tokio_trace::trace;
 
 use crate::error::{Error, Result};
 
 const CORRECT_PASSWORD_RESPONSE: u8 = 0;
 const SEND_ADDR_SUCCESS_RESPONSE: u8 = 0;
 
+#[derive(Debug)]
 enum Message {
     SendPassword {
         send: SendStream,
@@ -90,6 +91,7 @@ impl StreamActor {
     }
 
     async fn handle(&mut self, msg: Message) {
+        trace!("Accept message: {:?}", &msg);
         match msg {
             Message::SendPassword { send, recv, sender } => {
                 let res = self.send_passwd(send, recv).await;
@@ -116,7 +118,11 @@ impl StreamActor {
     }
 
     async fn send_passwd(&mut self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-        send.write_all(&self.passwd).await?;
+        trace!("Send password: {:?}", &self.passwd);
+        let mut buf = vec![self.passwd.len() as u8];
+        buf.extend_from_slice(&self.passwd);
+        send.write_all(&&buf).await?;
+        trace!("Send password successfully.");
         send.flush().await?;
         let mut buf = [0u8; 1];
         recv.read_exact(&mut buf).await?;
@@ -185,6 +191,7 @@ impl StreamActor {
 }
 
 async fn run_stream_actor(mut actor: StreamActor) {
+    trace!("StreamActor is running...");
     while let Some(msg) = actor.receiver.recv().await {
         actor.handle(msg).await;
     }
@@ -245,5 +252,54 @@ impl StreamActorHandler {
         let msg = Message::handle_open_remote_req(send, recv, sender);
         let _ = self.sender.send(msg).await;
         respond_to.await?
+    }
+}
+
+#[pin_project::pin_project]
+pub struct QuicStream {
+    #[pin]
+    recv: RecvStream,
+    #[pin]
+    send: SendStream,
+}
+
+impl QuicStream {
+    pub fn new(recv: RecvStream, send: SendStream) -> Self {
+        Self { recv, send }
+    }
+}
+
+impl AsyncRead for QuicStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = self.project();
+        me.recv.poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for QuicStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        self.project().send.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        self.project().send.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        self.project().send.poll_shutdown(cx)
     }
 }

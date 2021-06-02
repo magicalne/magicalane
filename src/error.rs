@@ -52,8 +52,11 @@ pub enum Error {
     RcgenError(#[from] RcgenError),
     #[error("Parse key or cert error: {0}")]
     CertParseError(#[from] ParseError),
-    #[error("TLSError: {0}")]
-    TLSError(#[from] TLSError),
+    #[error("TlsError: {0}")]
+    TlsError(#[from] TLSError),
+
+    #[error("Open remote error")]
+    OpenRemoteError,
 
     #[error("Recvive error from channel: {0}")]
     OneshotRecvError(#[from] oneshot::error::RecvError),

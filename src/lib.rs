@@ -1,23 +1,24 @@
-use std::{fs, future::Future, path::{Path, PathBuf}, task::Poll};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use bytes::{Buf, Bytes, BytesMut};
-use error::{Error, Result};
-use futures::{future, ready, FutureExt};
+use error::Result;
 use quinn::{CertificateChain, PrivateKey};
-
-use protocol::Protocol;
-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite}, net::{TcpStream, UdpSocket}};
 
 pub mod error;
 pub mod protocol;
 pub mod quic;
-pub mod stream;
-pub mod server1;
+pub mod quic_connector;
 
 pub const ALPN_QUIC: &[&[u8]] = &[b"hq-29"];
 
-pub fn generate_key_and_cert_der() -> Result<(PathBuf, PathBuf)> {
-    let dirs = directories::ProjectDirs::from("org", "tls", "examples").unwrap();
+pub fn generate_key_and_cert_der(
+    qualifier: &str,
+    org: &str,
+    application: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let dirs = directories::ProjectDirs::from(qualifier, org, application).unwrap();
     let path = dirs.data_local_dir();
     let cert_path = path.join("cert.der");
     let key_path = path.join("key.der");
@@ -32,8 +33,12 @@ pub fn generate_key_and_cert_der() -> Result<(PathBuf, PathBuf)> {
     Ok((key_path, cert_path))
 }
 
-pub fn generate_key_and_cert_pem() -> Result<(PathBuf, PathBuf)> {
-    let dirs = directories::ProjectDirs::from("org", "tls", "examples").unwrap();
+pub fn generate_key_and_cert_pem(
+    qualifier: &str,
+    org: &str,
+    application: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let dirs = directories::ProjectDirs::from(qualifier, org, application).unwrap();
     let path = dirs.data_local_dir();
     let cert_path = path.join("cert.pem");
     let key_path = path.join("key.pem");

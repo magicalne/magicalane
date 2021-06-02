@@ -7,7 +7,6 @@ use error::Result;
 use quinn::{CertificateChain, PrivateKey};
 
 pub mod error;
-pub mod protocol;
 pub mod quic;
 pub mod quic_connector;
 

@@ -14,9 +14,9 @@ use std::net::{ToSocketAddrs, SocketAddr};
 #[derive(Debug, Eq, PartialEq)]
 pub enum Kind {
     //0
-    TCP,
+    Tcp,
     //1
-    UDP,
+    Udp,
     Error
 }
 
@@ -49,8 +49,8 @@ impl Protocol {
     pub fn encode(&self) -> Result<BytesMut> {
         let mut bytes = BytesMut::new();
         bytes.put_u8(match self.kind {
-            Kind::TCP => 0u8,
-            Kind::UDP => 1u8,
+            Kind::Tcp => 0u8,
+            Kind::Udp => 1u8,
             _ => 2u8
         });
         bytes.put_slice(self.password.clone().as_bytes());
@@ -88,10 +88,10 @@ impl Protocol {
 fn parse_kind(i: &[u8]) -> Kind {
     match i.first() {
         Some(0u8) => {
-            Kind::TCP
+            Kind::Tcp
         }
         Some(1u8) => {
-            Kind::UDP
+            Kind::Udp
         },
         _ => Kind::Error
     }
@@ -135,7 +135,7 @@ fn test() {
 #[test]
 fn protocol_encode_test() {
     let protocol = Protocol::new(
-        Kind::TCP,
+        Kind::Tcp,
         "pw0".into(),
         "localhost".into(),
         2345,
@@ -163,7 +163,7 @@ fn protocol_parser_test() {
 
     let result = Protocol::parse(&buf);
     let expect = Protocol {
-        kind: Kind::TCP,
+        kind: Kind::Tcp,
         password: "pwd".to_string(),
         host: "localhost".to_string(),
         port: 23456,

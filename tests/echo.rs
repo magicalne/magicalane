@@ -53,7 +53,7 @@ pub async fn echo_client() -> Result<()> {
     let mut client_config = quinn::ClientConfigBuilder::default();
     client_config.protocols(ALPN_QUIC);
     client_config.enable_keylog();
-    let (key, cert) = generate_key_and_cert_der()?;
+    let (_, cert) = generate_key_and_cert_der()?;
     fs::read(cert)
         .map(|cert| quinn::Certificate::from_der(&cert))
         .map(|cert| match cert {
@@ -76,7 +76,7 @@ pub async fn echo_client() -> Result<()> {
     endpoint_builder.default_client_config(config);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     // Bind this endpoint to a UDP socket on the given client address.
-    let (endpoint, incoming) = endpoint_builder.bind(&addr)?;
+    let (endpoint, _) = endpoint_builder.bind(&addr)?;
     trace!("Client bind endpoint: {:?}", &addr);
 
     let connection = endpoint.connect(&remote, "localhost")?.await?;

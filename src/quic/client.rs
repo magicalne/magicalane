@@ -9,15 +9,13 @@ use std::{
 use bytes::BytesMut;
 use futures::{future::poll_fn, AsyncWrite};
 use quinn::{Connection, Endpoint, NewConnection, RecvStream, SendStream};
+use socket2::{Domain, Protocol, Socket, Type};
 use socks5lib::proto::Addr;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
 use tracing::{error, trace};
 
-use crate::{
-    error::{Error, Result},
-    ALPN_QUIC,
-};
+use crate::{ALPN_QUIC, error::{Error, Result}, quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE}};
 
 use super::{stream::{QuicStream, StreamActorHandler}};
 
@@ -34,10 +32,12 @@ impl Client {
         client_config.enable_keylog();
         cert_path
             .map(|path| {
+                // This is for self-signed.
                 fs::read(path)
                     .map(|cert| quinn::Certificate::from_der(&cert))
                     .map(|cert| match cert {
                         Ok(cert) => {
+                            trace!("Add cert: {:?}", &cert);
                             if let Err(err) = client_config.add_certificate_authority(cert) {
                                 error!("Client add cert failed: {:?}.", err);
                             }
@@ -57,13 +57,19 @@ impl Client {
             .to_socket_addrs()?
             .find(|add| add.is_ipv4())
             .ok_or(Error::UnknownRemoteHost)?;
-        trace!("Connect remote: {:?}", &remote_addr);
+        trace!("Connect remote: {:?}, server name: {:?}", &remote_addr, &server_name);
         let mut endpoint_builder = Endpoint::builder();
         endpoint_builder.default_client_config(config);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         // Bind this endpoint to a UDP socket on the given client address.
-        let (endpoint, _) = endpoint_builder.bind(&addr)?;
-        trace!("Client bind endpoint: {:?}", &addr);
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let addr = addr.into();
+        socket.bind(&addr)?;
+        socket.set_recv_buffer_size(SOCKET_RECV_BUF_SIZE)?;
+        socket.set_send_buffer_size(SOCKET_SEND_BUF_SIZE)?;
+        let udp = socket.into();
+        let (endpoint, _) = endpoint_builder.with_socket(udp)?;
+        trace!("Client bind: {:?}", &addr);
 
         Ok(Self {
             remote_addr,
@@ -126,7 +132,8 @@ impl ClientActor {
                         }
                         Err(err) => {
                             trace!("Cannot connect to quic server: {:?}", err);
-                            continue;
+                            let _ = sender.send(Err(err));
+                            return;
                         }
                     }
                 }
@@ -216,6 +223,7 @@ impl ClientActorHndler {
 }
 
 async fn run_client_actor(mut actor: ClientActor) {
+    trace!("Accecpt client request.");
     while let Some(msg) = actor.receiver.recv().await {
         actor.handle(msg).await;
     }

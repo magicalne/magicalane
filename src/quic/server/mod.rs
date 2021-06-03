@@ -9,6 +9,7 @@ use std::{
 
 use futures::StreamExt;
 use quinn::{Endpoint, NewConnection, ServerConfig};
+use socket2::{Domain, Protocol, Socket, Type};
 use socks5lib::Connector;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -17,8 +18,10 @@ use tokio::{
 use tracing::{info, trace};
 
 use crate::{
-    error::Result, load_private_cert, load_private_key,
-    quic::server::conn::Connection, ALPN_QUIC,
+    error::Result,
+    load_private_cert, load_private_key,
+    quic::{server::conn::Connection, SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE},
+    ALPN_QUIC,
 };
 
 #[pin_project::pin_project]
@@ -48,9 +51,15 @@ impl<C> Server<C> {
         server_config.protocols(ALPN_QUIC);
         let mut endpoint_builder = Endpoint::builder();
         endpoint_builder.listen(server_config.build());
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
-        let (_, incoming) = endpoint_builder.bind(&addr)?;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let addr = addr.into();
         info!("Server bind: {:?}", &addr);
+        socket.bind(&addr)?;
+        socket.set_recv_buffer_size(SOCKET_RECV_BUF_SIZE)?;
+        socket.set_send_buffer_size(SOCKET_SEND_BUF_SIZE)?;
+        let udp = socket.into();
+        let (_, incoming) = endpoint_builder.with_socket(udp)?;
         let passwd = passwd.into_bytes();
         Ok(Self {
             connector,

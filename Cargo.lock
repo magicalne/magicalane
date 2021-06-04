@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "socks5lib"
 version = "0.1.0"
-source = "git+https://github.com/magicalne/socks5lib?branch=main#24013226e7dde4eb534bfa99c4d51ac2f0e7b142"
+source = "git+https://github.com/magicalne/socks5lib?branch=main#6b7be18e1cbf53bd0f49c6c5b0f82ce358a3c8d8"
 dependencies = [
  "bytes",
  "futures",

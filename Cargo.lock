@@ -908,9 +908,9 @@ dependencies = [
 
 [[package]]
 name = "security-framework"
-version = "2.2.0"
+version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3670b1d2fdf6084d192bc71ead7aabe6c06aa2ea3fbd9cc3ac111fa5c2b1bd84"
+checksum = "23a2ac85147a3a11d77ecf1bc7166ec0b92febfa4461c37944e180f319ece467"
 dependencies = [
  "bitflags",
  "core-foundation",
@@ -921,9 +921,9 @@ dependencies = [
 
 [[package]]
 name = "security-framework-sys"
-version = "2.2.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3676258fd3cfe2c9a0ec99ce3038798d847ce3e4bb17746373eb9f0f1ac16339"
+checksum = "7e4effb91b4b8b6fb7732e670b6cee160278ff8e6bf485c7805d9e319d76e284"
 dependencies = [
  "core-foundation-sys",
  "libc",
@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "socks5lib"
 version = "0.1.0"
-source = "git+https://github.com/magicalne/socks5lib?branch=main#3de89816ec5efaf7b05d536201134c0182095988"
+source = "git+https://github.com/magicalne/socks5lib?branch=main#4080958c78feb86276a9396905b3702d789d554c"
 dependencies = [
  "bytes",
  "futures",

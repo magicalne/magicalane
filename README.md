@@ -1,12 +1,23 @@
 # Magicalane - A QUIC based proxy
 
-## Design
+## Download
 
-### Protocol
+Checkout the recent releases.
 
-Once connection is setup, client will open a bi stream to send password validate request.
+## Run
 
-If password is validate, connection will be used to proxy requests of user.
+```sh
+chmod +x magicalane-linux
+```
 
-Otherwise connection will be droped.
+`client`:
 
+```sh
+./magicalane-linux client --socks-port <your_local_socks_port> --password <your_password> --server-host <your.hostname> --server-port <443_or_your_server_port>
+```
+
+`server`:
+
+```
+./magicalane-linux server --key <your_key.pem> --ca <your_ca.pem>  --port <443_or_your_server_port> --password <your_password>
+```

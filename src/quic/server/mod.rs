@@ -7,10 +7,10 @@ use std::{
     u16,
 };
 
+use crate::connector::Connector;
 use futures::StreamExt;
 use quinn::{Endpoint, NewConnection, ServerConfig};
 use socket2::{Domain, Protocol, Socket, Type};
-use socks5lib::Connector;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     spawn,
@@ -30,6 +30,7 @@ pub struct Server<C> {
     passwd: Vec<u8>,
     #[pin]
     incoming: quinn::Incoming,
+    bandwidth: usize,
 }
 
 impl<C> Server<C> {
@@ -38,6 +39,7 @@ impl<C> Server<C> {
         key_cert: (PathBuf, PathBuf),
         port: u16,
         passwd: String,
+        bandwidth: usize,
     ) -> Result<Self> {
         let server_config = ServerConfig::default();
         let mut server_config = quinn::ServerConfigBuilder::new(server_config);
@@ -65,6 +67,7 @@ impl<C> Server<C> {
             connector,
             passwd,
             incoming,
+            bandwidth,
         })
     }
 }
@@ -82,8 +85,12 @@ where
             );
             match connecting.await {
                 Ok(NewConnection { bi_streams, .. }) => {
-                    let mut conn =
-                        Connection::new(bi_streams, self.connector.clone(), self.passwd.clone());
+                    let mut conn = Connection::new(
+                        bi_streams,
+                        self.connector.clone(),
+                        self.passwd.clone(),
+                        self.bandwidth,
+                    );
                     spawn(async move {
                         if let Err(err) = conn.accept().await {
                             trace!("Quic connection error: {:?}", err);

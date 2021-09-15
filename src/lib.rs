@@ -6,9 +6,11 @@ use std::{
 use error::Result;
 use quinn::{CertificateChain, PrivateKey};
 
+pub mod connector;
 pub mod error;
+pub(crate) mod proxy;
 pub mod quic;
-pub mod quic_connector;
+pub mod socks5;
 
 pub const ALPN_QUIC: &[&[u8]] = &[b"hq-29"];
 

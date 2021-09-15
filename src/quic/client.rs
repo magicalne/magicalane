@@ -6,18 +6,22 @@ use std::{
     u8,
 };
 
+use crate::socks5::proto::Addr;
 use bytes::BytesMut;
 use futures::{future::poll_fn, AsyncWrite};
 use quinn::{Connection, Endpoint, NewConnection, RecvStream, SendStream};
 use socket2::{Domain, Protocol, Socket, Type};
-use socks5lib::proto::Addr;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
 use tracing::{error, trace};
 
-use crate::{ALPN_QUIC, error::{Error, Result}, quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE}};
+use crate::{
+    error::{Error, Result},
+    quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE},
+    ALPN_QUIC,
+};
 
-use super::{stream::{QuicStream, StreamActorHandler}};
+use super::stream::{QuicStream, StreamActorHandler};
 
 pub struct Client {
     remote_addr: SocketAddr,
@@ -57,7 +61,11 @@ impl Client {
             .to_socket_addrs()?
             .find(|add| add.is_ipv4())
             .ok_or(Error::UnknownRemoteHost)?;
-        trace!("Connect remote: {:?}, server name: {:?}", &remote_addr, &server_name);
+        trace!(
+            "Connect remote: {:?}, server name: {:?}",
+            &remote_addr,
+            &server_name
+        );
         let mut endpoint_builder = Endpoint::builder();
         endpoint_builder.default_client_config(config);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
@@ -218,7 +226,7 @@ impl ClientActorHndler {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let stream = QuicStream::new(recv, send);
-        return Ok(stream);
+        Ok(stream)
     }
 }
 

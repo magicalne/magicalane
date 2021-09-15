@@ -1,12 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use lib::{
-    generate_key_and_cert_pem,
-    quic::{self, server::Server},
-    quic_connector,
-};
-use socks5lib::LocalConnector;
+use lib::connector::LocalConnector;
+use lib::{connector, generate_key_and_cert_pem};
 use structopt::StructOpt;
 use tracing::Level;
 
@@ -32,6 +28,8 @@ enum Opt {
         ca: Option<PathBuf>,
         #[structopt(long)]
         verbose: bool,
+        #[structopt(long)]
+        bandwidth: usize,
     },
     Server {
         #[structopt(long)]
@@ -44,6 +42,8 @@ enum Opt {
         key: Option<PathBuf>,
         #[structopt(long)]
         verbose: bool,
+        #[structopt(long)]
+        bandwidth: usize,
     },
 }
 
@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
             password,
             ca,
             verbose,
+            bandwidth,
         } => {
             let file_appender = tracing_appender::rolling::hourly("./log", "magicalane-client.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -67,16 +68,16 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .expect("no global subscriber has been set");
-            let quic_client = quic::client::ClientActorHndler::new(
+            let quic_client = lib::quic::client::ClientActorHndler::new(
                 server_host.clone(),
                 server_port,
                 ca,
                 password.as_bytes().to_vec(),
             )
             .await?;
-            let connector = quic_connector::QuicConnector::new(quic_client);
+            let connector = connector::QuicConnector::new(quic_client);
             let mut socks_server =
-                socks5lib::server::Server::new(Some(socks_port), connector).await?;
+                lib::socks5::server::Server::new(Some(socks_port), connector, bandwidth).await?;
             socks_server.run().await?;
         }
         Opt::Server {
@@ -85,6 +86,7 @@ async fn main() -> Result<()> {
             ca,
             key,
             verbose,
+            bandwidth,
         } => {
             let file_appender = tracing_appender::rolling::hourly("./log", "magicalane-server.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -99,7 +101,8 @@ async fn main() -> Result<()> {
                 (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
             };
             let connector = LocalConnector;
-            let mut server = Server::new(connector, key_cert, port, password)?;
+            let mut server =
+                lib::quic::server::Server::new(connector, key_cert, port, password, bandwidth)?;
             server.run().await?;
         }
     }

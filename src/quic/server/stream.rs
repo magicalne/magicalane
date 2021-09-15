@@ -4,13 +4,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::{connector::Connector, proxy::Proxy, socks5::proto::Addr};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{future::BoxFuture, ready, Future};
-use socks5lib::{
-    proto::Addr,
-    proxy::Proxy,
-    Connector,
-};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
 use tracing::trace;
@@ -33,6 +29,7 @@ pub struct Stream<IO, C, O> {
     remote: Option<O>,
     state: State,
     proxy: Option<Proxy<IO, O>>,
+    bandwidth: usize,
 }
 
 impl<IO, C, O> Stream<IO, C, O>
@@ -41,7 +38,7 @@ where
     O: AsyncRead + AsyncWrite + Unpin,
     C: Connector<Connection = O>,
 {
-    pub fn new(io: IO, connector: C) -> Self {
+    pub fn new(io: IO, connector: C, bandwidth: usize) -> Self {
         Self {
             io: Some(io),
             buf: BytesMut::new(),
@@ -49,7 +46,8 @@ where
             connector_fut: None,
             remote: None,
             state: State::ReadAddrReq,
-            proxy: None
+            proxy: None,
+            bandwidth,
         }
     }
 
@@ -61,7 +59,7 @@ where
             &mut self.buf
         ))?;
         trace!("Read addr: {:?}Bytes: {:?}", n, &self.buf[..n]);
-        let addr = Addr::new(&self.buf.chunk())?;
+        let addr = Addr::new(self.buf.chunk())?;
         trace!("read addr: {:?}", &addr);
         self.connector_fut = Some(self.connector.connect(addr));
         self.state = State::OpenRemote;
@@ -136,13 +134,14 @@ where
                 State::Finished => {
                     let src = me.io.take().unwrap();
                     let dst = me.remote.take().unwrap();
-                    let proxy = Proxy::new(src, dst);
+                    let bandwidth = me.bandwidth;
+                    let proxy = Proxy::new(src, dst, bandwidth);
                     me.proxy = Some(proxy);
                     me.state = State::Proxy;
                 }
                 State::Proxy => {
                     let _ = ready!(Pin::new(&mut me.proxy).as_pin_mut().unwrap().poll(cx))?;
-                    return Poll::Ready(Ok(()))
+                    return Poll::Ready(Ok(()));
                 }
             }
         }

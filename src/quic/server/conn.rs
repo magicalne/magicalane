@@ -1,9 +1,9 @@
 use std::pin::Pin;
 
+use crate::connector::Connector;
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{future::poll_fn, StreamExt, TryStreamExt};
 use quinn::IncomingBiStreams;
-use socks5lib::Connector;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     spawn,
@@ -23,6 +23,7 @@ pub struct Connection<C> {
     buf: BytesMut,
     connector: C,
     passwd: Vec<u8>,
+    bandwidth: usize,
 }
 
 impl<C, O> Connection<C>
@@ -30,12 +31,18 @@ where
     O: AsyncRead + AsyncWrite + Unpin + 'static,
     C: Connector<Connection = O> + Send + 'static,
 {
-    pub fn new(bi_streams: IncomingBiStreams, connector: C, passwd: Vec<u8>) -> Self {
+    pub fn new(
+        bi_streams: IncomingBiStreams,
+        connector: C,
+        passwd: Vec<u8>,
+        bandwidth: usize,
+    ) -> Self {
         Self {
             bi_streams,
             buf: BytesMut::new(),
             connector,
             passwd,
+            bandwidth,
         }
     }
 
@@ -67,7 +74,8 @@ where
                 Ok((send, recv)) => {
                     let connector = me.connector.clone();
                     let stream = QuicStream::new(recv, send);
-                    let stream = Stream::new(stream, connector);
+                    let bandwidth = me.bandwidth;
+                    let stream = Stream::new(stream, connector, bandwidth);
                     spawn(async move {
                         if let Err(err) = stream.await {
                             trace!("Stream error: {:?}", err);

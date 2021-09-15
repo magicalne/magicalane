@@ -1,13 +1,22 @@
-use std::{pin::Pin, task::{Context, Poll}};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::BytesMut;
 use futures::AsyncWriteExt;
 use quinn::{RecvStream, SendStream};
-use socks5lib::proto::Addr;
-use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpStream, sync::{mpsc, oneshot}};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
 use tokio_trace::trace;
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    socks5::proto::Addr,
+};
 
 const CORRECT_PASSWORD_RESPONSE: u8 = 0;
 const SEND_ADDR_SUCCESS_RESPONSE: u8 = 0;
@@ -43,11 +52,7 @@ impl Message {
         recv: RecvStream,
         sender: oneshot::Sender<Result<()>>,
     ) -> Self {
-        Self::SendPassword {
-            send,
-            recv,
-            sender,
-        }
+        Self::SendPassword { send, recv, sender }
     }
 
     fn send_addr_req(
@@ -121,7 +126,7 @@ impl StreamActor {
         trace!("Send password: {:?}", &self.passwd);
         let mut buf = vec![self.passwd.len() as u8];
         buf.extend_from_slice(&self.passwd);
-        send.write_all(&&buf).await?;
+        send.write_all(&buf).await?;
         trace!("Send password successfully.");
         send.flush().await?;
         let mut buf = [0u8; 1];
@@ -210,11 +215,7 @@ impl StreamActorHandler {
         Self { sender }
     }
 
-    pub async fn send_passwd(
-        &mut self,
-        send: SendStream,
-        recv: RecvStream,
-    ) -> Result<()> {
+    pub async fn send_passwd(&mut self, send: SendStream, recv: RecvStream) -> Result<()> {
         let (sender, respond_to) = oneshot::channel();
         let msg = Message::send_passwd_req(send, recv, sender);
         let _ = self.sender.send(msg).await;

@@ -14,7 +14,6 @@ name = "magicalane"
 path = "src/main.rs"
 
 [dependencies]
-socks5lib = { git = "https://github.com/magicalne/socks5lib", branch = "main"}
 bytes = "1"
 libc = "0.2.69"
 quinn = "0.7.0"

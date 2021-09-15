@@ -1,6 +1,6 @@
 use std::str::Utf8Error;
 
-use quinn::{ParseError, crypto::rustls::TLSError};
+use quinn::{crypto::rustls::TLSError, ParseError};
 use rcgen::RcgenError;
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -20,6 +20,8 @@ pub enum Error {
     WrongPassword,
     #[error("Failed to open remote addr")]
     OpenRemoteAddrError,
+    #[error("Connection closed")]
+    ConnectionClose,
     /// Buffer is empty.
     #[error("Empty buffer.")]
     EmptyBuffer,
@@ -73,7 +75,7 @@ pub enum Error {
     WebPkiError,
 
     #[error("Socks lib error: {0}")]
-    Socs5LibError(#[from] socks5lib::error::Error),
+    Socs5LibError(#[from] crate::socks5::error::Error),
 
     #[error("Utf8 error")]
     Utf8Error(#[from] Utf8Error),

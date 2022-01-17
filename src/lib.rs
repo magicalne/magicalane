@@ -6,6 +6,7 @@ use std::{
 use error::Result;
 use quinn::{CertificateChain, PrivateKey};
 
+pub mod config;
 pub mod connector;
 pub mod error;
 pub(crate) mod proxy;

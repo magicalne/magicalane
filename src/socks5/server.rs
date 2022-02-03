@@ -1,11 +1,11 @@
 use crate::connector::Connector;
 
 use super::{conn::Connection, Result};
+use log::{debug, info, trace};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpListener,
 };
-use tracing::{debug, info, trace};
 
 pub struct Server<C> {
     listener: TcpListener,

@@ -9,11 +9,11 @@ use std::{
 use crate::socks5::proto::Addr;
 use bytes::BytesMut;
 use futures::{future::poll_fn, AsyncWrite};
+use log::{error, trace};
 use quinn::{Connection, Endpoint, NewConnection, RecvStream, SendStream};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
-use tracing::{error, trace};
 
 use crate::{
     error::{Error, Result},
@@ -38,7 +38,7 @@ impl Client {
             .map(|path| {
                 // This is for self-signed.
                 fs::read(path)
-                    .map(|cert| quinn::Certificate::from_der(&cert))
+                    .map(|cert| quinn::Certificate::from_pem(&cert))
                     .map(|cert| match cert {
                         Ok(cert) => {
                             trace!("Add cert: {:?}", &cert);

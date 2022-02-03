@@ -39,10 +39,10 @@ where
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
+        let this = self.project();
         trace!("poll");
-        let _ = this.i.poll_copy_into(cx, &mut this.o)?;
-        let _ = this.o.poll_copy_into(cx, &mut this.i)?;
+        let _ = this.i.poll_copy_into(cx, this.o)?;
+        let _ = this.o.poll_copy_into(cx, this.i)?;
         if this.i.is_done() && this.o.is_done() {
             Poll::Ready(Ok(()))
         } else {

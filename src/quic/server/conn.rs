@@ -3,13 +3,13 @@ use std::pin::Pin;
 use crate::connector::Connector;
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{future::poll_fn, StreamExt, TryStreamExt};
+use log::trace;
 use quinn::IncomingBiStreams;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     spawn,
 };
 use tokio_util::io::{poll_read_buf, poll_write_buf};
-use tracing::trace;
 
 use crate::{
     error::{Error, Result},

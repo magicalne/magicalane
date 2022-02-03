@@ -30,6 +30,7 @@ pub struct ProxyConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct TransparentProxyConfig {
     tcp_port: u16,
     udp_port: u16,

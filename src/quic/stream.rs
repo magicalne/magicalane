@@ -5,13 +5,13 @@ use std::{
 
 use bytes::BytesMut;
 use futures::AsyncWriteExt;
+use log::trace;
 use quinn::{RecvStream, SendStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     sync::{mpsc, oneshot},
 };
-use tokio_trace::trace;
 
 use crate::{
     error::{Error, Result},

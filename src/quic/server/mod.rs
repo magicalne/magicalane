@@ -9,13 +9,13 @@ use std::{
 
 use crate::connector::Connector;
 use futures::StreamExt;
+use log::{info, trace};
 use quinn::{Endpoint, NewConnection, ServerConfig};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     spawn,
 };
-use tracing::{info, trace};
 
 use crate::{
     error::Result,

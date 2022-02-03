@@ -7,9 +7,9 @@ use std::{
 
 use bytes::{Buf, BytesMut};
 use futures::{future::BoxFuture, ready, Future};
+use log::trace;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
-use tracing::trace;
 
 use crate::{connector::Connector, proxy::Proxy};
 

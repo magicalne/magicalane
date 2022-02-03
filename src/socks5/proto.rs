@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::BufMut;
-use tracing::trace;
+use log::trace;
 
 use super::{error::Error, Result};
 

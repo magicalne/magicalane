@@ -3,7 +3,6 @@ use lib::config::{Config, Kind};
 use lib::connector::LocalConnector;
 use lib::{connector, generate_key_and_cert_pem};
 use structopt::StructOpt;
-use tracing::Level;
 
 #[derive(StructOpt, Debug)]
 enum Mode {
@@ -28,19 +27,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn is_verbose(verbose: bool) -> Level {
-    if verbose {
-        Level::TRACE
-    } else {
-        Level::INFO
-    }
-}
-
 async fn start_with_config(config: Config) -> Result<()> {
     let password = config.password;
     let bandwidth = config.bandwidth;
     let kind = config.kind;
-    setup_logger(config.verbose, &kind)?;
+    env_logger::init();
     match kind {
         Kind::Server { port, ca, key } => {
             let connector = LocalConnector;
@@ -71,29 +62,5 @@ async fn start_with_config(config: Config) -> Result<()> {
             socks_server.run().await?;
         }
     };
-    Ok(())
-}
-
-fn setup_logger(verbose: bool, kind: &Kind) -> Result<()> {
-    let log_dir = match kind {
-        Kind::Server {
-            port: _,
-            ca: _,
-            key: _,
-        } => "./server",
-        Kind::Client {
-            proxy: _,
-            socks5_port: _,
-            tproxy: _,
-        } => "./client",
-    };
-    let file_appender = tracing_appender::rolling::hourly(log_dir, "magicalane.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(is_verbose(verbose))
-        .with_writer(non_blocking)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
-
     Ok(())
 }

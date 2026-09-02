@@ -227,6 +227,7 @@ impl AsyncWrite for KcpStream {
         }
         let now = now_ms();
         let _ = inner.kcp.update(now);
+        let _ = inner.kcp.flush();
         drop(inner);
         shared.wake.notify_one();
         Poll::Ready(Ok(buf.len()))
@@ -260,6 +261,7 @@ pub(crate) fn send_eof(shared: &Arc<Shared>) {
     inner.write_closed = true;
     let now = now_ms();
     let _ = inner.kcp.update(now);
+    let _ = inner.kcp.flush();
     drop(inner);
     shared.wake.notify_one();
 }

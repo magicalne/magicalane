@@ -1,0 +1,5 @@
+# magicalane test-env: KCP transport client, plaintext (no TLS)
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp", tls = false }, socks5_port = 1080, tproxy = { tcp_port = 7895, udp_port = 7896 } } }

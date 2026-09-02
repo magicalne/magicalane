@@ -7,3 +7,6 @@ magicalane.iml
 # test env generated artifacts
 env/certs/
 env/.build/
+
+# benchmark results
+env/bench-results/

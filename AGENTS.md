@@ -63,6 +63,21 @@ bash env/test.sh             # full assertion suite (10 checks; auto-detects tra
 - Local cargo tests cover the KCP session layer without containers: `tests/kcp_loopback.rs` (raw + TLS echo), `tests/kcp_fullstack.rs` (real listener/connector + origin).
 - Override the engine with `CONTAINER_ENGINE=...` if needed.
 
+## Benchmarks (`env/bench.sh`)
+
+End-to-end transport comparison through the real stack (socks5 -> transport -> server -> echo origin), using the `magabench` binary (framed TCP echo origin + socks5-driven load client):
+
+```sh
+env/bench.sh                          # quic vs kcp
+env/bench.sh --transports quic,kcp,kcp-plain   # include plaintext KCP (TLS overhead)
+env/bench.sh --delay 30 --loss 2     # netem on the server: 30ms RTT, 2% loss
+env/bench.sh --pings 200 --dl-bytes 134217728  # knobs pass through to magabench
+```
+
+Metrics: fresh-connection setup (p50/p95, includes KCP session+TLS or QUIC stream open), RTT percentiles (64B/1KiB/16KiB), download/upload throughput (MB/s), and concurrent small-request rate (rps + p95). Results print as a comparison table and are saved under `env/bench-results/` (gitignored). The echo origin runs as container `magicalane-bench-echo` (label-owned, removed by `down.sh`).
+
+Reference numbers (local bridge, no netem): QUIC ~0.7ms connect / ~0.3ms RTT / ~150MB/s; KCP+TLS ~200ms connect (per-request session+TLS, no reuse) / ~0.4ms RTT / ~20MB/s. Under 30ms+2% loss, KCP download outperformed QUIC ~4x. Known optimization areas: KCP session reuse/multiplexing, window/tick tuning for throughput.
+
 ## Conventions
 
 - Public API errors: use `crate::error::{Result, Error}` rather than ad-hoc error types (SOCKS5 module has its own `error.rs`).

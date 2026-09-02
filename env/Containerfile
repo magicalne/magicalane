@@ -20,6 +20,7 @@ RUN apt-get update \
 # Staged by env/up.sh into env/.build/ (build context) to keep the
 # transfer small - no multi-GB target/ directory in the context.
 COPY magicalane /usr/local/bin/magicalane
+COPY magabench /usr/local/bin/magabench
 COPY tproxy-rules.sh /usr/local/bin/tproxy-rules.sh
 
 WORKDIR /srv

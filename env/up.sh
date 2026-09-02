@@ -22,12 +22,12 @@ while [ $# -gt 0 ]; do
         --profile) : ;;
         tproxy) PROFILE="tproxy" ;;
         --transport) TRANSPORT="$2"; shift ;;
-        quic|kcp) TRANSPORT="$1" ;;
+        quic|kcp|kcp-plain) TRANSPORT="$1" ;;
         *) echo "usage: env/up.sh [--transport quic|kcp] [--profile tproxy]" >&2; exit 2 ;;
     esac
     shift
 done
-case "$TRANSPORT" in quic|kcp) ;; *) echo "invalid transport: $TRANSPORT" >&2; exit 2 ;; esac
+case "$TRANSPORT" in quic|kcp|kcp-plain) ;; *) echo "invalid transport: $TRANSPORT" >&2; exit 2 ;; esac
 
 say() { echo "[up] $*"; }
 say "transport: $TRANSPORT"
@@ -66,6 +66,7 @@ cargo build --release
 say "staging build context"
 mkdir -p "$ENV_DIR/.build"
 cp -f target/release/magicalane "$ENV_DIR/.build/magicalane"
+cp -f target/release/magabench "$ENV_DIR/.build/magabench"
 cp -f "$ENV_DIR/tproxy-rules.sh" "$ENV_DIR/.build/tproxy-rules.sh"
 chmod +x "$ENV_DIR/.build/"*
 
@@ -92,6 +93,7 @@ ensure_run magicalane-origin \
 ensure_run magicalane-server \
     $CE run -d --name magicalane-server --label "$LABEL" \
     --network "$NET" --network-alias magicalane-server \
+    --cap-add NET_ADMIN \
     -e RUST_LOG=info \
     -v "$ENV_DIR/configs/server-$TRANSPORT.toml:/etc/magicalane/server.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \

@@ -1,0 +1,6 @@
+# magicalane test-env: KCP transport server, plaintext (no TLS) - for
+# benchmarking TLS overhead and debugging/captures. Auth still required.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4433, ca = "/etc/magicalane/certs/server.pem", key = "/etc/magicalane/certs/server.key", protocol = "kcp", tls = false } }

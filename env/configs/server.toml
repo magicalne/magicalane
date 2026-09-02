@@ -1,0 +1,5 @@
+# magicalane test-env: QUIC server config (mounted to /etc/magicalane/server.toml)
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4433, ca = "/etc/magicalane/certs/server.pem", key = "/etc/magicalane/certs/server.key" } }

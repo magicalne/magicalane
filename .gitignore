@@ -3,3 +3,7 @@
 /log
 magicalane.iml
 .vscode/
+
+# test env generated artifacts
+env/certs/
+env/.build/

@@ -1,0 +1,25 @@
+# magicalane test-env runtime image.
+# Base is bookworm (older glibc than the trixie build host) so the host-built
+# release binary always links cleanly. One image serves all roles:
+# origin (python3 http.server), magicalane server/client, and the tester.
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        iperf3 \
+        iproute2 \
+        iptables \
+        nftables \
+        procps \
+        python3 \
+        socat \
+    && rm -rf /var/lib/apt/lists/*
+
+# Staged by env/up.sh into env/.build/ (build context) to keep the
+# transfer small - no multi-GB target/ directory in the context.
+COPY magicalane /usr/local/bin/magicalane
+COPY tproxy-rules.sh /usr/local/bin/tproxy-rules.sh
+
+WORKDIR /srv

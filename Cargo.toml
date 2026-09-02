@@ -45,3 +45,8 @@ rcgen = "0.8"
 structopt = "0.3.0"
 pin-project = "1.0.7"
 socket2 = "0.4.0"
+# Vendored quinn 0.7.2 with a fix for source-address decoding on modern rustc
+# (std SocketAddrV4/sockaddr_in layout mismatch). Remove when upgrading to
+# quinn >= 0.11.
+[patch.crates-io]
+quinn = { path = "third_party/quinn" }

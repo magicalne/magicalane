@@ -57,6 +57,7 @@ impl<C> Server<C> {
         let addr = addr.into();
         info!("Server bind: {:?}", &addr);
         socket.bind(&addr)?;
+        socket.set_nonblocking(true)?;
         socket.set_recv_buffer_size(SOCKET_RECV_BUF_SIZE)?;
         socket.set_send_buffer_size(SOCKET_SEND_BUF_SIZE)?;
         let udp = socket.into();

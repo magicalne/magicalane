@@ -43,6 +43,23 @@ Integration tests are run manually with `cargo test -- --ignored` since they spi
 
 `.github/workflows/rust.yml` triggers on `v*` tags: builds release binaries for Linux and macOS, runs tests, and uploads `magicalane-linux` / `magicalane-macOS` to the GitHub release.
 
+## Test Environment (`env/`)
+
+Isolated rootless-podman network for verifying the proxy end-to-end without touching host ports/firewall:
+
+```sh
+./env/up.sh                  # origin + quic server + socks5 client on magicalane-net
+./env/up.sh --profile tproxy # + dual-homed tproxy client + app (transparent interception)
+bash env/test.sh             # full assertion suite (10 checks; auto-detects tproxy profile)
+./env/status.sh              # containers, listeners, tproxy rules, app routes
+./env/down.sh                # remove containers + networks (--purge also drops image/certs)
+```
+
+- Interaction is `podman exec` only; nothing is published to the host. Certs/fixtures live under `env/` (gitignored).
+- **After changing Rust code, run `env/down.sh` before `env/up.sh`** — up.sh skips already-running containers, so a rebuild won't deploy into them.
+- `env/tproxy-rules.sh apply|clean|show` manages TPROXY mangle + policy routing inside the tproxy-client container (socat stands in for the future `TransparentProxyConfig` listener on tcp 7895).
+- Override the engine with `CONTAINER_ENGINE=...` if needed.
+
 ## Conventions
 
 - Public API errors: use `crate::error::{Result, Error}` rather than ad-hoc error types (SOCKS5 module has its own `error.rs`).

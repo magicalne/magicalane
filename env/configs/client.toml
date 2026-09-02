@@ -1,0 +1,6 @@
+# magicalane test-env: client config (mounted to /etc/magicalane/client.toml)
+# proxy.host must match the server cert SAN (magicalane-server) and is used as SNI.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" }, socks5_port = 1080, tproxy = { tcp_port = 7895, udp_port = 7896 } } }

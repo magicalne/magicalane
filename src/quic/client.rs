@@ -71,6 +71,7 @@ impl Client {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         let addr = addr.into();
         socket.bind(&addr)?;
+        socket.set_nonblocking(true)?;
         socket.set_recv_buffer_size(SOCKET_RECV_BUF_SIZE)?;
         socket.set_send_buffer_size(SOCKET_SEND_BUF_SIZE)?;
         let udp = socket.into();

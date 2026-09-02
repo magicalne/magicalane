@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use crate::connector::Connector;
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{future::poll_fn, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, future::poll_fn};
 use log::trace;
 use quinn::IncomingBiStreams;
 use tokio::{
@@ -65,7 +65,7 @@ where
                 me.buf.put_u8(flag);
                 let n = poll_fn(|cx| poll_write_buf(Pin::new(&mut send), cx, &mut me.buf)).await?;
                 trace!("Write {:?}Bytes", n);
-                let _ = poll_fn(|cx| Pin::new(&mut send).poll_flush(cx)).await?;
+                poll_fn(|cx| Pin::new(&mut send).poll_flush(cx)).await?;
             }
             None => return Err(Error::StreamClose),
         };

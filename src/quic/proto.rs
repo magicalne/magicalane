@@ -1,5 +1,3 @@
-use std::usize;
-
 use crate::error::{Error, Result};
 
 /// `buf` is read from IO and compare buf with password.

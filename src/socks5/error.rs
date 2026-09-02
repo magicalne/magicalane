@@ -1,5 +1,3 @@
-use std::u8;
-
 use thiserror::Error;
 
 #[derive(Error, Debug)]

@@ -6,7 +6,7 @@ use std::{
 
 use crate::{connector::Connector, proxy::Proxy, socks5::proto::Addr};
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{future::BoxFuture, ready, Future};
+use futures::{Future, future::BoxFuture, ready};
 use log::trace;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
@@ -67,11 +67,12 @@ where
     }
 
     fn poll_open_remote(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        match ready!(Pin::new(&mut self.connector_fut)
-            .as_pin_mut()
-            .unwrap()
-            .poll(cx))
-        {
+        match ready!(
+            Pin::new(&mut self.connector_fut)
+                .as_pin_mut()
+                .unwrap()
+                .poll(cx)
+        ) {
             Ok(remote) => {
                 trace!("Open remote successfully.");
                 self.remote = Some(remote);
@@ -94,7 +95,7 @@ where
             &mut self.buf
         ))?;
         trace!("Write {:?}Bytes", n);
-        let _ = ready!(Pin::new(&mut self.io).as_pin_mut().unwrap().poll_flush(cx))?;
+        ready!(Pin::new(&mut self.io).as_pin_mut().unwrap().poll_flush(cx))?;
         let res = match &self.remote {
             Some(_) => {
                 self.state = State::Finished;
@@ -123,13 +124,13 @@ where
         loop {
             match me.state {
                 State::ReadAddrReq => {
-                    let _ = ready!(me.poll_read_addr(cx))?;
+                    ready!(me.poll_read_addr(cx))?;
                 }
                 State::OpenRemote => {
-                    let _ = ready!(me.poll_open_remote(cx))?;
+                    ready!(me.poll_open_remote(cx))?;
                 }
                 State::SendAddrRes => {
-                    let _ = ready!(me.poll_send_addr(cx))?;
+                    ready!(me.poll_send_addr(cx))?;
                 }
                 State::Finished => {
                     let src = me.io.take().unwrap();
@@ -140,7 +141,7 @@ where
                     me.state = State::Proxy;
                 }
                 State::Proxy => {
-                    let _ = ready!(Pin::new(&mut me.proxy).as_pin_mut().unwrap().poll(cx))?;
+                    ready!(Pin::new(&mut me.proxy).as_pin_mut().unwrap().poll(cx))?;
                     return Poll::Ready(Ok(()));
                 }
             }

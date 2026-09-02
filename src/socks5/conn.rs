@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::{Buf, BytesMut};
-use futures::{future::BoxFuture, ready, Future};
+use futures::{Future, future::BoxFuture, ready};
 use log::trace;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
@@ -14,9 +14,9 @@ use tokio_util::io::{poll_read_buf, poll_write_buf};
 use crate::{connector::Connector, proxy::Proxy};
 
 use super::{
+    Result,
     error::Error,
     proto::{Addr, Command, Decoder, Encoder, Reply, Version},
-    Result,
 };
 
 enum ConnectingState {
@@ -60,10 +60,10 @@ where
         loop {
             match &mut me.state {
                 ConnectingState::Negotiation => {
-                    let _ = ready!(me.poll_negotiation(cx))?;
+                    ready!(me.poll_negotiation(cx))?;
                 }
                 ConnectingState::SubNegotiation => {
-                    let _ = ready!(me.poll_subnegotiation(cx))?;
+                    ready!(me.poll_subnegotiation(cx))?;
                 }
                 ConnectingState::OpenRemote => {
                     let remote = ready!(me.poll_open_remote(cx))?;
@@ -153,7 +153,7 @@ where
         if n == 0 {
             return Poll::Ready(Err(Error::ConnectionClose));
         }
-        let _ = ready!(Pin::new(self.io.as_mut().unwrap()).poll_flush(cx))?;
+        ready!(Pin::new(self.io.as_mut().unwrap()).poll_flush(cx))?;
         Poll::Ready(Ok(remote_io))
     }
 }

@@ -1,6 +1,6 @@
 use crate::connector::Connector;
 
-use super::{conn::Connection, Result};
+use super::{Result, conn::Connection};
 use log::{debug, info, trace};
 use tokio::{
     io::{AsyncRead, AsyncWrite},

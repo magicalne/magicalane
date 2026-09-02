@@ -3,12 +3,11 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
-    u8,
 };
 
 use crate::socks5::proto::Addr;
 use bytes::BytesMut;
-use futures::{future::poll_fn, AsyncWrite};
+use futures::{AsyncWrite, future::poll_fn};
 use log::{error, trace};
 use quinn::{Connection, Endpoint, NewConnection, RecvStream, SendStream};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -16,9 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
 
 use crate::{
+    ALPN_QUIC,
     error::{Error, Result},
     quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE},
-    ALPN_QUIC,
 };
 
 use super::stream::{QuicStream, StreamActorHandler};
@@ -63,8 +62,7 @@ impl Client {
             .ok_or(Error::UnknownRemoteHost)?;
         trace!(
             "Connect remote: {:?}, server name: {:?}",
-            &remote_addr,
-            &server_name
+            &remote_addr, &server_name
         );
         let mut endpoint_builder = Endpoint::builder();
         endpoint_builder.default_client_config(config);

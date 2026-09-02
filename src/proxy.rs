@@ -2,11 +2,10 @@ use std::{
     io::{Error, ErrorKind::ConnectionAborted, Result},
     pin::Pin,
     task::{Context, Poll},
-    usize,
 };
 
 use bytes::{Buf, BytesMut};
-use futures::{ready, Future};
+use futures::{Future, ready};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{poll_read_buf, poll_write_buf};
 use tracing::{error, trace};
@@ -52,14 +51,14 @@ where
 }
 
 enum BufRead {
-    Read(usize),
+    Read,
     NotEmpty,
     Eof,
 }
 
 enum BufWrite {
     BufEmpty,
-    Partial(usize),
+    Partial,
     All(usize),
 }
 
@@ -124,7 +123,7 @@ where
                     }
                     return Poll::Pending;
                 }
-                Poll::Ready(BufRead::NotEmpty) | Poll::Ready(BufRead::Read(_)) => {
+                Poll::Ready(BufRead::NotEmpty) | Poll::Ready(BufRead::Read) => {
                     // Write buf to the dst.
                     match self.drain_into(cx, dst)? {
                         // All the buf was written, so continue to read.
@@ -135,14 +134,14 @@ where
                         // Only some of the buffered data could be written
                         // before the dst became pending. Try to flush the
                         // written data to get capacity.
-                        BufWrite::Partial(_) => {
+                        BufWrite::Partial => {
                             ready!(self.poll_flush(cx, dst))?;
                             // `BufWrite::Partital` matches with `Poll::Pending`
                             // If the flush completed, try writeing again to
                             // ensure that we have a notification registered. If
                             // all of the buffered data still cannot be written,
                             // return pending. Otherwise, continue.
-                            if let BufWrite::Partial(_) = self.drain_into(cx, dst)? {
+                            if let BufWrite::Partial = self.drain_into(cx, dst)? {
                                 return Poll::Pending;
                             }
                             needs_flush = false;
@@ -179,7 +178,7 @@ where
         trace!(direction = %self.direction, "read {}B", sz);
 
         if sz > 0 {
-            Poll::Ready(Ok(BufRead::Read(sz)))
+            Poll::Ready(Ok(BufRead::Read))
         } else {
             trace!("eof");
             self.buf.clear();
@@ -197,7 +196,7 @@ where
         while self.buf.has_remaining() {
             trace!(direction = %self.direction, "writing {}B", self.buf.remaining());
             let n = match poll_write_buf(Pin::new(&mut dst.io), cx, &mut self.buf)? {
-                Poll::Pending => return Ok(BufWrite::Partial(sz)),
+                Poll::Pending => return Ok(BufWrite::Partial),
                 Poll::Ready(n) => n,
             };
             trace!(direction = %self.direction, "wrote {}B", n);

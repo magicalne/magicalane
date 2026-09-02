@@ -1,6 +1,6 @@
 use std::str::Utf8Error;
 
-use quinn::{crypto::rustls::TLSError, ParseError};
+use quinn::{ParseError, crypto::rustls::TLSError};
 use rcgen::RcgenError;
 use thiserror::Error;
 use tokio::sync::oneshot;

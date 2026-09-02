@@ -2,7 +2,8 @@
 name = "magicalane"
 version = "0.1.0"
 authors = ["magicalne"]
-edition = "2018"
+edition = "2024"
+rust-version = "1.85"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]

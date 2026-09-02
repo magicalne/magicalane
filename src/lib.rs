@@ -28,7 +28,7 @@ pub fn generate_key_and_cert_der(
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = cert.serialize_private_key_der();
         let cert = cert.serialize_der()?;
-        fs::create_dir_all(&path)?;
+        fs::create_dir_all(path)?;
         fs::write(&cert_path, &cert)?;
         fs::write(&key_path, &key)?;
     }
@@ -48,7 +48,7 @@ pub fn generate_key_and_cert_pem(
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = cert.serialize_private_key_pem();
         let cert = cert.serialize_pem()?;
-        fs::create_dir_all(&path)?;
+        fs::create_dir_all(path)?;
         fs::write(&cert_path, &cert)?;
         fs::write(&key_path, &key)?;
     }
@@ -57,7 +57,7 @@ pub fn generate_key_and_cert_pem(
 
 pub fn load_private_key(key_path: &Path) -> Result<PrivateKey> {
     let key = fs::read(key_path)?;
-    let key = if key_path.extension().map_or(false, |x| x == "der") {
+    let key = if key_path.extension().is_some_and(|x| x == "der") {
         quinn::PrivateKey::from_der(&key)?
     } else {
         quinn::PrivateKey::from_pem(&key)?
@@ -69,7 +69,7 @@ pub fn load_private_cert(cert_path: &Path) -> Result<CertificateChain> {
     let cert_chain = fs::read(cert_path)?;
     let cert_chain = if cert_path
         .extension()
-        .map_or(false, |x| x == "der" || x == "crt")
+        .is_some_and(|x| x == "der" || x == "crt")
     {
         quinn::CertificateChain::from_certs(quinn::Certificate::from_der(&cert_chain))
     } else {

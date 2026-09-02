@@ -1,13 +1,12 @@
 use std::{
     fmt::Debug,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    usize,
 };
 
 use bytes::BufMut;
 use log::trace;
 
-use super::{error::Error, Result};
+use super::{Result, error::Error};
 
 #[derive(Debug, Clone)]
 pub enum Version {
@@ -111,7 +110,7 @@ impl Debug for Addr {
 
 impl Addr {
     pub fn new(buf: &[u8]) -> Result<Self> {
-        buf.get(0)
+        buf.first()
             .and_then(|tp| match *tp {
                 1 => {
                     //1 flag, 4 bytes ipv4, 2 bytes port
@@ -252,7 +251,7 @@ impl Decoder {
     }
 
     pub fn parse_nego_req(buf: &[u8]) -> Result<(Version, Command, Addr)> {
-        let ver = match buf.get(0) {
+        let ver = match buf.first() {
             Some(b) => Version::new(*b)?,
             None => return Err(Error::InvalidMessage()),
         };

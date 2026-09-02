@@ -4,7 +4,6 @@ pub(crate) mod stream;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    u16,
 };
 
 use crate::connector::Connector;
@@ -18,10 +17,10 @@ use tokio::{
 };
 
 use crate::{
+    ALPN_QUIC,
     error::Result,
     load_private_cert, load_private_key,
-    quic::{server::conn::Connection, SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE},
-    ALPN_QUIC,
+    quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE, server::conn::Connection},
 };
 
 #[pin_project::pin_project]

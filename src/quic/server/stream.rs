@@ -30,6 +30,8 @@ pub struct Stream<IO, C, O> {
     state: State,
     proxy: Option<Proxy<IO, O>>,
     bandwidth: usize,
+    /// The addr-response flag byte has been written; only flush may re-poll.
+    addr_res_written: bool,
 }
 
 impl<IO, C, O> Stream<IO, C, O>
@@ -48,6 +50,7 @@ where
             state: State::ReadAddrReq,
             proxy: None,
             bandwidth,
+            addr_res_written: false,
         }
     }
 
@@ -87,14 +90,23 @@ where
 
     fn poll_send_addr(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let flag = if self.remote.is_some() { 0 } else { 1 };
-        self.buf.clear();
-        self.buf.put_u8(flag);
-        let n = ready!(poll_write_buf(
-            Pin::new(&mut self.io).as_pin_mut().unwrap(),
-            cx,
-            &mut self.buf
-        ))?;
-        trace!("Write {:?}Bytes", n);
+        // Re-entrancy guard: this state is polled again whenever a previous
+        // write or flush returned Pending (common over TLS-on-KCP). Writing
+        // the flag on every re-poll would duplicate it onto the stream.
+        if !self.addr_res_written {
+            self.buf.clear();
+            self.buf.put_u8(flag);
+            let n = ready!(poll_write_buf(
+                Pin::new(&mut self.io).as_pin_mut().unwrap(),
+                cx,
+                &mut self.buf
+            ))?;
+            if n == 0 {
+                return Poll::Ready(Err(Error::StreamClose));
+            }
+            self.addr_res_written = true;
+            trace!("Write {:?}Bytes", n);
+        }
         ready!(Pin::new(&mut self.io).as_pin_mut().unwrap().poll_flush(cx))?;
         let res = match &self.remote {
             Some(_) => {

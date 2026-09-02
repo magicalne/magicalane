@@ -1,7 +1,9 @@
 use std::str::Utf8Error;
 
-use quinn::{ParseError, crypto::rustls::TLSError};
-use rcgen::RcgenError;
+use quinn::crypto::rustls::NoInitialCipherSuite;
+use rcgen::Error as RcgenError;
+use rustls::Error as RustlsError;
+use rustls_pki_types::pem::Error as PemError;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::dispatcher::SetGlobalDefaultError;
@@ -53,9 +55,13 @@ pub enum Error {
     #[error("Generate key or cert error: {0}")]
     RcgenError(#[from] RcgenError),
     #[error("Parse key or cert error: {0}")]
-    CertParseError(#[from] ParseError),
+    CertParseError(#[from] NoInitialCipherSuite),
     #[error("TlsError: {0}")]
-    TlsError(#[from] TLSError),
+    TlsError(#[from] RustlsError),
+    #[error("Pem error: {0}")]
+    PemError(#[from] PemError),
+    #[error("Invalid DNS name: {0}")]
+    InvalidDnsName(#[from] rustls_pki_types::InvalidDnsNameError),
 
     #[error("Open remote error")]
     OpenRemoteError,
@@ -94,14 +100,16 @@ pub enum Error {
     QuinnReadError(#[from] quinn::ReadError),
     #[error("Quinn write error: {0}")]
     QuinnWriteError(#[from] quinn::WriteError),
-    #[error("Quinn endpoint error: {0}")]
-    QuinnEndpointError(#[from] quinn::EndpointError),
     #[error("Quinn connect error: {0}")]
     QuinnConnectingError(#[from] quinn::ConnectError),
     #[error("Quinn connection error: {0}")]
     QuinnConnectionError(#[from] quinn::ConnectionError),
     #[error("QUinn read exact error: {0}")]
     QuinnReadExactError(#[from] quinn::ReadExactError),
+    #[error("Invalid private key: {0}")]
+    InvalidPrivateKey(String),
+    #[error("KCP error: {0}")]
+    KcpError(#[from] kcp::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

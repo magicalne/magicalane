@@ -2,9 +2,8 @@ use std::pin::Pin;
 
 use crate::connector::Connector;
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{StreamExt, TryStreamExt, future::poll_fn};
+use futures::future::poll_fn;
 use log::trace;
-use quinn::IncomingBiStreams;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     spawn,
@@ -19,7 +18,7 @@ use crate::{
 use super::stream::Stream;
 
 pub struct Connection<C> {
-    bi_streams: IncomingBiStreams,
+    conn: quinn::Connection,
     buf: BytesMut,
     connector: C,
     passwd: Vec<u8>,
@@ -31,14 +30,9 @@ where
     O: AsyncRead + AsyncWrite + Unpin + 'static,
     C: Connector<Connection = O> + Send + 'static,
 {
-    pub fn new(
-        bi_streams: IncomingBiStreams,
-        connector: C,
-        passwd: Vec<u8>,
-        bandwidth: usize,
-    ) -> Self {
+    pub fn new(conn: quinn::Connection, connector: C, passwd: Vec<u8>, bandwidth: usize) -> Self {
         Self {
-            bi_streams,
+            conn,
             buf: BytesMut::new(),
             connector,
             passwd,
@@ -46,10 +40,12 @@ where
         }
     }
 
+    /// Handle one QUIC connection: the first bi-stream authenticates the
+    /// password, then every accepted bi-stream becomes a relay.
     pub async fn accept(&mut self) -> Result<()> {
         let me = &mut *self;
-        match me.bi_streams.try_next().await? {
-            Some((mut send, mut recv)) => {
+        match me.conn.accept_bi().await {
+            Ok((mut send, mut recv)) => {
                 let n = poll_fn(|cx| poll_read_buf(Pin::new(&mut recv), cx, &mut me.buf)).await?;
                 trace!("Read {:?}Bytes", n);
                 if n == 0 {
@@ -63,14 +59,17 @@ where
                 };
                 me.buf.clear();
                 me.buf.put_u8(flag);
-                let n = poll_fn(|cx| poll_write_buf(Pin::new(&mut send), cx, &mut me.buf)).await?;
-                trace!("Write {:?}Bytes", n);
+                poll_fn(|cx| poll_write_buf(Pin::new(&mut send), cx, &mut me.buf)).await?;
+                trace!("Write passwd ack");
                 poll_fn(|cx| Pin::new(&mut send).poll_flush(cx)).await?;
+                if flag != 0 {
+                    return Err(Error::WrongPassword);
+                }
             }
-            None => return Err(Error::StreamClose),
+            Err(_) => return Err(Error::StreamClose),
         };
-        while let Some(next) = me.bi_streams.next().await {
-            match next {
+        loop {
+            match me.conn.accept_bi().await {
                 Ok((send, recv)) => {
                     let connector = me.connector.clone();
                     let stream = QuicStream::new(recv, send);
@@ -82,11 +81,9 @@ where
                         };
                     });
                 }
-                Err(err) => return Err(Error::QuinnConnectionError(err)),
+                Err(_) => return Ok(()),
             }
         }
-
-        Ok(())
     }
 }
 

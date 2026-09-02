@@ -29,6 +29,9 @@ need() { $CE ps --format '{{.Names}}' | grep -qx "$1" \
 need magicalane-origin
 need magicalane-server
 need magicalane-client
+TRANSPORT="$($CE exec magicalane-client sh -c 'grep -o "protocol = \"[a-z]*\"" /etc/magicalane/client.toml 2>/dev/null | cut -d\" -f2' 2>/dev/null || true)"
+[ -n "$TRANSPORT" ] || TRANSPORT="quic"
+echo "transport under test: $TRANSPORT"
 CURL="curl -fsS --max-time 15 --socks5-hostname $SOCKS"
 
 # T1: happy path - SOCKS5 -> QUIC -> server -> origin, exact content
@@ -59,7 +62,7 @@ pass "T4 concurrency: 20 parallel proxied fetches"
 # T5: wrong password must be rejected (bounded, no hang)
 $CE run -d --rm --name magicalane-client-badpw --label magicalane.env=true \
     --network magicalane-net \
-    -v "$ENV_DIR/configs/client-badpw.toml:/etc/magicalane/client.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-badpw.toml:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     magicalane:env magicalane --config /etc/magicalane/client.toml >/dev/null
 trap '$CE rm -f magicalane-client-badpw >/dev/null 2>&1 || true; fail_dump "unexpected failure at line $LINENO"' ERR

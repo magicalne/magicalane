@@ -16,15 +16,21 @@ LAN="magicalane-lan"
 IMAGE="magicalane:env"
 
 PROFILE=""
-for a in "$@"; do
-    case "$a" in
+TRANSPORT="quic"
+while [ $# -gt 0 ]; do
+    case "$1" in
         --profile) : ;;
         tproxy) PROFILE="tproxy" ;;
-        *) echo "usage: env/up.sh [--profile tproxy]" >&2; exit 2 ;;
+        --transport) TRANSPORT="$2"; shift ;;
+        quic|kcp) TRANSPORT="$1" ;;
+        *) echo "usage: env/up.sh [--transport quic|kcp] [--profile tproxy]" >&2; exit 2 ;;
     esac
+    shift
 done
+case "$TRANSPORT" in quic|kcp) ;; *) echo "invalid transport: $TRANSPORT" >&2; exit 2 ;; esac
 
 say() { echo "[up] $*"; }
+say "transport: $TRANSPORT"
 
 have_net() { $CE network exists "$1" 2>/dev/null; }
 running() { $CE ps --format '{{.Names}}' | grep -qx "$1"; }
@@ -87,7 +93,7 @@ ensure_run magicalane-server \
     $CE run -d --name magicalane-server --label "$LABEL" \
     --network "$NET" --network-alias magicalane-server \
     -e RUST_LOG=info \
-    -v "$ENV_DIR/configs/server.toml:/etc/magicalane/server.toml:ro" \
+    -v "$ENV_DIR/configs/server-$TRANSPORT.toml:/etc/magicalane/server.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/server.toml
 
@@ -95,29 +101,30 @@ ensure_run magicalane-client \
     $CE run -d --name magicalane-client --label "$LABEL" \
     --network "$NET" \
     -e RUST_LOG=info \
-    -v "$ENV_DIR/configs/client.toml:/etc/magicalane/client.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT.toml:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 
 say "waiting for readiness"
 wait_exec magicalane-server sh -c "ss -lun | grep -q ':4433'"
 wait_exec magicalane-client sh -c "ss -ltn | grep -q ':1080'"
-say "core lab up: client socks5 -> quic -> server -> origin"
+say "core lab up: client socks5 -> $TRANSPORT -> server -> origin"
 
 # ---------------------------------------------------------------- tproxy profile
 if [ "$PROFILE" = "tproxy" ]; then
     if have_net "$LAN"; then say "network $LAN exists"; else $CE network create "$LAN" >/dev/null; fi
 
     # dual-homed client: magicalane-net (eth0, wan) + magicalane-lan (eth1, lan).
-    # socat stands in for the future magicalane tproxy listener on tcp 7895 -
-    # it relays intercepted connections straight to the origin.
+    # bridge.py stands in for the future magicalane tproxy listener on tcp
+    # 7895: it accepts transparently-intercepted connections and relays them
+    # through the local socks5 server (i.e. through the chosen transport).
     ensure_run magicalane-tproxy-client \
         $CE run -d --name magicalane-tproxy-client --label "$LABEL" \
         --network "$NET" \
         --cap-add NET_ADMIN \
         --sysctl net.ipv4.ip_forward=1 \
         -e RUST_LOG=info \
-        -v "$ENV_DIR/configs/client.toml:/etc/magicalane/client.toml:ro" \
+        -v "$ENV_DIR/configs/client-$TRANSPORT.toml:/etc/magicalane/client.toml:ro" \
         -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
         "$IMAGE" sh -c 'socat TCP-LISTEN:7895,bind=0.0.0.0,reuseaddr,fork,ip-transparent TCP:origin:80 & exec magicalane --config /etc/magicalane/client.toml'
 

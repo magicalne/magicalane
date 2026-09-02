@@ -4,14 +4,10 @@ use std::{
 };
 
 use bytes::BytesMut;
-use futures::AsyncWriteExt;
 use log::trace;
+use pin_project::pin_project;
 use quinn::{RecvStream, SendStream};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-    sync::{mpsc, oneshot},
-};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     error::{Error, Result},
@@ -21,242 +17,8 @@ use crate::{
 const CORRECT_PASSWORD_RESPONSE: u8 = 0;
 const SEND_ADDR_SUCCESS_RESPONSE: u8 = 0;
 
-#[derive(Debug)]
-enum Message {
-    SendPassword {
-        send: SendStream,
-        recv: RecvStream,
-        sender: oneshot::Sender<Result<()>>,
-    },
-    SendAddr {
-        send: SendStream,
-        recv: RecvStream,
-        addr: Vec<u8>,
-        sender: oneshot::Sender<Result<()>>,
-    },
-    HandlePasswordValid {
-        send: SendStream,
-        recv: RecvStream,
-        sender: oneshot::Sender<Result<()>>,
-    },
-    HandleOpenRemote {
-        send: SendStream,
-        recv: RecvStream,
-        sender: oneshot::Sender<Result<(SendStream, RecvStream, TcpStream)>>,
-    },
-}
-
-impl Message {
-    fn send_passwd_req(
-        send: SendStream,
-        recv: RecvStream,
-        sender: oneshot::Sender<Result<()>>,
-    ) -> Self {
-        Self::SendPassword { send, recv, sender }
-    }
-
-    fn send_addr_req(
-        send: SendStream,
-        recv: RecvStream,
-        addr: Vec<u8>,
-        sender: oneshot::Sender<Result<()>>,
-    ) -> Self {
-        Self::SendAddr {
-            send,
-            recv,
-            addr,
-            sender,
-        }
-    }
-
-    fn handle_passwd_req(
-        send: SendStream,
-        recv: RecvStream,
-        sender: oneshot::Sender<Result<()>>,
-    ) -> Self {
-        Self::HandlePasswordValid { send, recv, sender }
-    }
-
-    fn handle_open_remote_req(
-        send: SendStream,
-        recv: RecvStream,
-        sender: oneshot::Sender<Result<(SendStream, RecvStream, TcpStream)>>,
-    ) -> Self {
-        Self::HandleOpenRemote { send, recv, sender }
-    }
-}
-pub struct StreamActor {
-    receiver: mpsc::Receiver<Message>,
-    passwd: Vec<u8>,
-}
-
-impl StreamActor {
-    fn new(receiver: mpsc::Receiver<Message>, passwd: Vec<u8>) -> Self {
-        Self { receiver, passwd }
-    }
-
-    async fn handle(&mut self, msg: Message) {
-        trace!("Accept message: {:?}", &msg);
-        match msg {
-            Message::SendPassword { send, recv, sender } => {
-                let res = self.send_passwd(send, recv).await;
-                let _ = sender.send(res);
-            }
-            Message::SendAddr {
-                send,
-                recv,
-                addr,
-                sender,
-            } => {
-                let res = self.send_addr(send, recv, addr).await;
-                let _ = sender.send(res);
-            }
-            Message::HandlePasswordValid { send, recv, sender } => {
-                let res = self.validate_passwd(send, recv).await;
-                let _ = sender.send(res);
-            }
-            Message::HandleOpenRemote { send, recv, sender } => {
-                let res = self.open_remote(send, recv).await;
-                let _ = sender.send(res);
-            }
-        }
-    }
-
-    async fn send_passwd(&mut self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-        trace!("Send password: {:?}", &self.passwd);
-        let mut buf = vec![self.passwd.len() as u8];
-        buf.extend_from_slice(&self.passwd);
-        send.write_all(&buf).await?;
-        trace!("Send password successfully.");
-        send.flush().await?;
-        let mut buf = [0u8; 1];
-        recv.read_exact(&mut buf).await?;
-        if buf[0] == CORRECT_PASSWORD_RESPONSE {
-            Ok(())
-        } else {
-            Err(Error::WrongPassword)
-        }
-    }
-
-    async fn send_addr(
-        &mut self,
-        mut send: SendStream,
-        mut recv: RecvStream,
-        addr: Vec<u8>,
-    ) -> Result<()> {
-        send.write_all(&addr).await?;
-        send.flush().await?;
-        let mut buf = [0u8; 1];
-        recv.read_exact(&mut buf).await?;
-        if buf[0] == SEND_ADDR_SUCCESS_RESPONSE {
-            Ok(())
-        } else {
-            Err(Error::OpenRemoteAddrError)
-        }
-    }
-
-    async fn validate_passwd(&mut self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
-        let mut buf = vec![0; 128];
-        if let Some(n) = recv.read(&mut buf).await? {
-            if buf[..n] == self.passwd {
-                let buf = [0u8; 1];
-                send.write_all(&buf).await?;
-            } else {
-                let buf = [1u8; 1];
-                send.write_all(&buf).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn open_remote(
-        &mut self,
-        mut send: SendStream,
-        mut recv: RecvStream,
-    ) -> Result<(SendStream, RecvStream, TcpStream)> {
-        let mut buf = vec![0; 1024];
-        match recv.read(&mut buf).await? {
-            Some(n) => {
-                let addr = Addr::new(&buf[..n])?;
-                let tcp_stream = match addr {
-                    Addr::SocketAddr(ip) => TcpStream::connect(ip).await?,
-                    Addr::DomainName(domain, port) => {
-                        let domain = std::str::from_utf8(&domain)?;
-                        let socket = (domain, port);
-                        TcpStream::connect(socket).await?
-                    }
-                };
-                let buf = [0u8; 1];
-                send.write_all(&buf).await?;
-                Ok((send, recv, tcp_stream))
-            }
-            None => Err(Error::EmptyRemoteAddrError),
-        }
-    }
-}
-
-async fn run_stream_actor(mut actor: StreamActor) {
-    trace!("StreamActor is running...");
-    while let Some(msg) = actor.receiver.recv().await {
-        actor.handle(msg).await;
-    }
-}
-
-#[derive(Clone)]
-pub struct StreamActorHandler {
-    sender: mpsc::Sender<Message>,
-}
-
-impl StreamActorHandler {
-    pub fn new(passwd: Vec<u8>) -> Self {
-        let (sender, receiver) = mpsc::channel(200);
-        let actor = StreamActor::new(receiver, passwd);
-        tokio::spawn(run_stream_actor(actor));
-        Self { sender }
-    }
-
-    pub async fn send_passwd(&mut self, send: SendStream, recv: RecvStream) -> Result<()> {
-        let (sender, respond_to) = oneshot::channel();
-        let msg = Message::send_passwd_req(send, recv, sender);
-        let _ = self.sender.send(msg).await;
-        respond_to.await?
-    }
-
-    pub async fn send_addr(
-        &mut self,
-        send: SendStream,
-        recv: RecvStream,
-        addr: Addr,
-    ) -> Result<()> {
-        let (sender, respond_to) = oneshot::channel();
-        let mut buf = BytesMut::new();
-        addr.encode(&mut buf);
-        let addr = buf.to_vec();
-        let msg = Message::send_addr_req(send, recv, addr, sender);
-        let _ = self.sender.send(msg).await;
-        respond_to.await?
-    }
-
-    pub async fn validate_passwd(&mut self, send: SendStream, recv: RecvStream) -> Result<()> {
-        let (sender, respond_to) = oneshot::channel();
-        let msg = Message::handle_passwd_req(send, recv, sender);
-        let _ = self.sender.send(msg).await;
-        respond_to.await?
-    }
-
-    pub async fn open_remote(
-        &mut self,
-        send: SendStream,
-        recv: RecvStream,
-    ) -> Result<(SendStream, RecvStream, TcpStream)> {
-        let (sender, respond_to) = oneshot::channel();
-        let msg = Message::handle_open_remote_req(send, recv, sender);
-        let _ = self.sender.send(msg).await;
-        respond_to.await?
-    }
-}
-
-#[pin_project::pin_project]
+/// A bidirectional relay stream over a QUIC connection.
+#[pin_project]
 pub struct QuicStream {
     #[pin]
     recv: RecvStream,
@@ -276,8 +38,7 @@ impl AsyncRead for QuicStream {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let me = self.project();
-        me.recv.poll_read(cx, buf)
+        self.project().recv.poll_read(cx, buf)
     }
 }
 
@@ -287,20 +48,63 @@ impl AsyncWrite for QuicStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        self.project().send.poll_write(cx, buf)
+        // quinn::SendStream also has an inherent poll_write with its native
+        // error type; call the tokio trait impl explicitly.
+        <SendStream as AsyncWrite>::poll_write(self.project().send, cx, buf)
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        self.project().send.poll_flush(cx)
+        <SendStream as AsyncWrite>::poll_flush(self.project().send, cx)
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        self.project().send.poll_shutdown(cx)
+        <SendStream as AsyncWrite>::poll_shutdown(self.project().send, cx)
     }
+}
+
+/// Authenticate a fresh connection using its first bi-stream, mirroring the
+/// server-side `Connection::accept` flow: the first stream carries only the
+/// password and is dropped after the server replies.
+pub(crate) async fn authenticate(conn: &quinn::Connection, passwd: &[u8]) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let mut buf = Vec::with_capacity(1 + passwd.len());
+    buf.push(passwd.len() as u8);
+    buf.extend_from_slice(passwd);
+    send.write_all(&buf).await?;
+    send.flush().await?;
+    let mut flag = [0u8; 1];
+    recv.read_exact(&mut flag).await?;
+    if flag[0] != CORRECT_PASSWORD_RESPONSE {
+        return Err(Error::WrongPassword);
+    }
+    trace!("password accepted");
+    Ok(())
+}
+
+/// Open a relay stream to `addr` on an authenticated connection.
+///
+/// Wire protocol per relay bi-stream:
+///   client -> server: [Addr encoding]
+///   server -> client: [flag u8]
+///   ... raw relay ...
+pub(crate) async fn open_relay_stream(conn: &quinn::Connection, addr: &Addr) -> Result<QuicStream> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let mut addr_buf = BytesMut::new();
+    addr.encode(&mut addr_buf);
+    send.write_all(&addr_buf).await?;
+    send.flush().await?;
+
+    let mut flag = [0u8; 1];
+    recv.read_exact(&mut flag).await?;
+    if flag[0] != SEND_ADDR_SUCCESS_RESPONSE {
+        return Err(Error::OpenRemoteAddrError);
+    }
+    trace!("relay accepted");
+    Ok(QuicStream::new(recv, send))
 }

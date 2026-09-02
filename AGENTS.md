@@ -48,16 +48,19 @@ Integration tests are run manually with `cargo test -- --ignored` since they spi
 Isolated rootless-podman network for verifying the proxy end-to-end without touching host ports/firewall:
 
 ```sh
-./env/up.sh                  # origin + quic server + socks5 client on magicalane-net
-./env/up.sh --profile tproxy # + dual-homed tproxy client + app (transparent interception)
-bash env/test.sh             # full assertion suite (10 checks; auto-detects tproxy profile)
+./env/up.sh --transport quic|kcp        # core lab on the chosen transport (default quic)
+./env/up.sh --transport kcp --profile tproxy  # + dual-homed tproxy client + app
+bash env/test.sh             # full assertion suite (10 checks; auto-detects transport + tproxy)
 ./env/status.sh              # containers, listeners, tproxy rules, app routes
 ./env/down.sh                # remove containers + networks (--purge also drops image/certs)
 ```
 
 - Interaction is `podman exec` only; nothing is published to the host. Certs/fixtures live under `env/` (gitignored).
+- Configs live in `env/configs/{server,client}-{quic,kcp}.toml` (+ `-badpw` variants for the auth negative test).
+- The tproxy profile uses `env/bridge.py` (IP_TRANSPARENT listener → local socks5) as the stand-in for the future in-process `TransparentProxyConfig` listener; intercepted traffic then flows through the real client/server over the selected transport.
 - **After changing Rust code, run `env/down.sh` before `env/up.sh`** — up.sh skips already-running containers, so a rebuild won't deploy into them.
-- `env/tproxy-rules.sh apply|clean|show` manages TPROXY mangle + policy routing inside the tproxy-client container (socat stands in for the future `TransparentProxyConfig` listener on tcp 7895).
+- `env/tproxy-rules.sh apply|clean|show` manages TPROXY mangle + policy routing inside the tproxy-client container.
+- Local cargo tests cover the KCP session layer without containers: `tests/kcp_loopback.rs` (raw + TLS echo), `tests/kcp_fullstack.rs` (real listener/connector + origin).
 - Override the engine with `CONTAINER_ENGINE=...` if needed.
 
 ## Conventions

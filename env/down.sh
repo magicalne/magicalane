@@ -20,7 +20,7 @@ else
     say "no labeled containers"
 fi
 
-for net in magicalane-net magicalane-lan; do
+for net in magicalane-net magicalane-lan magicalane-backend; do
     if $CE network exists "$net" 2>/dev/null; then
         $CE network rm "$net" >/dev/null
         say "removed network $net"

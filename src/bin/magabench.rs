@@ -43,6 +43,20 @@ enum Cmd {
         #[structopt(long, default_value = "0.0.0.0:9807")]
         listen: String,
     },
+    /// Multi-protocol test service: minimal HTTP + framed TCP echo + UDP echo.
+    /// Deployed on a backend-only network: if you can talk to it, your
+    /// traffic went through the tunnel.
+    Serve {
+        /// HTTP listen port (0 = off).
+        #[structopt(long, default_value = "8080")]
+        http: u16,
+        /// Framed TCP echo port (0 = off).
+        #[structopt(long, default_value = "9001")]
+        tcp: u16,
+        /// UDP echo port (0 = off).
+        #[structopt(long, default_value = "9002")]
+        udp: u16,
+    },
     /// Drive the benchmark through the socks5 client.
     Run {
         #[structopt(long, default_value = "127.0.0.1:1080")]
@@ -86,6 +100,7 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async move {
         match cmd {
             Cmd::Echo { listen } => echo_server(&listen).await,
+            Cmd::Serve { http, tcp, udp } => serve(http, tcp, udp).await,
             Cmd::Run {
                 socks,
                 target,
@@ -179,6 +194,136 @@ async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
 
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+// ---------------------------------------------------------------- test service
+
+fn identity() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+async fn serve(http: u16, tcp: u16, udp: u16) -> anyhow::Result<()> {
+    let id = identity();
+    if http != 0 {
+        let listener = TcpListener::bind(("0.0.0.0", http)).await?;
+        eprintln!("magabench serve: http on {}", listener.local_addr()?);
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else { continue };
+                s.set_nodelay(true).ok();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_http(s).await {
+                        eprintln!("http conn error: {err}");
+                    }
+                });
+            }
+        });
+    }
+    if tcp != 0 {
+        let listener = TcpListener::bind(("0.0.0.0", tcp)).await?;
+        eprintln!("magabench serve: framed tcp echo on {}", listener.local_addr()?);
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else { continue };
+                s.set_nodelay(true).ok();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_echo(s).await {
+                        eprintln!("tcp conn error: {err}");
+                    }
+                });
+            }
+        });
+    }
+    if udp != 0 {
+        let sock = tokio::net::UdpSocket::bind(("0.0.0.0", udp)).await?;
+        eprintln!("magabench serve: udp echo on {}", sock.local_addr()?);
+        let id = id.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+                let reply: Vec<u8> = if &buf[..n] == b"MGL-ID?" {
+                    format!("{id} udp").into_bytes()
+                } else {
+                    buf[..n].to_vec()
+                };
+                let _ = sock.send_to(&reply, from).await;
+            }
+        });
+    }
+    futures::future::pending::<()>().await;
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+/// Minimal HTTP/1.1 responder:
+///   GET  /id    -> instance identity (egress assertions)
+///   ANY  /echo  -> echoes the request body (dup/corruption detection)
+///   GET  /hello -> fixed string
+async fn handle_http(mut s: TcpStream) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    // read until end of headers
+    let header_end = loop {
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in headers"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "headers too large"));
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or_default().to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    // read body
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+
+    let id = identity();
+    let path_only = path.split('?').next().unwrap_or(&path).to_string();
+    let (status, ctype, out) = match path_only.as_str() {
+        "/id" => ("200 OK", "text/plain", format!("{id} http\n").into_bytes()),
+        "/echo" => ("200 OK", "application/octet-stream", body),
+        "/hello" => ("200 OK", "text/plain", b"magicalane-test-service\n".to_vec()),
+        _ => ("404 Not Found", "text/plain", b"not found\n".to_vec()),
+    };
+    let resp = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        out.len()
+    );
+    let _ = method;
+    s.write_all(resp.as_bytes()).await?;
+    s.write_all(&out).await?;
+    Ok(())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 // ---------------------------------------------------------------- bench client

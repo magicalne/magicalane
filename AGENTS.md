@@ -50,13 +50,17 @@ Isolated rootless-podman network for verifying the proxy end-to-end without touc
 ```sh
 ./env/up.sh --transport quic|kcp        # core lab on the chosen transport (default quic)
 ./env/up.sh --transport kcp --profile tproxy  # + dual-homed tproxy client + app
-bash env/test.sh             # full assertion suite (10 checks; auto-detects transport + tproxy)
+./env/verify.sh              # fast: smoke suite on quic (~1 min)
+./env/verify.sh full         # all suites x transports + tproxy (26 checks)
+./env/verify.sh <suite|name> # e.g. smoke, transport, tproxy, regression, 008-tunnel-http-private
 ./env/status.sh              # containers, listeners, tproxy rules, app routes
 ./env/down.sh                # remove containers + networks (--purge also drops image/certs)
 ```
 
 - Interaction is `podman exec` only; nothing is published to the host. Certs/fixtures live under `env/` (gitignored).
 - Configs live in `env/configs/{server,client}-{quic,kcp}.toml` (+ `-badpw` variants for the auth negative test).
+- **Private test service** (`magicalane-testsvc`, `magabench serve`): HTTP :8080 (`/id`, `/echo`, `/hello`), framed TCP echo :9001, UDP echo :9002, on an `--internal` backend network only the server can reach. If a testcase can talk to it, the traffic provably went through the tunnel; the negative twins assert direct access fails. (This is why the backend must stay `--internal`: the shared rootless netns otherwise routes between all container networks.)
+- **Verification protocol**: testcases live in `env/tests/NNN-slug.sh` (metadata headers: suites/transports; helpers in `env/tests/helpers.sh`). `env/verify.sh` is the one entry point; `env/test.sh` is a wrapper for `full`. Rule: every bugfix lands with a regression testcase (see 015/016); every feature PR fills its suite (`dns`, `tproxy-ws`, `residue` are reserved for the transparent-client work).
 - The tproxy profile uses `env/bridge.py` (IP_TRANSPARENT listener → local socks5) as the stand-in for the future in-process `TransparentProxyConfig` listener; intercepted traffic then flows through the real client/server over the selected transport.
 - **After changing Rust code, run `env/down.sh` before `env/up.sh`** — up.sh skips already-running containers, so a rebuild won't deploy into them.
 - `env/tproxy-rules.sh apply|clean|show` manages TPROXY mangle + policy routing inside the tproxy-client container.

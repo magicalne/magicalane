@@ -13,7 +13,7 @@ echo
 echo "=== networks ==="
 $CE network ls | grep -E 'NAME|magicalane' || true
 
-for c in magicalane-server magicalane-client magicalane-tproxy-client; do
+for c in magicalane-testsvc magicalane-server magicalane-client magicalane-tproxy-client; do
     if $CE ps --filter name="^$c$" --filter status=running -q | grep -q .; then
         echo
         echo "=== $c listeners ==="

@@ -87,6 +87,12 @@ $CE build -q -t "$IMAGE" -f "$ENV_DIR/Containerfile" "$ENV_DIR/.build" >/dev/nul
 
 # ---------------------------------------------------------------- network
 if have_net "$NET"; then say "network $NET exists"; else $CE network create "$NET" >/dev/null; say "created network $NET"; fi
+BACKEND="magicalane-backend"
+# --internal: no gateway in the shared netns, so the backend subnet is
+# unreachable from other container networks - only containers attached to
+# this network (server, testsvc) can talk, at L2. This is what makes the
+# test service PROVABLY private.
+if have_net "$BACKEND"; then say "network $BACKEND exists"; else $CE network create --internal "$BACKEND" >/dev/null; say "created network $BACKEND (internal)"; fi
 
 # ---------------------------------------------------------------- core roles
 ensure_run magicalane-origin \
@@ -95,6 +101,11 @@ ensure_run magicalane-origin \
     --cap-add NET_ADMIN \
     -v "$ENV_DIR/fixtures:/fixtures:ro" \
     "$IMAGE" sh -c 'mkdir -p /srv/www/fixtures && cp -r /fixtures/. /srv/www/fixtures/ && cat /etc/hostname > /srv/www/fixtures/hostname && exec python3 -m http.server 80 --directory /srv/www'
+
+ensure_run magicalane-testsvc \
+    $CE run -d --name magicalane-testsvc --label "$LABEL" \
+    --network "$BACKEND" --network-alias testsvc \
+    "$IMAGE" magabench serve --http 8080 --tcp 9001 --udp 9002
 
 ensure_run magicalane-server \
     $CE run -d --name magicalane-server --label "$LABEL" \
@@ -117,7 +128,19 @@ ensure_run magicalane-client \
 say "waiting for readiness"
 wait_exec magicalane-server sh -c "ss -lun | grep -q ':4433'"
 wait_exec magicalane-client sh -c "ss -ltn | grep -q ':1080'"
-say "core lab up: client socks5 -> $TRANSPORT -> server -> origin"
+
+# server joins the backend network (idempotent) so it - and only it - can
+# reach the private test service
+if ! $CE inspect magicalane-server --format '{{range $k, $_ := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -q " $BACKEND "; then
+    $CE network connect "$BACKEND" magicalane-server
+    say "connected magicalane-server to $BACKEND"
+fi
+# aardvark DNS does not serve internal networks - pin the name on the server
+TESTSVC_IP_NOW="$($CE inspect magicalane-testsvc --format '{{(index .NetworkSettings.Networks "magicalane-backend").IPAddress}}')"
+$CE exec magicalane-server sh -c "grep -q testsvc /etc/hosts 2>/dev/null || echo '$TESTSVC_IP_NOW testsvc' >> /etc/hosts"
+wait_exec magicalane-server sh -c "curl -fsS --max-time 2 http://testsvc:8080/id >/dev/null"
+
+say "core lab up: client socks5 -> $TRANSPORT -> server -> origin (+ private testsvc on $BACKEND)"
 
 # ---------------------------------------------------------------- tproxy profile
 if [ "$PROFILE" = "tproxy" ]; then
@@ -135,13 +158,15 @@ if [ "$PROFILE" = "tproxy" ]; then
         -e RUST_LOG=info \
         -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
         -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
-        "$IMAGE" sh -c 'socat TCP-LISTEN:7895,bind=0.0.0.0,reuseaddr,fork,ip-transparent TCP:origin:80 & exec magicalane --config /etc/magicalane/client.toml'
+        -v "$ENV_DIR/bridge.py:/usr/local/bin/bridge.py:ro" \
+        "$IMAGE" sh -c 'python3 /usr/local/bin/bridge.py & exec magicalane --config /etc/magicalane/client.toml'
 
     $CE network connect "$LAN" magicalane-tproxy-client
 
     LAN_IP="$($CE inspect magicalane-tproxy-client --format '{{(index .NetworkSettings.Networks "'"$LAN"'").IPAddress}}')"
     ORIGIN_IP="$($CE inspect magicalane-origin --format '{{(index .NetworkSettings.Networks "'"$NET"'").IPAddress}}')"
-    say "tproxy-client lan ip: $LAN_IP, origin ip: $ORIGIN_IP"
+    TESTSVC_IP="$($CE inspect magicalane-testsvc --format '{{(index .NetworkSettings.Networks "magicalane-backend").IPAddress}}')"
+    say "tproxy-client lan ip: $LAN_IP, origin ip: $ORIGIN_IP, testsvc ip: $TESTSVC_IP"
 
     # the app: no proxy configuration whatsoever - its default route goes
     # through the tproxy client, which intercepts transparently.
@@ -150,6 +175,7 @@ if [ "$PROFILE" = "tproxy" ]; then
         --network "$LAN" \
         --cap-add NET_ADMIN \
         --add-host "origin:$ORIGIN_IP" \
+        --add-host "testsvc:$TESTSVC_IP" \
         "$IMAGE" sleep infinity
 
     $CE exec magicalane-app ip route replace default via "$LAN_IP" dev eth0

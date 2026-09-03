@@ -1,6 +1,6 @@
 use std::{
     fs, io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::Arc,
 };
@@ -62,15 +62,16 @@ impl ClientActorHndler {
 
         let remote_addr = (server_name.as_str(), port)
             .to_socket_addrs()?
-            .find(|add| add.is_ipv4())
+            .next()
             .ok_or(Error::UnknownRemoteHost)?;
         trace!(
             "Connect remote: {:?}, server name: {:?}",
             &remote_addr, &server_name
         );
 
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let bind = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        let _ = socket.set_only_v6(false); // dual-stack: accept IPv4
         socket.bind(&bind.into())?;
         socket.set_nonblocking(true)?;
         socket.set_recv_buffer_size(SOCKET_RECV_BUF_SIZE)?;

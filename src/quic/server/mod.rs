@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
 };
@@ -52,8 +52,9 @@ impl<C> Server<C> {
             quinn::crypto::rustls::QuicServerConfig::try_from(server_config)?,
         ));
         server_config.transport_config(transport_config(tuning.as_ref()));
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        let _ = socket.set_only_v6(false); // dual-stack: accept IPv4
         info!("Server bind: {:?}", &addr);
         socket.bind(&addr.into())?;
         socket.set_nonblocking(true)?;

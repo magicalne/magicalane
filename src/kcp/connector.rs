@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -238,9 +238,9 @@ async fn connect_kcp(
     addr: &Addr,
     tuning: &KcpTuning,
 ) -> Result<EitherKcpStream> {
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let bind = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.bind(&bind.into())?;
+            socket.bind(&bind.into())?;
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);
@@ -311,9 +311,9 @@ async fn connect_session_raw(
     tls: Option<Arc<tokio_rustls::TlsConnector>>,
     tuning: &KcpTuning,
 ) -> Result<EitherKcpStream> {
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let bind = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.bind(&bind.into())?;
+            socket.bind(&bind.into())?;
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);

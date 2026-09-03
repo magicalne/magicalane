@@ -108,6 +108,7 @@ ensure_run magicalane-server \
 ensure_run magicalane-client \
     $CE run -d --name magicalane-client --label "$LABEL" \
     --network "$NET" \
+    --cap-add NET_ADMIN \
     -e RUST_LOG=info \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \

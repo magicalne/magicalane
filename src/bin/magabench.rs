@@ -70,6 +70,13 @@ enum Cmd {
         /// Parallel download connections for the aggregate metric.
         #[structopt(long, default_value = "4")]
         dl_par: usize,
+        /// Measure foreground RTT while a saturating download runs
+        /// (bufferbloat / usability test).
+        #[structopt(long)]
+        under_load: bool,
+        /// Download bytes per saturator chunk in under-load mode.
+        #[structopt(long, default_value = "8388608")]
+        load_chunk: usize,
     },
 }
 
@@ -90,7 +97,9 @@ fn main() -> anyhow::Result<()> {
                 dl_bytes,
                 ul_bytes,
                 dl_par,
-            } => run_bench(&socks, &target, pairs, pings, connects, conc_conns, conc_pings, dl_bytes, ul_bytes, dl_par).await,
+                under_load,
+                load_chunk,
+            } => run_bench(&socks, &target, pairs, pings, connects, conc_conns, conc_pings, dl_bytes, ul_bytes, dl_par, under_load, load_chunk).await,
         }
     })
 }
@@ -241,6 +250,8 @@ async fn run_bench(
     dl_bytes: usize,
     ul_bytes: usize,
     dl_par: usize,
+    under_load: bool,
+    load_chunk: usize,
 ) -> anyhow::Result<()> {
     let mut metrics: Vec<(String, f64)> = Vec::new();
     let mut put = |k: &str, v: f64| metrics.push((k.to_string(), v));
@@ -381,6 +392,77 @@ async fn run_bench(
     put("conc_rps", total_reqs / wall);
     put("conc_p50_ms", pct(&all_rtts, 0.50));
     put("conc_p95_ms", pct(&all_rtts, 0.95));
+
+    // 6) under load: saturating background download while measuring
+    //    foreground RTT - the "is it usable while downloading" metric.
+    if under_load {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let socks = socks.to_string();
+            let target = target.to_string();
+            let stop = stop.clone();
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(mut c) = socks_connect(&socks, &target).await {
+                        let mut req = vec![0x02u8];
+                        req.extend_from_slice(&(load_chunk as u32).to_be_bytes());
+                        if write_frame(&mut c, &req).await.is_ok() {
+                            let mut got = 0usize;
+                            while got < load_chunk {
+                                match read_frame(&mut c).await {
+                                    Ok(f) => {
+                                        got += f.len() - 1;
+                                        // count as data arrives so the
+                                        // measurement window sees progress
+                                        bytes.fetch_add(
+                                            (f.len() - 1) as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                    Err(_) => break,
+                                }
+                                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+                            }
+                            if got >= load_chunk {
+                                continue; // chunk completed, go again
+                            }
+                        }
+                    }
+                    // back off before retrying a failed chunk
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(6)).await; // let it ramp up (WAN handshake + fill)
+        let mut s2 = socks_connect(socks, target).await?;
+        let mut scratch = Vec::new();
+        let t0 = Instant::now();
+        let b0 = bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut rtts = Vec::with_capacity(pings);
+        for _ in 0..pings {
+            match ping_rtt(&mut s2, 64, &mut scratch).await {
+                Ok(dt) => rtts.push(dt.as_secs_f64() * 1e3),
+                Err(_) => {
+                    // reconnect on failure (loss can kill a foreground stream)
+                    match socks_connect(socks, target).await {
+                        Ok(c) => s2 = c,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        let window = t0.elapsed().as_secs_f64();
+        let got = bytes.load(std::sync::atomic::Ordering::Relaxed) - b0;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        put("loaded_rtt64_p50_ms", pct(&rtts, 0.50));
+        put("loaded_rtt64_p95_ms", pct(&rtts, 0.95));
+        put("loaded_rtt64_p99_ms", pct(&rtts, 0.99));
+        put("load_dl_mbps", got as f64 / 1e6 / window);
+    }
 
     // -- output
     if pairs {

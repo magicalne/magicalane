@@ -20,6 +20,8 @@ TRANSPORTS="quic kcp"
 MATRIX=""
 DELAY=""
 LOSS=""
+BADNET=""
+BADNET_AQM="fifo"
 declare -a EXTRA=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -27,9 +29,12 @@ while [ $# -gt 0 ]; do
         --matrix) MATRIX="1" ;;
         --delay) DELAY="$2"; shift ;;
         --loss) LOSS="$2"; shift ;;
-        --pings|--connects|--conc-conns|--conc-pings|--dl-bytes|--ul-bytes|--dl-par)
+        --badnet) BADNET="$2"; shift ;;
+        --badnet-aqm) BADNET_AQM="$2"; shift ;;
+        --pings|--connects|--conc-conns|--conc-pings|--dl-bytes|--ul-bytes|--dl-par|--load-chunk)
             EXTRA+=("$1" "$2"); shift ;;
-        *) echo "usage: env/bench.sh [--matrix] [--transports quic,kcp] [--delay ms] [--loss pct] [magabench knobs]" >&2; exit 2 ;;
+        --under-load) EXTRA+=("$1"); ;;
+        *) echo "usage: env/bench.sh [--matrix] [--transports ...] [--badnet PROFILE [--badnet-aqm fifo|cake]] [--delay ms] [--loss pct] [magabench knobs]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -78,10 +83,12 @@ run_one() { # transport -> prints "key=value" lines
         say "env already on transport: $t"
     fi
     ensure_echo
+    [ -n "$BADNET" ] && "$ENV_DIR/badnet.sh" apply "$BADNET" --aqm "$BADNET_AQM" >/dev/null
     apply_netem
     $CE exec magicalane-client magabench run \
         --socks 127.0.0.1:1080 --target "bench:$ECHO_PORT" --pairs "${EXTRA[@]}"
     clear_netem
+    [ -n "$BADNET" ] && "$ENV_DIR/badnet.sh" clear >/dev/null
 }
 
 # ------------------------------------------------------------- matrix presets
@@ -98,6 +105,7 @@ variant_toml() {
         kcp-i40)         printf '[tuning.kcp]\ninterval = 40\n' ;;
         kcp-mtu1400)     printf '[tuning.kcp]\nmtu = 1400\n' ;;
         kcp-wnd2048-i40) printf '[tuning.kcp]\nsndwnd = 2048\nrcvwnd = 2048\ninterval = 40\n' ;;
+        kcp-w2048-nc0)  printf '[tuning.kcp]\nsndwnd = 2048\nrcvwnd = 2048\nnc = false\n' ;;
         *) return 1 ;;
     esac
 }
@@ -125,6 +133,7 @@ run_matrix_one() { # tag -> prints key=value lines
         --server-config "$dir/$tag-server.toml" \
         --client-config "$dir/$tag-client.toml" >/dev/null
     ensure_echo
+    [ -n "$BADNET" ] && "$ENV_DIR/badnet.sh" apply "$BADNET" --aqm "$BADNET_AQM" >/dev/null
     apply_netem
     $CE exec magicalane-client magabench run \
         --socks 127.0.0.1:1080 --target "bench:$ECHO_PORT" --pairs "${EXTRA[@]}"
@@ -143,6 +152,7 @@ mkdir -p "$RESULTS_DIR"
 TAG="$(date +%Y%m%d-%H%M%S)"
 [ -n "$DELAY" ] && TAG="$TAG-d${DELAY}ms"
 [ -n "$LOSS" ] && TAG="$TAG-l${LOSS}pct"
+[ -n "$BADNET" ] && TAG="$TAG-${BADNET}-${BADNET_AQM}"
 OUT="$RESULTS_DIR/$TAG.txt"
 
 declare -A PER_TRANSPORT
@@ -171,7 +181,7 @@ else
 fi
 
 # ------------------------------------------------------------------ comparison table
-COLS="connect_p50_ms connect_p95_ms rtt64_p50_ms rtt16384_p50_ms dl_mbps dl4par_mbps ul_mbps conc_rps"
+COLS="connect_p50_ms rtt64_p50_ms dl_mbps dl4par_mbps ul_mbps conc_rps loaded_rtt64_p95_ms load_dl_mbps"
 
 {
 printf "%-14s" "transport"

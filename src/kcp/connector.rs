@@ -38,6 +38,11 @@ pub struct KcpConnector {
     tls: Option<Arc<tokio_rustls::TlsConnector>>,
     passwd: Vec<u8>,
     tuning: KcpTuning,
+    /// Pool of pre-authenticated sessions (TLS + password done).
+    /// Each session is independent (own conv, own UDP port, own TLS)
+    /// and can serve one relay request. The pool eliminates the
+    /// ~200ms TLS handshake from the request path.
+    pool: Arc<tokio::sync::Mutex<Vec<EitherKcpStream>>>,
 }
 
 impl KcpConnector {
@@ -74,7 +79,57 @@ impl KcpConnector {
             tls: connector,
             passwd,
             tuning: tuning.unwrap_or_default(),
+            pool: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// Fill the pool with pre-authenticated sessions in the background.
+    /// Call once after construction to eliminate per-request handshake cost.
+    pub fn prewarm(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let need = {
+                    let pool = this.pool.lock().await;
+                    4usize.saturating_sub(pool.len())
+                };
+                for _ in 0..need {
+                    match this.create_authenticated_session().await {
+                        Ok(session) => {
+                            this.pool.lock().await.push(session);
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+    }
+
+    /// Create a new session and authenticate it (TLS + password handshake).
+    async fn create_authenticated_session(&self) -> Result<EitherKcpStream> {
+        let mut stream = connect_session_raw(
+            self.remote,
+            self.server_name.clone(),
+            self.tls.clone(),
+            &self.tuning,
+        )
+        .await?;
+        // password auth (same framing as connect_kcp)
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut hello = Vec::with_capacity(1 + self.passwd.len());
+        hello.push(self.passwd.len() as u8);
+        hello.extend_from_slice(&self.passwd);
+        stream.write_all(&hello).await?;
+        stream.flush().await?;
+        let mut flag = [0u8; 1];
+        stream.read_exact(&mut flag).await?;
+        if flag[0] != 0 {
+            return Err(crate::error::Error::WrongPassword);
+        }
+        Ok(stream)
     }
 }
 
@@ -87,10 +142,38 @@ impl Connector for KcpConnector {
         let tls = self.tls.clone();
         let passwd = self.passwd.clone();
         let tuning = self.tuning.clone();
+        let pool = self.pool.clone();
         Box::pin(async move {
-            connect_kcp(remote, server_name, tls, &passwd, &a, &tuning)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))
+            // Try a pre-authenticated session from the pool first
+            let pooled = pool.lock().await.pop();
+            match pooled {
+                Some(mut stream) => {
+                    // Session is authenticated; just send the address
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut addr_buf = bytes::BytesMut::new();
+                    a.encode(&mut addr_buf);
+                    stream.write_all(&addr_buf).await
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    stream.flush().await
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let mut flag = [0u8; 1];
+                    stream.read_exact(&mut flag).await
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    if flag[0] != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "remote refused",
+                        ));
+                    }
+                    Ok(stream)
+                }
+                None => {
+                    // Pool empty; full handshake
+                    connect_kcp(remote, server_name, tls, &passwd, &a, &tuning)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            }
         })
     }
 }
@@ -217,5 +300,51 @@ async fn connect_kcp(
         return Err(crate::error::Error::OpenRemoteAddrError);
     }
     trace!("kcp relay accepted");
+    Ok(io)
+}
+
+/// Create a raw KCP+TLS session without authentication.
+/// Used by the session pool to pre-establish connections.
+async fn connect_session_raw(
+    remote: SocketAddr,
+    server_name: String,
+    tls: Option<Arc<tokio_rustls::TlsConnector>>,
+    tuning: &KcpTuning,
+) -> Result<EitherKcpStream> {
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.bind(&bind.into())?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
+
+    let conv: u32 = rand::thread_rng().gen_range(1, u32::MAX);
+    let shared = Arc::new(session::Shared::new(conv, tuning));
+    let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
+
+    let sock = socket.clone();
+    spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            if from != remote {
+                continue;
+            }
+            if tx.send((from, buf[..n].to_vec())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let stream = KcpStream::new(shared.clone());
+    spawn(session::drive_session(shared, socket, remote, rx, || {}));
+
+    let io = match tls {
+        Some(connector) => {
+            let name = rustls_pki_types::ServerName::try_from(server_name)?;
+            let tls = Box::new(connector.connect(name, stream).await?);
+            EitherKcpStream::Tls(tls)
+        }
+        None => EitherKcpStream::Plain(stream),
+    };
     Ok(io)
 }

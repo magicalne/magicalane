@@ -140,6 +140,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         tls,
                         kcp_tuning,
                     )?;
+                    connector.prewarm();
                     run_client(
                         connector,
                         socks5_port,

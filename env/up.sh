@@ -122,12 +122,18 @@ ensure_run magicalane-client \
     --cap-add NET_ADMIN \
     -e RUST_LOG=info \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-ws.toml:/etc/magicalane/client-ws.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 
 say "waiting for readiness"
 wait_exec magicalane-server sh -c "ss -lun | grep -q ':4433'"
 wait_exec magicalane-client sh -c "ss -ltn | grep -q ':1080'"
+
+# pin the test service name on the client container as well (its resolver
+# cannot resolve internal-network names; the tproxy-ws tests fetch it by name)
+WS_TESTSVC_IP="$($CE inspect magicalane-testsvc --format '{{(index .NetworkSettings.Networks "magicalane-backend").IPAddress}}')"
+$CE exec magicalane-client sh -c "grep -q testsvc /etc/hosts 2>/dev/null || echo '$WS_TESTSVC_IP testsvc' >> /etc/hosts" || true
 
 # server joins the backend network (idempotent) so it - and only it - can
 # reach the private test service

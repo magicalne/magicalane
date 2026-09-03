@@ -151,9 +151,37 @@ pub struct ProxyConfig {
     pub tls: Option<bool>,
 }
 
+/// Client-side transparent interception.
+///
+/// ```toml
+/// [kind.Client.tproxy]
+/// mode = "tproxy"     # off (default) | tproxy | tun
+/// tcp_port = 7895     # transparent TCP listener (tproxy mode)
+/// udp_port = 7896     # transparent UDP listener (tproxy mode)
+/// dns_port = 15353    # DNS module listener; udp/53 is redirected here.
+///                     # 0 disables DNS interception.
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TproxyMode {
+    Off,
+    Tproxy,
+    Tun,
+}
+
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct TransparentProxyConfig {
-    tcp_port: u16,
-    udp_port: u16,
+    pub mode: Option<TproxyMode>,
+    pub tcp_port: u16,
+    pub udp_port: u16,
+    pub dns_port: Option<u16>,
+}
+
+impl TransparentProxyConfig {
+    pub fn mode(&self) -> TproxyMode {
+        self.mode.unwrap_or(TproxyMode::Off)
+    }
+    pub fn dns_port(&self) -> u16 {
+        self.dns_port.unwrap_or(0)
+    }
 }

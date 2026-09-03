@@ -57,3 +57,59 @@ wait_container_port() { # container tcp-port
     done
     fail "timeout waiting for $1:$2"
 }
+
+# ------------------------------------------------------- workstation (ws) mode
+# A second client instance with transparent interception enabled runs in
+# the client container; lifecycle helpers manage it for testcases.
+
+WS_CFG="/etc/magicalane/client-ws.toml"
+
+ws_running() { $CE exec magicalane-client sh -c "pgrep -f client-ws.toml >/dev/null" 2>/dev/null; }
+
+ws_start() {
+    if ws_running; then return 0; fi
+    # Start as a background daemon inside the container; the explicit
+    # exit prevents podman exec from waiting for the child
+    $CE exec -d magicalane-client sh -c 'nohup magicalane --config /etc/magicalane/client-ws.toml >/tmp/ws.log 2>&1 2>&1'
+    for _ in $(seq 1 40); do
+        if $CE exec magicalane-client sh -c "iptables -t mangle -n -L MGL-OUT >/dev/null 2>&1 && ss -ltn | grep -q ':7895 '" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    fail "ws client did not become ready"
+}
+
+ws_stop() { # signal (default TERM)
+    local sig="${1:-TERM}"
+    $CE exec magicalane-client sh -c "pkill -$sig -f client-ws.toml" >/dev/null 2>&1 || true
+    for _ in $(seq 1 20); do
+        ws_running || return 0
+        sleep 0.3
+    done
+    fail "ws client did not stop"
+}
+
+ws_wait_gone() {
+    for _ in $(seq 1 20); do
+        ws_running || return 0
+        sleep 0.3
+    done
+    fail "ws client still running"
+}
+
+# Network-state snapshot of the client container (mangle table + ip rule +
+# table 141). Byte-comparable before/after = clean-exit contract holds.
+ws_snapshot() {
+    $CE exec magicalane-client sh -c '
+        iptables-save 2>/dev/null | grep -v "^#" | sort
+        echo "--- rules ---"
+        ip rule list 2>/dev/null
+        echo "--- table141 ---"
+        ip route show table 141 2>/dev/null
+    '
+}
+
+ws_rules_present() {
+    $CE exec magicalane-client sh -c "iptables -t mangle -n -L MGL-OUT >/dev/null 2>&1"
+}

@@ -1,0 +1,5 @@
+# Workstation-mode client (kcp transport), see client-quic-ws.toml.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp", tls = true }, socks5_port = 1081, tproxy = { mode = "tproxy", tcp_port = 7895, udp_port = 7896, dns_port = 15353 } } }

@@ -36,6 +36,14 @@ suite_alias() {
 # testcase files sorted by number
 tc_files() { ls "$TESTS_DIR"/[0-9]*-*.sh 2>/dev/null | sort; }
 
+has_token() { # list token -> 0 if exact whitespace-separated token present
+    [ -z "$2" ] && return 1
+    case " $1 " in
+        *" $2 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 tc_meta() { # file key -> space-separated values
     grep -m1 "^# $2:" "$1" 2>/dev/null | sed "s/^# $2://" | tr -d '\r'
 }
@@ -48,7 +56,7 @@ for f in $(tc_files); do
     name="$(tc_name "$f")"
     for sel in "${SELECTORS[@]}"; do
         for suite in $(suite_alias "$sel"); do
-            if [ "$suite" = "$name" ] || grep -qw "$suite" <<<"$(tc_meta "$f" suites)"; then
+            if [ "$suite" = "$name" ] || has_token "$(tc_meta "$f" suites)" "$suite"; then
                 SELECTED+=("$f")
                 break 2
             fi
@@ -143,14 +151,14 @@ for f in "${TESTS[@]}"; do
     suites="$(tc_meta "$f" suites)"
     transports="$(tc_meta "$f" transports)"
     [ -z "$transports" ] && transports="any"
-    if grep -qw tproxy <<<"$suites"; then
+    if has_token "$suites" tproxy; then
         phase3+=("$f")
         continue
     fi
-    if grep -qw quic <<<"$transports" || grep -qw any <<<"$transports"; then
+    if has_token "$transports" quic || has_token "$transports" any; then
         phase1+=("$f")
     fi
-    if grep -qw kcp <<<"$transports"; then
+    if has_token "$transports" kcp; then
         phase2+=("$f")
     fi
 done
@@ -164,7 +172,7 @@ run_phase() { # file-array-name transport_label mode
         [ -z "$transports" ] && transports="any"
         if [ "$3" = "tproxy" ]; then
             run_test "$f" "any"
-        elif grep -qw "$2" <<<"$transports"; then
+        elif has_token "$transports" "$2"; then
             run_test "$f" "$2"
         fi
     done

@@ -1,7 +1,7 @@
 # Transparent client: TPROXY + TUN modes with clean-exit network management
 
 > Path: `docs/plans/2026-09-03-transparent-client.md`
-> Status: draft for review — no implementation yet.
+> Status: decisions locked (see Decisions) — ready for phase 1 implementation.
 
 ## Summary
 
@@ -30,16 +30,21 @@ exit path the host's iptables/routes/sysctls return to byte-identical state.
 
 ## Goals
 
-- Intercept local (workstation) and routed (gateway) TCP traffic transparently
+- Intercept local (workstation) AND routed (gateway) TCP traffic transparently
   into the tunnel with zero application configuration.
-- **Clean-exit contract** (see below) enforced and test-proven.
-- TUN mode as a firewall-free alternative (TCP via userland stack, UDP natively).
+- **DNS as a first-class separate module** (`src/dns/`) — required, not
+  optional: no DNS leak, resolution happens via the tunnel (server-side).
+- **Clean-exit contract** (see below) enforced and test-proved.
+- TUN mode as a firewall-free alternative behind a **stack abstraction with two
+  implementations, evaluated empirically** (smoltcp vs gVisor netstack).
 - All of it verifiable in the existing podman env, including crash scenarios.
 
 ## Non-goals
 
 - SOCKS5 UDP ASSOCIATE (may fall out of the UDP work, not required).
 - Windows/macOS transparent modes.
+- IPv6 — explicitly **after all IPv4 features are complete** (decision D2);
+  v1 must detect v6 connectivity and warn loudly.
 - Per-app routing rules / split tunneling configuration language (v1 is
   all-or-nothing with fixed exclusions).
 
@@ -110,11 +115,25 @@ topology), same owned-chain structure and exclusions.
 - **REJECT (not DROP) udp/443 while UDP is unimplemented** so browsers fall
   back to TCP immediately instead of timing out.
 
-### DNS (phase 2)
+### DNS module (phase 1 — required, standalone)
 
-Intercept udp/53 and dnat/relay through the tunnel (a UDP flow like any other)
-once phase 2 lands; v1 leaves `127.0.0.0/8` excluded (systemd-resolved keeps
-working, queries go direct — see open questions).
+DNS is its own module (`src/dns/`), independent of the general UDP relay so it
+ships with phase 1 and survives later refactors:
+
+- **Interception**: udp/53 (and tcp/53) is TPROXY'd to the DNS module's own
+  transparent listener (dst recovered via `IP_RECVORIGDSTADDR` / `getsockname`)
+  — separate rule entries in the owned chains, so the module can also be
+  enabled alone (`[dns] enabled` without full tproxy).
+- **Transport without the general UDP relay**: each query is relayed over a
+  short-lived tunnel stream (existing stream protocol): client sends the raw
+  DNS payload, the server forwards to the configured upstream (default: system
+  resolver) and streams the response back. No dependence on phase 2.
+- **Server side**: `src/dns/relay.rs` — upstream forwarder (UDP with TCP
+  fallback), future home of caching / DoH upstream / domain rules.
+- **Client side**: minimal transaction-aware forwarder (id + qname matching
+  for response routing; no full parser required in v1).
+- Loopback exclusion for `127.0.0.53` (systemd-resolved) is lifted when the
+  DNS module is enabled — queries are answered locally instead of leaking.
 
 ## Mode B — TUN (phase 3)
 
@@ -122,9 +141,14 @@ working, queries go direct — see open questions).
   - exception route: `<server_ip> via <physical gw> proto MAGICTUN` (pinned
     before the default override, loop guard)
   - `default dev mgl0 metric 41000 proto MAGICTUN`
-- Userland TCP stack (`smoltcp`, tun2socks-style): terminates TCP flows from
-  the tun, converts each to a tunnel relay. UDP is native datagrams (no
-  session semantics needed beyond flow timeouts) — TUN's structural advantage.
+- **Stack abstraction** (decision D3): `src/tun/stack.rs` defines a small
+  trait (IP packet in → established flow callbacks / userland `TcpStream`s
+  out); two implementations behind it:
+  - `smoltcp` (Rust-native, small, single-flow tuning concerns)
+  - gVisor netstack via available Rust bindings (heavier, battle-tested)
+  Both are built and **benchmarked in the env** (clean link + badnet
+  profiles); the loser stays in-tree behind a feature flag for re-evaluation.
+- UDP is native datagrams (flow table + timeouts) — TUN's structural advantage.
 - Costs vs TPROXY: userland retransmission (a second TCP), CPU, ~ms latency;
   benefit: no firewall privileges beyond route adds, uniform TCP/UDP handling,
   some VPN-ish features become natural (per-route splitting later).
@@ -133,16 +157,17 @@ working, queries go direct — see open questions).
 
 ## Phasing
 
-1. **Phase 1 — TCP TPROXY**: in-process listener + rule manager implementing
-   the contract + workstation & gateway rule sets + env residue tests
-   (graceful, SIGKILL, restart-adoption). Replaces bridge.py in the env.
-2. **Phase 2 — UDP over TPROXY**: datagram framing + server UDP relay + udp/53
-   interception; drop the udp/443 REJECT workaround.
-3. **Phase 3 — TUN mode**: smoltcp integration, route manager (contract
-   shared), UDP native.
-4. **Phase 4 — IPv6**: v6 rules/addresses across both modes (decides the
-   current silent-leak issue: v1 should at minimum detect v6 connectivity and
-   warn loudly, or optionally blackhole AAAA to force v4).
+1. **Phase 1 — TCP TPROXY + DNS module**: in-process TCP listener, **DNS
+   module (required)**, rule manager implementing the contract, workstation &
+   gateway rule sets (decision D4: both), env residue tests (graceful, SIGKILL,
+   restart-adoption). Replaces bridge.py in the env.
+2. **Phase 2 — general UDP over TPROXY**: datagram framing + server UDP relay
+   (DNS keeps its own module/path); drop the udp/443 REJECT workaround.
+3. **Phase 3 — TUN mode**: stack abstraction + **both implementations,
+   evaluated by env benchmark** (D3); route manager (contract shared), UDP
+   native.
+4. **Phase 4 — IPv6**: v6 rules/addresses across both modes and the DNS
+   module — strictly after all IPv4 features are complete (D2).
 
 Cross-cutting: the rule/route manager is one small module used by both modes;
 it owns apply/rollback/adopt-cleanup and is the only code allowed to touch
@@ -150,9 +175,12 @@ host networking.
 
 ## Files touched (phase 1 sketch)
 
-- [ ] `src/tproxy/mod.rs` — transparent TCP listener
+- [ ] `src/tproxy/mod.rs` — transparent TCP listener (workstation + gateway)
 - [ ] `src/tproxy/rules.rs` — transactional rule/route manager (owned chains,
       restore-blob apply, exact teardown, stale-state adoption)
+- [ ] `src/dns/{mod,proto,relay}.rs` — DNS module (client forwarder +
+      server-side upstream relay)
+- [ ] `src/tun/{mod,stack,smoltcp,gvisor}.rs` — phase 3 (both stacks)
 - [ ] `src/config.rs` — activate `TransparentProxyConfig` (mode: off/tproxy/tun)
 - [ ] `src/main.rs` — wire listener + manager lifecycle (signals → teardown)
 - [ ] `env/tproxy-rules.sh` — superseded by in-process manager; becomes
@@ -173,15 +201,14 @@ host networking.
 - **smoltcp** (phase 3) adds a dependency and its own risk profile; kept
   strictly behind the TUN mode feature.
 
-## Open questions
+## Decisions (locked 2026-09-03)
 
-1. DNS in v1: leave direct (loopback excluded — simplest, leaks metadata) vs
-   block udp/53 outbound to force DoH/failure? (Recommend: leave direct v1,
-   intercept in phase 2.)
-2. IPv6 posture pre-phase-4: warn-only vs optional AAAA blackhole?
-   (Recommend warn-only.)
-3. Tun stack choice: smoltcp vs gVisor netstack (bigger, faster, Go-oriented
-   bindings)? (Recommend smoltcp for footprint.)
-4. Should gateway mode ship in phase 1 or is workstation mode alone enough
-   for the first cut? (Env already tests gateway topology; product cost is
-   small — recommend both.)
+- **D1 — DNS**: a separate, required module (`src/dns/`); ships in phase 1
+  using per-query tunnel streams; no DNS leak (resolution via the server).
+- **D2 — IPv6**: implemented only after all IPv4 features are complete
+  (phase 4). Interim: loud warning when v6 connectivity is detected.
+- **D3 — TUN stack**: abstract behind `src/tun/stack.rs`; implement BOTH
+  smoltcp and gVisor netstack and pick empirically via env benchmarks; the
+  alternative stays in-tree behind a feature flag.
+- **D4 — Phase 1 scope**: both workstation (OUTPUT marking) and gateway
+  (PREROUTING) modes.

@@ -80,6 +80,7 @@ Isolated rootless-podman network for verifying the proxy end-to-end without touc
 - `env/tproxy-rules.sh apply|clean|show` manages TPROXY mangle + policy routing inside the tproxy-client container.
 - Local cargo tests cover the KCP session layer without containers: `tests/kcp_loopback.rs` (raw + TLS echo), `tests/kcp_fullstack.rs` (real listener/connector + origin).
 - Override the engine with `CONTAINER_ENGINE=...` if needed.
+- **TUN mode** (`mode = 	un\ in config`): requires `cargo build --features tun-mode` (pulls in `tun` + `smoltcp` deps; the default build stays lean without them).
 
 ## Benchmarks (`env/bench.sh`)
 

@@ -30,6 +30,7 @@ async fn start_with_config(config: Config) -> Result<()> {
     let password = config.password;
     let bandwidth = config.bandwidth;
     let kind = config.kind;
+    let tuning = config.tuning.clone().unwrap_or_default();
     env_logger::init();
     install_crypto_provider();
     match kind {
@@ -51,7 +52,12 @@ async fn start_with_config(config: Config) -> Result<()> {
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
                     };
                     let mut server = lib::quic::server::Server::new(
-                        connector, key_cert, port, password, bandwidth,
+                        connector,
+                        key_cert,
+                        port,
+                        password,
+                        bandwidth,
+                        tuning.quic.clone(),
                     )?;
                     server.run().await?;
                 }
@@ -62,7 +68,13 @@ async fn start_with_config(config: Config) -> Result<()> {
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
                     };
                     let mut server = lib::kcp::listener::Server::new(
-                        connector, key_cert, port, password, bandwidth, tls,
+                        connector,
+                        key_cert,
+                        port,
+                        password,
+                        bandwidth,
+                        tls,
+                        tuning.kcp.clone(),
                     )?;
                     server.run().await?;
                 }
@@ -76,6 +88,8 @@ async fn start_with_config(config: Config) -> Result<()> {
             let protocol = Protocol::from_opt(&proxy.protocol)
                 .with_context(|| "unknown protocol (expected \"quic\" or \"kcp\")")?;
             let tls = proxy.tls.unwrap_or(true);
+            let kcp_tuning = tuning.kcp.clone();
+            let quic_tuning = tuning.quic.clone();
             match protocol {
                 Protocol::Quic => {
                     let ca_path = proxy.ca_path.map(std::path::PathBuf::from);
@@ -84,6 +98,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         proxy.port,
                         ca_path,
                         password.as_bytes().to_vec(),
+                        quic_tuning,
                     )
                     .await?;
                     let connector = connector::QuicConnector::new(quic_client);
@@ -97,6 +112,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         ca_path,
                         password.as_bytes().to_vec(),
                         tls,
+                        kcp_tuning,
                     )?;
                     run_socks_server(connector, socks5_port, bandwidth).await?;
                 }

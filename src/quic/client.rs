@@ -11,9 +11,11 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::Mutex;
 
 use crate::{
+    config::QuicTuning,
     error::{Error, Result},
     quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE, stream},
     socks5::proto::Addr,
+    transport_config,
 };
 
 /// Handle used by the socks5 server to open relay streams over QUIC.
@@ -40,6 +42,7 @@ impl ClientActorHndler {
         port: u16,
         cert_path: Option<PathBuf>,
         passwd: Vec<u8>,
+        tuning: Option<QuicTuning>,
     ) -> Result<Self> {
         let mut roots = rustls::RootCertStore::empty();
         if let Some(path) = &cert_path {
@@ -52,9 +55,10 @@ impl ClientActorHndler {
             .with_root_certificates(roots)
             .with_no_client_auth();
         tls_config.alpn_protocols = crate::ALPN_QUIC.iter().map(|p| p.to_vec()).collect();
-        let quinn_config = quinn::ClientConfig::new(Arc::new(
+        let mut quinn_config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
         ));
+        quinn_config.transport_config(transport_config(tuning.as_ref()));
 
         let remote_addr = (server_name.as_str(), port)
             .to_socket_addrs()?

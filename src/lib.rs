@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use error::Result;
@@ -16,6 +17,34 @@ pub mod socks5;
 
 /// ALPN protocol identifier used by the QUIC transport.
 pub const ALPN_QUIC: &[&[u8]] = &[b"magicalane-1"];
+
+/// Build a quinn `TransportConfig` from optional tuning. Defaults to
+/// quinn's own (cubic congestion control, default windows).
+pub fn transport_config(tuning: Option<&config::QuicTuning>) -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    if let Some(t) = tuning {
+        let factory: std::sync::Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> = match t.congestion_name() {
+            "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+            "new-reno" | "newreno" | "reno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
+            "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
+            other => {
+                log::warn!("unknown congestion controller {other:?}, falling back to cubic");
+                Arc::new(quinn::congestion::CubicConfig::default())
+            }
+        };
+        tc.congestion_controller_factory(factory);
+        if let Some(w) = t.send_window {
+            tc.send_window(w);
+        }
+        if let Some(w) = t.receive_window {
+            tc.receive_window(quinn::VarInt::from_u64(w).unwrap_or(quinn::VarInt::MAX));
+        }
+        if let Some(w) = t.stream_receive_window {
+            tc.stream_receive_window(quinn::VarInt::from_u64(w).unwrap_or(quinn::VarInt::MAX));
+        }
+    }
+    Arc::new(tc)
+}
 
 pub fn generate_key_and_cert_der(
     qualifier: &str,

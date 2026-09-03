@@ -17,7 +17,7 @@ pub async fn server_test() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
     let connector = LocalConnector;
     let key_cert = generate_key_and_cert_der("tls", "org", "examples")?;
-    let mut server = Server::new(connector, key_cert, 3333, String::from("pwd"), 8024)?;
+    let mut server = Server::new(connector, key_cert, 3333, String::from("pwd"), 8024, None)?;
     server.run().await?;
     Ok(())
 }
@@ -36,6 +36,7 @@ pub async fn client_test() -> Result<()> {
         3333,
         Some(cert),
         "pwd".as_bytes().to_vec(),
+        None,
     )
     .await?;
     let connector = QuicConnector::new(quic_client);

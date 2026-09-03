@@ -19,7 +19,7 @@ async fn kcp_loopback_echo() -> anyhow::Result<()> {
 
     // Server side: route every incoming packet to session 42.
     let (stx, srx) = mpsc::channel(256);
-    let server_shared = Arc::new(session::Shared::new(42));
+    let server_shared = Arc::new(session::Shared::new(42, &Default::default()));
     let server_stream = KcpStream::new(server_shared.clone());
     {
         let sock = server_sock.clone();
@@ -44,7 +44,7 @@ async fn kcp_loopback_echo() -> anyhow::Result<()> {
 
     // Client side: its own socket and session 42.
     let (ctx, crx) = mpsc::channel(256);
-    let client_shared = Arc::new(session::Shared::new(42));
+    let client_shared = Arc::new(session::Shared::new(42, &Default::default()));
     let mut client_stream = KcpStream::new(client_shared.clone());
     {
         let sock = client_sock.clone();
@@ -141,7 +141,7 @@ async fn kcp_tls_loopback_echo() -> anyhow::Result<()> {
     let client_addr: SocketAddr = client_sock.local_addr()?;
 
     let (stx, srx) = mpsc::channel(256);
-    let server_shared = std::sync::Arc::new(session::Shared::new(7));
+    let server_shared = std::sync::Arc::new(session::Shared::new(7, &Default::default()));
     let server_stream = KcpStream::new(server_shared.clone());
     {
         let sock = server_sock.clone();
@@ -164,7 +164,7 @@ async fn kcp_tls_loopback_echo() -> anyhow::Result<()> {
     ));
 
     let (ctx, crx) = mpsc::channel(256);
-    let client_shared = std::sync::Arc::new(session::Shared::new(7));
+    let client_shared = std::sync::Arc::new(session::Shared::new(7, &Default::default()));
     let client_stream = KcpStream::new(client_shared.clone());
     {
         let sock = client_sock.clone();

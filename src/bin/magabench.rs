@@ -67,6 +67,9 @@ enum Cmd {
         /// Upload bytes (32 MiB).
         #[structopt(long, default_value = "33554432")]
         ul_bytes: usize,
+        /// Parallel download connections for the aggregate metric.
+        #[structopt(long, default_value = "4")]
+        dl_par: usize,
     },
 }
 
@@ -86,7 +89,8 @@ fn main() -> anyhow::Result<()> {
                 conc_pings,
                 dl_bytes,
                 ul_bytes,
-            } => run_bench(&socks, &target, pairs, pings, connects, conc_conns, conc_pings, dl_bytes, ul_bytes).await,
+                dl_par,
+            } => run_bench(&socks, &target, pairs, pings, connects, conc_conns, conc_pings, dl_bytes, ul_bytes, dl_par).await,
         }
     })
 }
@@ -236,6 +240,7 @@ async fn run_bench(
     conc_pings: usize,
     dl_bytes: usize,
     ul_bytes: usize,
+    dl_par: usize,
 ) -> anyhow::Result<()> {
     let mut metrics: Vec<(String, f64)> = Vec::new();
     let mut put = |k: &str, v: f64| metrics.push((k.to_string(), v));
@@ -289,6 +294,37 @@ async fn run_bench(
     }
 
     eprintln!("[phase] upload");
+    // 3b) parallel download: dl_par connections share the transfer
+    if dl_par > 1 {
+        let per = dl_bytes / dl_par;
+        let mut handles = Vec::new();
+        let barrier = Arc::new(Barrier::new(dl_par));
+        for _ in 0..dl_par {
+            let socks = socks.to_string();
+            let target = target.to_string();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let mut c = socks_connect(&socks, &target).await?;
+                let mut req = vec![0x02u8];
+                req.extend_from_slice(&(per as u32).to_be_bytes());
+                write_frame(&mut c, &req).await?;
+                barrier.wait().await;
+                let mut got = 0usize;
+                while got < per {
+                    let f = read_frame(&mut c).await?;
+                    got += f.len() - 1;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        let t = Instant::now();
+        for h in handles {
+            h.await??;
+        }
+        let dt = t.elapsed();
+        put(&format!("dl{dl_par}par_mbps"), dl_bytes as f64 / 1e6 / dt.as_secs_f64());
+    }
+
     // 4) upload throughput: SINK total + junk in one frame, wait for ACK
     {
         let mut head = vec![0x04u8];

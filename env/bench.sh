@@ -17,17 +17,19 @@ ECHO_NAME="magicalane-bench-echo"
 ECHO_PORT="9807"
 
 TRANSPORTS="quic kcp"
+MATRIX=""
 DELAY=""
 LOSS=""
 declare -a EXTRA=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --transports) TRANSPORTS="${2//,/ }"; shift ;;
+        --matrix) MATRIX="1" ;;
         --delay) DELAY="$2"; shift ;;
         --loss) LOSS="$2"; shift ;;
-        --pings|--connects|--conc-conns|--conc-pings|--dl-bytes|--ul-bytes)
+        --pings|--connects|--conc-conns|--conc-pings|--dl-bytes|--ul-bytes|--dl-par)
             EXTRA+=("$1" "$2"); shift ;;
-        *) echo "usage: env/bench.sh [--transports quic,kcp,kcp-plain] [--delay ms] [--loss pct] [magabench knobs]" >&2; exit 2 ;;
+        *) echo "usage: env/bench.sh [--matrix] [--transports quic,kcp] [--delay ms] [--loss pct] [magabench knobs]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -82,7 +84,60 @@ run_one() { # transport -> prints "key=value" lines
     clear_netem
 }
 
+# ------------------------------------------------------------- matrix presets
+# variant_toml <tag>: emits the tuning TOML fragment for a variant tag.
+variant_toml() {
+    case "$1" in
+        quic)            : ;;
+        quic-bbr)        printf '[tuning.quic]\ncongestion = "bbr"\n' ;;
+        quic-newreno)    printf '[tuning.quic]\ncongestion = "new-reno"\n' ;;
+        quic-win32m)     printf '[tuning.quic]\nsend_window = 33554432\nreceive_window = 33554432\nstream_receive_window = 16777216\n' ;;
+        kcp)             : ;;
+        kcp-wnd2048)     printf '[tuning.kcp]\nsndwnd = 2048\nrcvwnd = 2048\n' ;;
+        kcp-nc0)         printf '[tuning.kcp]\nnc = false\n' ;;
+        kcp-i40)         printf '[tuning.kcp]\ninterval = 40\n' ;;
+        kcp-mtu1400)     printf '[tuning.kcp]\nmtu = 1400\n' ;;
+        kcp-wnd2048-i40) printf '[tuning.kcp]\nsndwnd = 2048\nrcvwnd = 2048\ninterval = 40\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+variant_transport() { echo "${1%%-*}"; }
+
+gen_variant_configs() { # tag -> writes variants/<tag>-{server,client}.toml, echoes dir
+    local tag="$1" t
+    t="$(variant_transport "$tag")"
+    local dir="$ENV_DIR/configs/variants"
+    mkdir -p "$dir"
+    for side in server client; do
+        cp "$ENV_DIR/configs/$side-$t.toml" "$dir/$tag-$side.toml"
+        variant_toml "$tag" >> "$dir/$tag-$side.toml"
+    done
+    echo "$dir"
+}
+
+run_matrix_one() { # tag -> prints key=value lines
+    local tag="$1" dir
+    dir="$(gen_variant_configs "$tag")"
+    say "deploying variant $tag"
+    "$ENV_DIR/down.sh" >/dev/null 2>&1
+    "$ENV_DIR/up.sh" --transport "$(variant_transport "$tag")" \
+        --server-config "$dir/$tag-server.toml" \
+        --client-config "$dir/$tag-client.toml" >/dev/null
+    ensure_echo
+    apply_netem
+    $CE exec magicalane-client magabench run \
+        --socks 127.0.0.1:1080 --target "bench:$ECHO_PORT" --pairs "${EXTRA[@]}"
+    clear_netem
+}
+
 # ------------------------------------------------------------------ run
+if [ -n "$MATRIX" ]; then
+    # throughput-focused defaults unless overridden
+    if [ ${#EXTRA[@]} -eq 0 ]; then
+        EXTRA=(--pings 20 --dl-bytes 134217728 --ul-bytes 67108864 --dl-par 4)
+    fi
+fi
 RESULTS_DIR="$ENV_DIR/bench-results"
 mkdir -p "$RESULTS_DIR"
 TAG="$(date +%Y%m%d-%H%M%S)"
@@ -91,19 +146,32 @@ TAG="$(date +%Y%m%d-%H%M%S)"
 OUT="$RESULTS_DIR/$TAG.txt"
 
 declare -A PER_TRANSPORT
-for t in $TRANSPORTS; do
-    say "benchmarking $t ..."
-    if ! out="$(run_one "$t")"; then
-        say "benchmark for $t FAILED"
-        continue
-    fi
-    echo "=== $t ===" >> "$OUT"
-    echo "$out" >> "$OUT"
-    PER_TRANSPORT["$t"]="$out"
-done
+if [ -n "$MATRIX" ]; then
+    for tag in $TRANSPORTS; do
+        say "benchmarking variant $tag ..."
+        if ! out="$(run_matrix_one "$tag")"; then
+            say "benchmark for $tag FAILED"
+            continue
+        fi
+        echo "=== $tag ===" >> "$OUT"
+        echo "$out" >> "$OUT"
+        PER_TRANSPORT["$tag"]="$out"
+    done
+else
+    for t in $TRANSPORTS; do
+        say "benchmarking $t ..."
+        if ! out="$(run_one "$t")"; then
+            say "benchmark for $t FAILED"
+            continue
+        fi
+        echo "=== $t ===" >> "$OUT"
+        echo "$out" >> "$OUT"
+        PER_TRANSPORT["$t"]="$out"
+    done
+fi
 
 # ------------------------------------------------------------------ comparison table
-COLS="connect_p50_ms connect_p95_ms rtt64_p50_ms rtt64_p95_ms rtt16384_p50_ms rtt16384_p95_ms dl_mbps ul_mbps conc_rps conc_p95_ms"
+COLS="connect_p50_ms connect_p95_ms rtt64_p50_ms rtt16384_p50_ms dl_mbps dl4par_mbps ul_mbps conc_rps"
 
 {
 printf "%-14s" "transport"

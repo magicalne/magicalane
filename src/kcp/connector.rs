@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use crate::{
+    config::KcpTuning,
     connector::Connector,
     error::Result,
     kcp::session::{self, KcpStream},
@@ -36,6 +37,7 @@ pub struct KcpConnector {
     server_name: String,
     tls: Option<Arc<tokio_rustls::TlsConnector>>,
     passwd: Vec<u8>,
+    tuning: KcpTuning,
 }
 
 impl KcpConnector {
@@ -45,6 +47,7 @@ impl KcpConnector {
         ca_path: Option<PathBuf>,
         passwd: Vec<u8>,
         tls: bool,
+        tuning: Option<KcpTuning>,
     ) -> Result<Self> {
         let remote = (server_name.as_str(), port)
             .to_socket_addrs()?
@@ -70,6 +73,7 @@ impl KcpConnector {
             server_name,
             tls: connector,
             passwd,
+            tuning: tuning.unwrap_or_default(),
         })
     }
 }
@@ -82,8 +86,9 @@ impl Connector for KcpConnector {
         let server_name = self.server_name.clone();
         let tls = self.tls.clone();
         let passwd = self.passwd.clone();
+        let tuning = self.tuning.clone();
         Box::pin(async move {
-            connect_kcp(remote, server_name, tls, &passwd, &a)
+            connect_kcp(remote, server_name, tls, &passwd, &a, &tuning)
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))
         })
@@ -148,6 +153,7 @@ async fn connect_kcp(
     tls: Option<Arc<tokio_rustls::TlsConnector>>,
     passwd: &[u8],
     addr: &Addr,
+    tuning: &KcpTuning,
 ) -> Result<EitherKcpStream> {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -157,7 +163,7 @@ async fn connect_kcp(
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);
 
     let conv: u32 = { rand::thread_rng().gen_range(1, u32::MAX) };
-    let shared = Arc::new(session::Shared::new(conv));
+    let shared = Arc::new(session::Shared::new(conv, tuning));
     let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
 
     // Receiver: only accept datagrams from the server.

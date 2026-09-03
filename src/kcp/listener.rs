@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use crate::{
-    connector::Connector, error::Result, load_private_cert, load_private_key,
+    config::KcpTuning, connector::Connector, error::Result, load_private_cert, load_private_key,
     quic::server::stream::Stream,
 };
 
@@ -87,6 +87,7 @@ pub struct Server<C> {
     bandwidth: usize,
     socket: Arc<UdpSocket>,
     routes: Route,
+    tuning: KcpTuning,
 }
 
 impl<C> Server<C> {
@@ -99,6 +100,7 @@ impl<C> Server<C> {
         passwd: String,
         bandwidth: usize,
         tls: bool,
+        tuning: Option<KcpTuning>,
     ) -> Result<Self> {
         let acceptor = if tls {
             let (key, cert) = key_cert;
@@ -126,6 +128,7 @@ impl<C> Server<C> {
             bandwidth,
             socket,
             routes: Arc::new(StdMutex::new(HashMap::new())),
+            tuning: tuning.unwrap_or_default(),
         })
     }
 
@@ -147,6 +150,7 @@ where
         let connector = self.connector.clone();
         let passwd = self.passwd.clone();
         let bandwidth = self.bandwidth;
+        let self_tuning = self.tuning.clone();
 
         // Dispatch datagrams by conv to session tasks, creating sessions lazily.
         spawn(async move {
@@ -168,7 +172,7 @@ where
                             None => {
                                 let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
                                 routes.lock().unwrap().insert(conv, tx);
-                                let shared = Arc::new(session::Shared::new(conv));
+                                let shared = Arc::new(session::Shared::new(conv, &self_tuning));
                                 let stream = KcpStream::new(shared.clone());
                                 let sock = socket.clone();
                                 let rts = routes.clone();

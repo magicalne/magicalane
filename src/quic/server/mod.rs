@@ -14,10 +14,9 @@ use tokio::{
 
 use crate::connector::Connector;
 use crate::{
-    ALPN_QUIC,
-    error::Result,
-    load_private_cert, load_private_key,
+    ALPN_QUIC, config::QuicTuning, error::Result, load_private_cert, load_private_key,
     quic::{SOCKET_RECV_BUF_SIZE, SOCKET_SEND_BUF_SIZE, server::conn::Connection},
+    transport_config,
 };
 
 pub mod conn;
@@ -38,6 +37,7 @@ impl<C> Server<C> {
         port: u16,
         passwd: String,
         bandwidth: usize,
+        tuning: Option<QuicTuning>,
     ) -> Result<Self> {
         let (key, cert) = key_cert;
         info!("key path: {:?}", &key);
@@ -48,9 +48,10 @@ impl<C> Server<C> {
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)?;
         server_config.alpn_protocols = ALPN_QUIC.iter().map(|p| p.to_vec()).collect();
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_config)?,
         ));
+        server_config.transport_config(transport_config(tuning.as_ref()));
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         info!("Server bind: {:?}", &addr);

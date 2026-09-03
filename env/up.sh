@@ -17,16 +17,22 @@ IMAGE="magicalane:env"
 
 PROFILE=""
 TRANSPORT="quic"
+SERVER_CONFIG=""
+CLIENT_CONFIG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --profile) : ;;
         tproxy) PROFILE="tproxy" ;;
         --transport) TRANSPORT="$2"; shift ;;
         quic|kcp|kcp-plain) TRANSPORT="$1" ;;
-        *) echo "usage: env/up.sh [--transport quic|kcp] [--profile tproxy]" >&2; exit 2 ;;
+        --server-config) SERVER_CONFIG="$2"; shift ;;
+        --client-config) CLIENT_CONFIG="$2"; shift ;;
+        *) echo "usage: env/up.sh [--transport quic|kcp|kcp-plain] [--profile tproxy] [--server-config PATH] [--client-config PATH]" >&2; exit 2 ;;
     esac
     shift
 done
+SERVER_CFG_PATH="${SERVER_CONFIG:-$ENV_DIR/configs/server-$TRANSPORT.toml}"
+CLIENT_CFG_PATH="${CLIENT_CONFIG:-$ENV_DIR/configs/client-$TRANSPORT.toml}"
 case "$TRANSPORT" in quic|kcp|kcp-plain) ;; *) echo "invalid transport: $TRANSPORT" >&2; exit 2 ;; esac
 
 say() { echo "[up] $*"; }
@@ -95,7 +101,7 @@ ensure_run magicalane-server \
     --network "$NET" --network-alias magicalane-server \
     --cap-add NET_ADMIN \
     -e RUST_LOG=info \
-    -v "$ENV_DIR/configs/server-$TRANSPORT.toml:/etc/magicalane/server.toml:ro" \
+    -v "$SERVER_CFG_PATH:/etc/magicalane/server.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/server.toml
 
@@ -103,7 +109,7 @@ ensure_run magicalane-client \
     $CE run -d --name magicalane-client --label "$LABEL" \
     --network "$NET" \
     -e RUST_LOG=info \
-    -v "$ENV_DIR/configs/client-$TRANSPORT.toml:/etc/magicalane/client.toml:ro" \
+    -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 
@@ -126,7 +132,7 @@ if [ "$PROFILE" = "tproxy" ]; then
         --cap-add NET_ADMIN \
         --sysctl net.ipv4.ip_forward=1 \
         -e RUST_LOG=info \
-        -v "$ENV_DIR/configs/client-$TRANSPORT.toml:/etc/magicalane/client.toml:ro" \
+        -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
         -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
         "$IMAGE" sh -c 'socat TCP-LISTEN:7895,bind=0.0.0.0,reuseaddr,fork,ip-transparent TCP:origin:80 & exec magicalane --config /etc/magicalane/client.toml'
 

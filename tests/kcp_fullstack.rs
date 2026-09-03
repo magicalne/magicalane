@@ -61,6 +61,7 @@ async fn kcp_full_stack() -> anyhow::Result<()> {
         PASSWORD.to_string(),
         65536,
         true,
+        None,
     )?;
     let kcp_port = server.local_addr()?.port();
     tokio::spawn(async move { server.run().await });
@@ -72,6 +73,7 @@ async fn kcp_full_stack() -> anyhow::Result<()> {
         Some(ca_path.clone()),
         PASSWORD.as_bytes().to_vec(),
         true,
+        None,
     )?;
 
     // One relay request to the origin via the connector (socks5 Addr).

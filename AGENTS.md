@@ -70,13 +70,16 @@ End-to-end transport comparison through the real stack (socks5 -> transport -> s
 ```sh
 env/bench.sh                          # quic vs kcp
 env/bench.sh --transports quic,kcp,kcp-plain   # include plaintext KCP (TLS overhead)
+env/bench.sh --matrix --transports quic,quic-bbr,kcp,kcp-wnd2048   # parameter sweep
 env/bench.sh --delay 30 --loss 2     # netem on the server: 30ms RTT, 2% loss
 env/bench.sh --pings 200 --dl-bytes 134217728  # knobs pass through to magabench
 ```
 
-Metrics: fresh-connection setup (p50/p95, includes KCP session+TLS or QUIC stream open), RTT percentiles (64B/1KiB/16KiB), download/upload throughput (MB/s), and concurrent small-request rate (rps + p95). Results print as a comparison table and are saved under `env/bench-results/` (gitignored). The echo origin runs as container `magicalane-bench-echo` (label-owned, removed by `down.sh`).
+Metrics: fresh-connection setup (p50/p95, includes KCP session+TLS or QUIC stream open), RTT percentiles (64B/1KiB/16KiB), download throughput (single + `--dl-par` parallel aggregate), upload throughput, and concurrent small-request rate (rps). Results print as a comparison table and are saved under `env/bench-results/` (gitignored). The echo origin runs as container `magicalane-bench-echo` (label-owned, removed by `down.sh`).
 
-Reference numbers (local bridge, no netem): QUIC ~0.7ms connect / ~0.3ms RTT / ~150MB/s; KCP+TLS ~200ms connect (per-request session+TLS, no reuse) / ~0.4ms RTT / ~20MB/s. Under 30ms+2% loss, KCP download outperformed QUIC ~4x. Known optimization areas: KCP session reuse/multiplexing, window/tick tuning for throughput.
+**Parameter matrix** (`--matrix`): variants are generated into `env/configs/variants/` (gitignored) and deployed via `up.sh --server-config/--client-config`. Built-in tags: `quic`, `quic-bbr`, `quic-newreno`, `quic-win32m` (congestion controller + 32MiB windows), `kcp`, `kcp-wnd2048`, `kcp-nc0` (congestion control on), `kcp-i40`, `kcp-mtu1400`. Add variants by extending `variant_toml` in bench.sh. Tuning is a normal config feature (see `src/config.rs` `KcpTuning`/`QuicTuning` docs).
+
+**Findings so far** (local bridge): clean link — QUIC-cubic fastest single-stream (~159/182 MB/s dl/ul), BBR wins concurrency (5.4k rps vs 2.2k); KCP scales with window (wnd2048: 2× default to ~44 MB/s), keep `nc=true` (cc on costs 4.5×) and `interval=10` (i40 costs 4×). 30ms+2% loss — BBR is transformative (19/41 MB/s vs cubic's 0.9), KCP-wnd2048 best of the KCPs (5.5 MB/s, 105 rps). KCP connect is ~204ms everywhere: fresh session+TLS per request (no reuse yet) — the top optimization candidate (QUIC reuses one connection: 0.7ms).
 
 ## Conventions
 

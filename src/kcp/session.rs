@@ -21,10 +21,8 @@ use tokio::{
     sync::{Notify, mpsc},
 };
 
-use super::{
-    KCP_IDLE_TIMEOUT_SECS, KCP_INTERVAL_MS, KCP_MAX_WRITE, KCP_MTU, KCP_RCV_WND, KCP_SND_WND,
-    KCP_TICK_MS,
-};
+use super::{KCP_IDLE_TIMEOUT_SECS, KCP_MAX_WRITE, KCP_TICK_MS};
+use crate::config::KcpTuning;
 
 /// Collects datagrams produced by the kcp state machine; the driver task
 /// drains this queue onto the UDP socket via the shared `OutputBuf` handle.
@@ -56,6 +54,7 @@ impl std::io::Write for OutputQueue {
 
 struct Inner {
     kcp: Kcp<OutputQueue>,
+    sndwnd: usize,
     /// Decoded application payload waiting to be read.
     rbuf: BytesMut,
     /// A zero-length (EOF) message was received.
@@ -78,7 +77,7 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(conv: u32) -> Self {
+    pub fn new(conv: u32, tuning: &KcpTuning) -> Self {
         let outbuf = OutputBuf(Arc::new(StdMutex::new(VecDeque::new())));
         let mut kcp = Kcp::new(
             conv,
@@ -86,12 +85,13 @@ impl Shared {
                 buf: outbuf.clone(),
             },
         );
-        kcp.set_mtu(KCP_MTU).ok();
-        kcp.set_wndsize(KCP_SND_WND, KCP_RCV_WND);
-        kcp.set_nodelay(true, KCP_INTERVAL_MS, 2, true);
+        kcp.set_mtu(tuning.mtu).ok();
+        kcp.set_wndsize(tuning.sndwnd, tuning.rcvwnd);
+        kcp.set_nodelay(tuning.nodelay, tuning.interval, tuning.resend, tuning.nc);
         Self {
             inner: StdMutex::new(Inner {
                 kcp,
+                sndwnd: tuning.sndwnd as usize,
                 rbuf: BytesMut::new(),
                 eof: false,
                 wrote_eof: false,
@@ -204,7 +204,7 @@ impl AsyncWrite for KcpStream {
                 "kcp session closed",
             )));
         }
-        if inner.kcp.wait_snd() >= KCP_SND_WND as usize {
+        if inner.kcp.wait_snd() >= inner.sndwnd {
             shared.write_waker.register(cx.waker());
             return Poll::Pending;
         }

@@ -4,7 +4,8 @@
 # and the NEXT start adopts and replaces the stale state; after its graceful
 # stop the system is clean again.
 source "$TESTS_DIR/helpers.sh"
-before="$(ws_snapshot)"
+before_chains="$(ws_snapshot_chains)"
+before_rules="$(ws_snapshot_rules)"
 ws_start
 ws_stop KILL
 ws_wait_gone
@@ -14,5 +15,8 @@ pass "residue: stale rules present after kill -9 (as designed)"
 ws_start
 ws_stop
 ws_wait_gone
-after="$(ws_snapshot)"
-assert_eq "$after" "$before" "residue: adoption cleans stale state; final state clean"
+ws_wait_clean
+after_chains="$(ws_snapshot_chains)"
+after_rules="$(ws_snapshot_rules)"
+assert_eq "$after_chains" "$before_chains" "residue: adoption cleans stale state"
+assert_eq "$after_rules" "$before_rules" "residue: no policy routes after adoption+stop"

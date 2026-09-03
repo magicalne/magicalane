@@ -99,7 +99,7 @@ pub struct QuicTuning {
 
 impl QuicTuning {
     pub fn congestion_name(&self) -> &str {
-        self.congestion.as_deref().unwrap_or("cubic")
+        self.congestion.as_deref().unwrap_or("bbr")
     }
 }
 

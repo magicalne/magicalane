@@ -33,6 +33,24 @@ async fn start_with_config(config: Config) -> Result<()> {
     let tuning = config.tuning.clone().unwrap_or_default();
     env_logger::init();
     install_crypto_provider();
+
+    // Teardown stale tproxy rules BEFORE any network activity (F1 fix):
+    // the QUIC/KCP client constructor resolves the server hostname via
+    // system DNS, which would be intercepted by stale DNS redirect rules
+    // from a crashed previous run (circular dependency: DNS needs the
+    // tunnel, the tunnel needs DNS). Clearing first breaks the cycle.
+    if let Kind::Client { tproxy, .. } = &kind {
+        if tproxy.mode() == lib::config::TproxyMode::Tproxy {
+            lib::tproxy::rules::teardown(&lib::tproxy::rules::RuleSpec {
+                server_ip: "0.0.0.0".parse().unwrap(),
+                gateway: false,
+                tcp_port: tproxy.tcp_port,
+                udp_port: tproxy.udp_port,
+                dns_port: tproxy.dns_port(),
+            });
+        }
+    }
+
     match kind {
         Kind::Server {
             port,
@@ -166,6 +184,24 @@ where
         TproxyMode::Tproxy => Some(lib::udp::bind_client(tproxy.udp_port)?),
         _ => None,
     };
+
+    // Warm up the tunnel BEFORE starting the DNS interceptor (F1 fix):
+    // the first DNS query would trigger the QUIC/KCP handshake, which
+    // itself needs to resolve the server hostname via DNS — a circular
+    // dependency. Opening a throwaway tunnel stream forces the handshake
+    // now, while system DNS is still un-intercepted.
+    if mode == TproxyMode::Tproxy && tproxy.dns_port() != 0 {
+        let mut warm = connector.clone();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            warm.connect(lib::socks5::proto::Addr::SocketAddr(
+                "127.0.0.1:1".parse().unwrap(),
+            )),
+        )
+        .await;
+        log::info!("tunnel warmed up for DNS interceptor");
+    }
+
     let dns_sock = match (mode, tproxy.dns_port()) {
         (TproxyMode::Tproxy, p) if p != 0 => Some(lib::dns::bind_client(p)?),
         _ => None,

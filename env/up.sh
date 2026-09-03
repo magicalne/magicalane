@@ -74,6 +74,7 @@ mkdir -p "$ENV_DIR/.build"
 cp -f target/release/magicalane "$ENV_DIR/.build/magicalane"
 cp -f target/release/magabench "$ENV_DIR/.build/magabench"
 cp -f "$ENV_DIR/tproxy-rules.sh" "$ENV_DIR/.build/tproxy-rules.sh"
+cp -f "$ENV_DIR/ws-daemon.sh" "$ENV_DIR/.build/ws-daemon.sh"
 chmod +x "$ENV_DIR/.build/"*
 
 say "generating certs"

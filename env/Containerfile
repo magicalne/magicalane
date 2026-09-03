@@ -22,5 +22,6 @@ RUN apt-get update \
 COPY magicalane /usr/local/bin/magicalane
 COPY magabench /usr/local/bin/magabench
 COPY tproxy-rules.sh /usr/local/bin/tproxy-rules.sh
+COPY ws-daemon.sh /usr/local/bin/ws-daemon.sh
 
 WORKDIR /srv

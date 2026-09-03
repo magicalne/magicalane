@@ -6,13 +6,6 @@
 # NOTE: both fetches use IP addresses to avoid the DNS interceptor's
 # circular dependency (first query triggers QUIC which needs DNS).
 source "$TESTS_DIR/helpers.sh"
-# KNOWN ISSUE: the ws client survives when started via podman exec -d from
-# an interactive shell but dies when started from within the verify.sh
-# test harness (podman exec session lifecycle). The transparent TCP path
-# itself is verified working manually. Revisit with a proper daemon
-# supervisor (systemd unit) or by testing from the app container instead.
-echo "  skip: ws process management in test harness (transparent TCP verified manually)" >&2
-exit 0
 ws_start
 ORIGIN_IP="$($CE inspect magicalane-origin --format '{{(index .NetworkSettings.Networks "magicalane-net").IPAddress}}')"
 out="$(exec_c curl -fsS --max-time 10 "http://$ORIGIN_IP/fixtures/hello.txt")" \

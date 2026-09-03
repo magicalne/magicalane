@@ -229,7 +229,16 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             blob.push_str(&format!(
                 "-A {CHAIN_OUT} -p udp --dport 53 -j RETURN\n"
             ));
+            // Exclude our own DNS interceptor's responses (from dns_port):
+            // they would be MARK'd and TPROXY'd to our own UDP interceptor.
+            blob.push_str(&format!(
+                "-A {CHAIN_OUT} -p udp --sport {} -j RETURN\n", spec.dns_port
+            ));
         }
+        // Exclude our own UDP interceptor's responses
+        blob.push_str(&format!(
+            "-A {CHAIN_OUT} -p udp --sport {} -j RETURN\n", spec.udp_port
+        ));
         blob.push_str(&format!(
             "-A {CHAIN_OUT} -p udp -j MARK --set-mark {MARK}\n"
         ));
@@ -305,9 +314,15 @@ pub fn teardown(_spec: &RuleSpec) {
     // nat chain
     if run("iptables", &["-t", "nat", "-C", "OUTPUT", "-j", CHAIN_NAT]).is_ok() {
         run_ok("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", CHAIN_NAT]);
+    } else {
+        // try deleting anyway (the check might fail for nft compat reasons)
+        run_ok("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", CHAIN_NAT]);
     }
     run_ok("iptables", &["-t", "nat", "-F", CHAIN_NAT]);
-    run_ok("iptables", &["-t", "nat", "-X", CHAIN_NAT]);
+    // retry deletion: -X can fail transiently (nft backend timing)
+    for _ in 0..3 {
+        run_ok("iptables", &["-t", "nat", "-X", CHAIN_NAT]);
+    }
     for _ in 0..3 {
         run_ok(
             "ip",

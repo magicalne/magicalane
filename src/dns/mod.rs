@@ -69,7 +69,10 @@ pub fn bind_client(port: u16) -> io::Result<std::sync::Arc<UdpSocket>> {
     if rc != 0 {
         warn!("dns: IP_TRANSPARENT failed: {}", io::Error::last_os_error());
     }
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    // Bind to loopback: nat REDIRECT changes the destination to
+    // 127.0.0.1:port, and the response must originate from 127.0.0.1
+    // for conntrack to reverse-NAT it back to the original nameserver.
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     socket.bind(&addr.into())?;
     let sock = std::sync::Arc::new(UdpSocket::from_std(socket.into())?);
     info!("dns interceptor listening on {addr}");

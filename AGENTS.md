@@ -25,6 +25,20 @@ cargo clippy           # lints
 
 Integration tests are run manually with `cargo test -- --ignored` since they spin up real client/server endpoints.
 
+## Verification Protocol — MANDATORY
+
+**Any change to the code — new feature, bugfix, refactor, dependency bump — MUST be verified with the harness before committing.** Never commit on a red or unverified suite.
+
+1. **Every code change**:
+   - `cargo test` (fast, no containers) AND `cargo clippy` must be clean.
+   - `env/verify.sh fast` — smoke suite, ~30 s. Minimum bar for any commit.
+2. **Features, transport changes, config changes, PRs**: `env/verify.sh full` (all suites × transports + tproxy, ~2 min). If your feature has a suite (e.g. `dns`, `tproxy-ws`, `residue`), run it explicitly: `env/verify.sh <suite>`.
+3. **Bugfixes**: additionally land a **regression testcase** in `env/tests/` (`NNN-reg-<slug>.sh`, `# regression: <commit-or-issue>` in the header). A bugfix without a pin for the bug is incomplete — see `015-reg-fresh-handshake.sh` / `016-reg-relay-no-dup.sh` for the pattern.
+4. **Performance-relevant changes**: run `env/bench.sh` (and `--badnet` profiles if loss/latency behavior is affected) and compare against previous results in `env/bench-results/`.
+5. If the harness fails, fix before committing — do not skip, comment out, or weaken testcases to get past it.
+
+Reminder: after rebuilding the binary, run `env/down.sh` before `env/up.sh` — running containers are not auto-redeployed.
+
 ## Code Layout
 
 - `src/main.rs` — CLI entry point (client/server subcommands)
@@ -60,7 +74,7 @@ Isolated rootless-podman network for verifying the proxy end-to-end without touc
 - Interaction is `podman exec` only; nothing is published to the host. Certs/fixtures live under `env/` (gitignored).
 - Configs live in `env/configs/{server,client}-{quic,kcp}.toml` (+ `-badpw` variants for the auth negative test).
 - **Private test service** (`magicalane-testsvc`, `magabench serve`): HTTP :8080 (`/id`, `/echo`, `/hello`), framed TCP echo :9001, UDP echo :9002, on an `--internal` backend network only the server can reach. If a testcase can talk to it, the traffic provably went through the tunnel; the negative twins assert direct access fails. (This is why the backend must stay `--internal`: the shared rootless netns otherwise routes between all container networks.)
-- **Verification protocol**: testcases live in `env/tests/NNN-slug.sh` (metadata headers: suites/transports; helpers in `env/tests/helpers.sh`). `env/verify.sh` is the one entry point; `env/test.sh` is a wrapper for `full`. Rule: every bugfix lands with a regression testcase (see 015/016); every feature PR fills its suite (`dns`, `tproxy-ws`, `residue` are reserved for the transparent-client work).
+- **Harness**: testcases live in `env/tests/NNN-slug.sh` (metadata headers: suites/transports; helpers in `env/tests/helpers.sh`). `env/verify.sh` is the one entry point; `env/test.sh` is a wrapper for `full`. Suites `dns`, `tproxy-ws`, `residue` are reserved for the transparent-client phases. See "Verification Protocol" above — running it is mandatory for all code changes.
 - The tproxy profile uses `env/bridge.py` (IP_TRANSPARENT listener → local socks5) as the stand-in for the future in-process `TransparentProxyConfig` listener; intercepted traffic then flows through the real client/server over the selected transport.
 - **After changing Rust code, run `env/down.sh` before `env/up.sh`** — up.sh skips already-running containers, so a rebuild won't deploy into them.
 - `env/tproxy-rules.sh apply|clean|show` manages TPROXY mangle + policy routing inside the tproxy-client container.

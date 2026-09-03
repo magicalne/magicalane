@@ -81,6 +81,20 @@ Metrics: fresh-connection setup (p50/p95, includes KCP session+TLS or QUIC strea
 
 **Findings so far** (local bridge): clean link — QUIC-cubic fastest single-stream (~159/182 MB/s dl/ul), BBR wins concurrency (5.4k rps vs 2.2k); KCP scales with window (wnd2048: 2× default to ~44 MB/s), keep `nc=true` (cc on costs 4.5×) and `interval=10` (i40 costs 4×). 30ms+2% loss — BBR is transformative (19/41 MB/s vs cubic's 0.9), KCP-wnd2048 best of the KCPs (5.5 MB/s, 105 rps). KCP connect is ~204ms everywhere: fresh session+TLS per request (no reuse yet) — the top optimization candidate (QUIC reuses one connection: 0.7ms).
 
+## Bad-network simulation (`env/badnet.sh`)
+
+Realistic cross-country profiles shaped in **both directions** with dst-IP filtering (only client↔server is degraded; server↔origin stays clean), asymmetric rates, jitter, loss, and a choice of bottleneck queue:
+
+```sh
+env/badnet.sh apply cn-us            # 160ms RTT, 0.3% loss, 5/20 Mbit up/down, deep FIFO (bufferbloat)
+env/badnet.sh apply cn-us --aqm cake # same path with AQM (managed queue)
+env/badnet.sh apply eu-us|mobile     # other profiles; status / clear
+# combined with the benchmark:
+env/bench.sh --matrix --transports quic,quic-bbr,kcp --badnet cn-us --under-load
+```
+
+`magabench --under-load` measures foreground RTT percentiles **while a saturating download runs** plus the sustained load throughput — the "is it usable while downloading" metric. Findings + recommendations in `docs/reports/2026-09-03-badnet-usability.md` (short version: cross-country → QUIC+BBR; KCP needs a real congestion controller and session reuse before WAN use).
+
 ## Conventions
 
 - Public API errors: use `crate::error::{Result, Error}` rather than ad-hoc error types (SOCKS5 module has its own `error.rs`).

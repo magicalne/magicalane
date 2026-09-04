@@ -15,19 +15,20 @@ NET="magicalane-net"
 LAN="magicalane-lan"
 IMAGE="magicalane:env"
 
+IPV6="${IPV6:-0}"
 PROFILE=""
 TRANSPORT="quic"
 SERVER_CONFIG=""
 CLIENT_CONFIG=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --profile) : ;;
+        --ipv6) IPV6=1 ;;
         tproxy) PROFILE="tproxy" ;;
         --transport) TRANSPORT="$2"; shift ;;
         quic|kcp|kcp-plain) TRANSPORT="$1" ;;
         --server-config) SERVER_CONFIG="$2"; shift ;;
         --client-config) CLIENT_CONFIG="$2"; shift ;;
-        *) echo "usage: env/up.sh [--transport quic|kcp|kcp-plain] [--profile tproxy] [--server-config PATH] [--client-config PATH]" >&2; exit 2 ;;
+        *) echo "usage: env/up.sh [--transport quic|kcp|kcp-plain] [--ipv6] [--profile tproxy] [--server-config PATH] [--client-config PATH]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -87,7 +88,17 @@ say "building image"
 $CE build -q -t "$IMAGE" -f "$ENV_DIR/Containerfile" "$ENV_DIR/.build" >/dev/null
 
 # ---------------------------------------------------------------- network
-if have_net "$NET"; then say "network $NET exists"; else $CE network create "$NET" >/dev/null; say "created network $NET"; fi
+if have_net "$NET"; then
+    say "network $NET exists"
+else
+    if [ "$IPV6" = "1" ]; then
+        $CE network create --ipv6 --subnet "10.89.0.0/16" --subnet "fd00:89::/64" "$NET" >/dev/null
+        say "created network $NET (dual-stack)"
+    else
+        $CE network create "$NET" >/dev/null
+        say "created network $NET"
+    fi
+fi
 BACKEND="magicalane-backend"
 # --internal: no gateway in the shared netns, so the backend subnet is
 # unreachable from other container networks - only containers attached to
@@ -101,7 +112,7 @@ ensure_run magicalane-origin \
     --network "$NET" --network-alias origin \
     --cap-add NET_ADMIN \
     -v "$ENV_DIR/fixtures:/fixtures:ro" \
-    "$IMAGE" sh -c 'mkdir -p /srv/www/fixtures && cp -r /fixtures/. /srv/www/fixtures/ && cat /etc/hostname > /srv/www/fixtures/hostname && exec python3 -m http.server 80 --directory /srv/www'
+    "$IMAGE" sh -c 'mkdir -p /srv/www/fixtures && cp -r /fixtures/. /srv/www/fixtures/ && cat /etc/hostname > /srv/www/fixtures/hostname && exec python3 -m http.server 80 --bind :: --directory /srv/www'
 
 ensure_run magicalane-testsvc \
     $CE run -d --name magicalane-testsvc --label "$LABEL" \

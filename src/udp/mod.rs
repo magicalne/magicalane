@@ -64,16 +64,27 @@ fn recvmsg_origdst(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<(
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    if name.ss_family as i32 != libc::AF_INET {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "non-ipv4 udp"));
-    }
-    let sin = unsafe { *(&name as *const _ as *const libc::sockaddr_in) };
-    let src = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
-        u16::from_be(sin.sin_port),
-    );
-    // cmsg walk: IP_RECVORIGDSTADDR (20) data = sockaddr_in (original dst)
+    let src = match name.ss_family as i32 {
+        libc::AF_INET => {
+            let sin = unsafe { *(&name as *const _ as *const libc::sockaddr_in) };
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
+                u16::from_be(sin.sin_port),
+            )
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { *(&name as *const _ as *const libc::sockaddr_in6) };
+            SocketAddr::new(
+                IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+                u16::from_be(sin6.sin6_port),
+            )
+        }
+        _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "non-ip udp")),
+    };
+    // cmsg walk: IP_RECVORIGDSTADDR (v4) / IPV6_RECVORIGDSTADDR (v6);
+    // data = sockaddr_in / sockaddr_in6 (the original destination).
     const IP_RECVORIGDSTADDR: libc::c_int = 20;
+    const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
     let mut dst = None;
     unsafe {
         let mut ptr = libc::CMSG_FIRSTHDR(&hdr);
@@ -85,6 +96,14 @@ fn recvmsg_origdst(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<(
                 dst = Some(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))),
                     u16::from_be(sin.sin_port),
+                ));
+            }
+            if cmsg.cmsg_level == libc::SOL_IPV6 && cmsg.cmsg_type == IPV6_RECVORIGDSTADDR {
+                let data = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
+                let sin6 = &*data;
+                dst = Some(SocketAddr::new(
+                    IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+                    u16::from_be(sin6.sin6_port),
                 ));
             }
             ptr = libc::CMSG_NXTHDR(&hdr, ptr);
@@ -134,6 +153,45 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp interceptor listening on {addr}");
+    Ok(Arc::new(UdpInterceptor {
+        sock,
+        flows: StdMutex::new(HashMap::new()),
+        last_used: StdMutex::new(HashMap::new()),
+    }))
+}
+
+/// v6 sibling of `bind_client` (IPV6_TRANSPARENT + IPV6_RECVORIGDSTADDR,
+/// v6-only socket so v4 traffic keeps using the v4 interceptor).
+pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
+    const IPV6_TRANSPARENT: libc::c_int = 72;
+    const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let fd = socket.as_raw_fd();
+    let on: libc::c_int = 1;
+    unsafe {
+        for opt in [IPV6_TRANSPARENT, IPV6_RECVORIGDSTADDR, libc::IPV6_V6ONLY] {
+            let rc = libc::setsockopt(
+                fd,
+                libc::SOL_IPV6,
+                opt,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            if rc != 0 {
+                warn!("udp6: setsockopt {opt} failed: {}", io::Error::last_os_error());
+            }
+        }
+    }
+    let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+    socket.bind(&addr.into())?;
+    let sock = Arc::new(UdpSocket::from_std(socket.into())?);
+    info!("udp6 interceptor listening on {addr}");
     Ok(Arc::new(UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),

@@ -89,17 +89,22 @@ current_transport() {
 }
 tproxy_up() { $CE ps --format '{{.Names}}' 2>/dev/null | grep -qx magicalane-app; }
 
-ensure_env() { # transport tproxy(0|1)
-    local want_t="$1" want_tp="$2" cur_tp
+ensure_env() { # transport tproxy(0|1) [ipv6(0|1)]
+    local want_t="$1" want_tp="$2" want_v6="${3:-0}" cur_tp
     cur_tp=0; tproxy_up && cur_tp=1
     if [ "$(current_transport)" = "$want_t" ] && [ "$cur_tp" = "$want_tp" ] \
         && $CE ps --format '{{.Names}}' | grep -qx magicalane-client; then
-        return 0
+        if [ "$want_v6" = "1" ] && ! $CE exec magicalane-client ip -6 route show default 2>/dev/null | grep -q .; then
+            : # v4 env up but v6 needed: redeploy below
+        else
+            return 0
+        fi
     fi
-    echo "# env: (re)deploying transport=$want_t tproxy=$want_tp" >&2
+    echo "# env: (re)deploying transport=$want_t tproxy=$want_tp ipv6=$want_v6" >&2
     "$ENV_DIR/down.sh" >/dev/null 2>&1
     local args=(--transport "$want_t")
     [ "$want_tp" = "1" ] && args+=(--profile tproxy)
+    [ "$want_v6" = "1" ] && args+=(--ipv6)
     "$ENV_DIR/up.sh" "${args[@]}" >/dev/null 2>&1
 }
 
@@ -146,11 +151,15 @@ COUNT=0
 FAILED=0
 START=$(date +%s)
 
-declare -a phase1=() phase2=() phase3=()
+declare -a phase1=() phase2=() phase3=() phase4=()
 for f in "${TESTS[@]}"; do
     suites="$(tc_meta "$f" suites)"
     transports="$(tc_meta "$f" transports)"
     [ -z "$transports" ] && transports="any"
+    if has_token "$suites" v6; then
+        phase4+=("$f")
+        continue
+    fi
     if has_token "$suites" tproxy; then
         phase3+=("$f")
         continue
@@ -189,6 +198,10 @@ fi
 if [ ${#phase3[@]} -gt 0 ]; then
     ensure_env quic 1
     run_phase phase3[@] quic tproxy
+fi
+if [ ${#phase4[@]} -gt 0 ]; then
+    ensure_env quic 0 1
+    run_phase phase4[@] quic plain
 fi
 
 # ---------------------------------------------------------------- summary

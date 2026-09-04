@@ -107,6 +107,24 @@ pub fn bind_client(port: u16) -> io::Result<std::sync::Arc<UdpSocket>> {
     Ok(sock)
 }
 
+/// v6 sibling: binds [::1] (ip6tables nat REDIRECT rewrites udp/53 dst
+/// to ::1; the response must originate from ::1 for conntrack to
+/// reverse-NAT it back to the original nameserver).
+pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpSocket>> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port);
+    socket.bind(&addr.into())?;
+    let sock = Arc::new(UdpSocket::from_std(socket.into())?);
+    info!("dns6 interceptor listening on {addr}");
+    Ok(sock)
+}
+
 /// Serve DNS queries through the tunnel.
 pub async fn serve_client<C, IO>(sock: std::sync::Arc<UdpSocket>, connector: C)
 where

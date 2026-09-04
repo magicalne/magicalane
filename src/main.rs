@@ -47,6 +47,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                 tcp_port: tproxy.tcp_port,
                 udp_port: tproxy.udp_port,
                 dns_port: tproxy.dns_port(),
+                server_ip6: None,
             });
         }
     }
@@ -204,12 +205,21 @@ where
         routing_cfg.default_action(), routing_cfg.rule.len());
 
     // Transparent listeners must exist BEFORE rules are installed.
+    // v6 siblings bind best-effort (hosts without v6 degrade to v4).
     let tcp_listener = match mode {
         TproxyMode::Tproxy => Some(lib::tproxy::bind(tproxy.tcp_port)?),
         _ => None,
     };
+    let tcp6_listener = match mode {
+        TproxyMode::Tproxy => lib::tproxy::bind6(tproxy.tcp_port).ok(),
+        _ => None,
+    };
     let udp_interceptor = match mode {
         TproxyMode::Tproxy => Some(lib::udp::bind_client(tproxy.udp_port)?),
+        _ => None,
+    };
+    let udp6_interceptor = match mode {
+        TproxyMode::Tproxy => lib::udp::bind_client_v6(tproxy.udp_port).ok(),
         _ => None,
     };
 
@@ -234,6 +244,10 @@ where
         (TproxyMode::Tproxy, p) if p != 0 => Some(lib::dns::bind_client(p)?),
         _ => None,
     };
+    let dns6_sock = match (mode, tproxy.dns_port()) {
+        (TproxyMode::Tproxy, p) if p != 0 => lib::dns::bind_client_v6(p).ok(),
+        _ => None,
+    };
 
     // SOCKS5 stays available alongside transparent interception.
     let mut socks =
@@ -243,40 +257,37 @@ where
     if let Some(l) = tcp_listener {
         tokio::spawn(lib::tproxy::serve(l, connector.clone(), router.clone(), bandwidth));
     }
+    if let Some(l6) = tcp6_listener {
+        tokio::spawn(lib::tproxy::serve6(l6, connector.clone(), router.clone(), bandwidth));
+    }
     if let Some(u) = udp_interceptor {
         tokio::spawn(lib::udp::serve_client(u, connector.clone()));
     }
-    if let Some(d) = dns_sock {
-        match tproxy.dns_mode() {
-            "fakeip" => {
-                // Answer locally from the fake map; non-fakeable qtypes
-                // still tunnel for real answers.
-                let v6_active = lib::tproxy::rules::v6_interception_available();
-                log::info!("dns: fakeip mode (aaaa={aaaa:?}, v6_intercept={v6_active})");
-                tokio::spawn(lib::dns::serve_client_fakeip(
-                    d,
-                    fake_map.clone(),
-                    aaaa,
-                    v6_active,
-                    connector.clone(),
-                ));
-            }
-            _ => {
-                tokio::spawn(lib::dns::serve_client(d, connector.clone()));
-            }
-        }
+    if let Some(u6) = udp6_interceptor {
+        tokio::spawn(lib::udp::serve_client(u6, connector.clone()));
     }
 
     // Rules last; removed on exit paths below.
     if mode == TproxyMode::Tproxy {
-        let server_ip = (server_host, server_port)
+        let server_addrs: Vec<std::net::SocketAddr> = (server_host, server_port)
             .to_socket_addrs()
-            .ok()
-            .and_then(|mut it| it.find(|a| a.is_ipv4()))
-            .and_then(|a| a.ip().to_string().parse::<std::net::Ipv4Addr>().ok());
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let server_ip = server_addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .and_then(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            });
+        let server_ip6 = server_addrs.iter().find(|a| a.is_ipv6()).and_then(|a| match a.ip() {
+            std::net::IpAddr::V6(v6) => Some(v6),
+            _ => None,
+        });
         if let Some(ip) = server_ip {
             let spec = lib::tproxy::rules::RuleSpec {
                 server_ip: ip,
+                server_ip6,
                 gateway: false, // workstation mode; gateway rules capture
                                  // server return traffic (see rules.rs)
                 tcp_port: tproxy.tcp_port,
@@ -284,6 +295,28 @@ where
                 dns_port: tproxy.dns_port(),
             };
             lib::tproxy::rules::apply(&spec)?;
+            // DNS serve tasks start after the rules so the fake-AAAA
+            // "auto" flag reflects the actually-installed v6 plane.
+            let v6_active = lib::tproxy::rules::v6_installed();
+            for (sock, label) in [(dns_sock, "v4"), (dns6_sock, "v6")] {
+                let Some(d) = sock else { continue };
+                match tproxy.dns_mode() {
+                    "fakeip" => {
+                        log::info!("dns[{label}]: fakeip mode (aaaa={aaaa:?}, v6_intercept={v6_active})");
+                        tokio::spawn(lib::dns::serve_client_fakeip(
+                            d,
+                            fake_map.clone(),
+                            aaaa,
+                            v6_active,
+                            connector.clone(),
+                        ));
+                    }
+                    _ => {
+                        log::info!("dns[{label}]: tunnel mode");
+                        tokio::spawn(lib::dns::serve_client(d, connector.clone()));
+                    }
+                }
+            }
         } else {
             anyhow::bail!("tproxy mode requires an IPv4-resolvable server address");
         }
@@ -306,6 +339,7 @@ where
                     tcp_port: tproxy.tcp_port,
                     udp_port: tproxy.udp_port,
                     dns_port: tproxy.dns_port(),
+                    server_ip6: None,
                 });
             }
             anyhow::bail!("socks server exited: {r:?}");
@@ -319,6 +353,7 @@ where
             tcp_port: tproxy.tcp_port,
             udp_port: tproxy.udp_port,
             dns_port: tproxy.dns_port(),
+            server_ip6: None,
         });
     }
     std::process::exit(0);

@@ -233,6 +233,107 @@ where
     Ok(())
 }
 
+// ---------------------------------------------------------------- v6 plane
+
+/// Bind the transparent v6 TCP listener (IPV6_TRANSPARENT; harmless for
+/// the REDIRECT path, required if the mangle TPROXY path ever routes
+/// here). Returns None on hosts without usable IPv6.
+pub fn bind6(port: u16) -> io::Result<TcpListener> {
+    const IPV6_TRANSPARENT: libc::c_int = 72;
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let on: libc::c_int = 1;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+            &on as *const _ as *const libc::c_void, 4);
+        libc::setsockopt(fd, libc::SOL_IPV6, IPV6_TRANSPARENT,
+            &on as *const _ as *const libc::c_void, 4);
+        // v6only=0 would also accept v4-mapped conns (already handled by
+        // the v4 listener) — keep it v6-only for clean separation.
+        libc::setsockopt(fd, libc::SOL_IPV6, libc::IPV6_V6ONLY,
+            &on as *const _ as *const libc::c_void, 4);
+        let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+        addr.sin6_family = libc::AF_INET6 as u16;
+        addr.sin6_port = port.to_be();
+        if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, 28) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::listen(fd, 1024) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let std_listener = std::net::TcpListener::from_raw_fd(fd);
+        std_listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(std_listener)?;
+        info!("tproxy TCP v6 listener on [::]:{port}");
+        Ok(listener)
+    }
+}
+
+/// Serve v6 transparent connections (REDIRECT path: recover the
+/// original destination via IP6T_SO_ORIGINAL_DST).
+pub async fn serve6<C, IO>(listener: TcpListener, connector: C, router: TproxyRouter, bandwidth: usize)
+where
+    C: Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                let dst = match original_dst6(&stream, port) {
+                    Ok(a) => a,
+                    Err(err) => {
+                        warn!("tproxy6 accept without dst: {err}");
+                        continue;
+                    }
+                };
+                let connector = connector.clone();
+                let router = router.clone();
+                log::info!("tproxy6 accepted conn, original dst {dst}");
+                spawn(async move {
+                    match relay(stream, dst, connector, router, bandwidth).await {
+                        Ok(()) => log::info!("tproxy6 relay {dst} done"),
+                        Err(err) => log::warn!("tproxy6 relay {dst} error: {err}"),
+                    }
+                });
+            }
+            Err(err) => {
+                warn!("tproxy6 accept error: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Original destination of a v6 REDIRECT'd connection
+/// (IP6T_SO_ORIGINAL_DST = 80, data = sockaddr_in6).
+pub fn original_dst6(stream: &tokio::net::TcpStream, listen_port: u16) -> io::Result<SocketAddr> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    const IP6T_SO_ORIGINAL_DST: libc::c_int = 80;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_IPV6,
+            IP6T_SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+    let port = u16::from_be(addr.sin6_port);
+    // Defensive: REDIRECT makes getsockname ::1; anything sane is fine.
+    let _ = listen_port;
+    Ok(SocketAddr::new(std::net::IpAddr::V6(ip), port))
+}
+
 /// Get the original destination of a REDIRECT'd connection via
 /// SO_ORIGINAL_DST (the conntrack entry created by nat REDIRECT).
 pub fn original_dst(

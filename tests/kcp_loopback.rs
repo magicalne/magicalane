@@ -119,7 +119,7 @@ async fn kcp_tls_loopback_echo() -> anyhow::Result<()> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_der = rustls_pki_types::CertificateDer::from(cert.cert.der().to_vec());
     let key_der = rustls_pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let mut server_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()

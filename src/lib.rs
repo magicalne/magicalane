@@ -14,6 +14,7 @@ pub mod kcp;
 pub(crate) mod proxy;
 pub mod dns;
 pub mod tproxy;
+pub mod routing;
 pub mod udp;
 pub mod dispatch;
 pub mod quic;

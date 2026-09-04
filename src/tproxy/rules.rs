@@ -196,6 +196,12 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     let mut nat = String::new();
     nat.push_str("*nat\n");
     nat.push_str(&format!(":{CHAIN_NAT} - [0:0]\n"));
+    // Direct-route sockets carry SO_MARK_DIRECT: skip ALL interception
+    // (DNS REDIRECT and TCP REDIRECT alike) or direct connections loop.
+    nat.push_str(&format!(
+        "-A {CHAIN_NAT} -m mark --mark {:#x} -j RETURN\n",
+        crate::connector::SO_MARK_DIRECT
+    ));
     nat.push_str(&format!(
         "-A {CHAIN_NAT} -d {}/32 -j RETURN\n", spec.server_ip
     ));
@@ -222,6 +228,11 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     // MGL-OUT marks local UDP for policy routing to lo (for TPROXY);
     // local TCP is already handled by REDIRECT in nat.
     if spec.udp_port != 0 {
+        // Direct-route sockets never get re-marked.
+        blob.push_str(&format!(
+            "-A {CHAIN_OUT} -m mark --mark {:#x} -j RETURN\n",
+            crate::connector::SO_MARK_DIRECT
+        ));
         blob.push_str(&format!("-A {CHAIN_OUT} -d {}/32 -j RETURN\n", spec.server_ip));
         blob.push_str("-A MGL-OUT -d 127.0.0.0/8 -j RETURN\n");
         if spec.dns_port != 0 {
@@ -345,4 +356,14 @@ pub fn is_installed() -> bool {
 #[allow(dead_code)]
 fn _warn_placeholder() {
     warn!("unused");
+}
+
+/// Whether this host has usable IPv6 (route + ip6tables). Drives the
+/// fake-AAAA "auto" strategy: v6 tokens are only handed out when the
+/// interception plane can actually catch them.
+pub fn v6_interception_available() -> bool {
+    // CP3 installs the MGL6 mirror; until then fake-AAAA must stay off
+    // (tokens without interception would blackhole apps). Once the
+    // mirror exists, extend with: global v6 route + ip6tables present.
+    false
 }

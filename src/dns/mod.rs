@@ -14,6 +14,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -31,6 +32,33 @@ use crate::{
     connector::Connector,
     socks5::proto::Addr,
 };
+
+pub mod fakeip;
+pub mod proto;
+
+pub use fakeip::FakeIpMap;
+
+/// AAAA-answer strategy for fakeip mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AaaaMode {
+    /// Fake AAAA iff IPv6 interception is active (detected at startup).
+    Auto,
+    /// Always answer AAAA with fake v6 tokens.
+    Fake,
+    /// Always answer AAAA with NODATA (apps use the v4 token).
+    Empty,
+}
+
+impl AaaaMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "fake" => Some(Self::Fake),
+            "empty" => Some(Self::Empty),
+            _ => None,
+        }
+    }
+}
 
 /// Magic address the dispatch connector recognizes on the server side.
 pub const DNS_MAGIC_HOST: &[u8] = b"magicalane-dns";
@@ -140,6 +168,94 @@ where
     let mut resp = vec![0u8; len];
     tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut resp)).await??;
     Ok(resp)
+}
+
+// ---------------------------------------------------------------- fakeip mode
+
+/// Serve DNS in fakeip mode: every A query is answered LOCALLY with a
+/// token from 198.18.0.0/15 (AAAA from fc00::/18 when enabled) — no DNS
+/// query ever crosses the network for faked families. Queries we cannot
+/// fake (MX/TXT/SRV/...) fall back to the tunnel relay so real answers
+/// still arrive server-side.
+pub async fn serve_client_fakeip<C, IO>(
+    sock: Arc<UdpSocket>,
+    map: Arc<FakeIpMap>,
+    aaaa: AaaaMode,
+    v6_intercept_active: bool,
+    connector: C,
+) where
+    C: Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, from)) => {
+                let query = buf[..n].to_vec();
+                let map = map.clone();
+                let connector = connector.clone();
+                let sock = sock.clone();
+                spawn(async move {
+                    let _permit = INFLIGHT.acquire().await;
+                    let resp = answer_fakeip(map, aaaa, v6_intercept_active, connector, query).await;
+                    if let Ok(resp) = resp {
+                        let _ = sock.send_to(&resp, from).await;
+                    } else if let Err(err) = resp {
+                        debug!("fakeip query from {from} failed: {err}");
+                    }
+                });
+            }
+            Err(err) => {
+                warn!("dns recv error: {err}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Answer one query from the fake map; non-fakeable qtypes tunnel.
+async fn answer_fakeip<C, IO>(
+    map: Arc<FakeIpMap>,
+    aaaa: AaaaMode,
+    v6_intercept_active: bool,
+    connector: C,
+    query: Vec<u8>,
+) -> io::Result<Vec<u8>>
+where
+    C: Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(q) = proto::parse_query(&query) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unparseable dns query"));
+    };
+    match q.qtype {
+        proto::QTYPE_A => {
+            let ip = map.assign_v4(&q.domain);
+            debug!("fakeip A {} -> {ip}", q.domain);
+            Ok(proto::build_a_response(&q, ip))
+        }
+        proto::QTYPE_AAAA => {
+            let fake_v6 = match aaaa {
+                AaaaMode::Fake => true,
+                AaaaMode::Empty => false,
+                AaaaMode::Auto => v6_intercept_active,
+            };
+            if fake_v6 {
+                let ip = map.assign_v6(&q.domain);
+                debug!("fakeip AAAA {} -> {ip}", q.domain);
+                Ok(proto::build_aaaa_response(&q, ip))
+            } else {
+                // NODATA: app falls back to the A token.
+                Ok(proto::build_empty_response(&q))
+            }
+        }
+        proto::QTYPE_PTR => Ok(proto::build_nxdomain(&q)),
+        _ => {
+            // MX/TXT/SRV/… need real answers: relay through the tunnel.
+            debug!("fakeip passthrough qtype {} {}", q.qtype, q.domain);
+            query_once(connector, &query).await
+        }
+    }
 }
 
 // ---------------------------------------------------------------- server side

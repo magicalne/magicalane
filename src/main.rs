@@ -102,6 +102,7 @@ async fn start_with_config(config: Config) -> Result<()> {
             proxy,
             socks5_port,
             tproxy: tproxy_cfg,
+            routing,
         } => {
             let protocol = Protocol::from_opt(&proxy.protocol)
                 .with_context(|| "unknown protocol (expected \"quic\" or \"kcp\")")?;
@@ -124,6 +125,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         connector,
                         socks5_port,
                         tproxy_cfg,
+                        routing,
                         &proxy.host,
                         proxy.port,
                         bandwidth,
@@ -145,6 +147,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         connector,
                         socks5_port,
                         tproxy_cfg,
+                        routing,
                         &proxy.host,
                         proxy.port,
                         bandwidth,
@@ -165,6 +168,7 @@ async fn run_client<C, IO>(
     connector: C,
     socks5_port: u16,
     tproxy: lib::config::TransparentProxyConfig,
+    routing: Option<lib::config::RoutingSpec>,
     server_host: &str,
     server_port: u16,
     bandwidth: usize,
@@ -175,6 +179,29 @@ where
 {
     use lib::config::TproxyMode;
     let mode = tproxy.mode();
+
+    // Split-routing engine + fake-IP map + direct connector (the trio
+    // that turns intercepted connections into rule-based decisions).
+    let routing_cfg = routing.unwrap_or_default();
+    let engine = match lib::routing::RoutingEngine::from_config(&routing_cfg) {
+        Ok(e) => e,
+        Err(err) => anyhow::bail!("routing config invalid: {}", err),
+    };
+    let fake_map = std::sync::Arc::new(lib::dns::FakeIpMap::new());
+    let direct_dns = routing_cfg.direct_dns.as_deref().and_then(|s| s.parse().ok());
+    let direct = lib::connector::DirectConnector::new(direct_dns);
+    let router = lib::tproxy::TproxyRouter {
+        fake_map: fake_map.clone(),
+        routing: std::sync::Arc::new(engine),
+        direct,
+    };
+    let aaaa = routing_cfg
+        .aaaa
+        .as_deref()
+        .and_then(lib::dns::AaaaMode::parse)
+        .unwrap_or(lib::dns::AaaaMode::Auto);
+    log::info!("routing: default={:?} rules={} aaaa={aaaa:?}",
+        routing_cfg.default_action(), routing_cfg.rule.len());
 
     // Transparent listeners must exist BEFORE rules are installed.
     let tcp_listener = match mode {
@@ -214,13 +241,30 @@ where
     let socks_task = tokio::spawn(async move { socks.run().await });
 
     if let Some(l) = tcp_listener {
-        tokio::spawn(lib::tproxy::serve(l, connector.clone(), bandwidth));
+        tokio::spawn(lib::tproxy::serve(l, connector.clone(), router.clone(), bandwidth));
     }
     if let Some(u) = udp_interceptor {
         tokio::spawn(lib::udp::serve_client(u, connector.clone()));
     }
     if let Some(d) = dns_sock {
-        tokio::spawn(lib::dns::serve_client(d, connector.clone()));
+        match tproxy.dns_mode() {
+            "fakeip" => {
+                // Answer locally from the fake map; non-fakeable qtypes
+                // still tunnel for real answers.
+                let v6_active = lib::tproxy::rules::v6_interception_available();
+                log::info!("dns: fakeip mode (aaaa={aaaa:?}, v6_intercept={v6_active})");
+                tokio::spawn(lib::dns::serve_client_fakeip(
+                    d,
+                    fake_map.clone(),
+                    aaaa,
+                    v6_active,
+                    connector.clone(),
+                ));
+            }
+            _ => {
+                tokio::spawn(lib::dns::serve_client(d, connector.clone()));
+            }
+        }
     }
 
     // Rules last; removed on exit paths below.

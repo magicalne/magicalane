@@ -2,7 +2,7 @@
 //! mini-origin TCP server <- kcp::listener::Server <- KcpConnector <- raw socks5 client.
 //! Mirrors env/test.sh T1 without containers.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use lib::connector::{Connector, LocalConnector};
 use lib::kcp::{connector::KcpConnector, listener::Server as KcpServer};
@@ -67,7 +67,7 @@ async fn kcp_full_stack() -> anyhow::Result<()> {
     tokio::spawn(async move { server.run().await });
 
     // Connector
-    let mut connector = KcpConnector::new(
+    let connector = KcpConnector::new(
         "localhost".to_string(),
         kcp_port,
         Some(ca_path.clone()),

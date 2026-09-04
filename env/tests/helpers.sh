@@ -68,6 +68,20 @@ ws_running() {
     [ "$($CE exec magicalane-client /usr/local/bin/ws-daemon.sh status 2>/dev/null)" = "running" ]
 }
 
+# Start the ws client with a specific config (e.g. fakeip profile).
+ws_start_cfg() {
+    local cfg="$1"
+    if ws_running; then return 0; fi
+    $CE exec magicalane-client /usr/local/bin/ws-daemon.sh start "$cfg"
+    for _ in $(seq 1 40); do
+        if $CE exec magicalane-client sh -c "ss -ltn | grep -q ':7897 '" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    fail "ws fakeip client did not become ready"
+}
+
 ws_start() {
     if ws_running; then return 0; fi
     $CE exec magicalane-client /usr/local/bin/ws-daemon.sh start

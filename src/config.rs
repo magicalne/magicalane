@@ -139,6 +139,7 @@ pub enum Kind {
         proxy: ProxyConfig,
         socks5_port: u16,
         tproxy: TransparentProxyConfig,
+        routing: Option<RoutingSpec>,
     },
 }
 
@@ -175,6 +176,10 @@ pub struct TransparentProxyConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub dns_port: Option<u16>,
+    /// `"tunnel"` (default) — queries relayed through the tunnel;
+    /// `"fakeip"` — answered locally with fake tokens (see src/dns/fakeip.rs);
+    /// `"off"` — dns_port is ignored.
+    pub dns_mode: Option<String>,
 }
 
 impl TransparentProxyConfig {
@@ -184,4 +189,74 @@ impl TransparentProxyConfig {
     pub fn dns_port(&self) -> u16 {
         self.dns_port.unwrap_or(0)
     }
+    pub fn dns_mode(&self) -> &str {
+        self.dns_mode.as_deref().unwrap_or("tunnel")
+    }
 }
+
+/// Split-routing configuration (`[kind.Client.routing]`).
+///
+/// ```toml
+/// [kind.Client.routing]
+/// default = "proxy"                 # unmatched → proxy | direct
+/// aaaa = "auto"                     # auto | fake | empty (fakeip mode)
+/// direct_dns = "223.5.5.5:53"      # resolver for direct domains
+/// server_ip = "203.0.113.10"       # pin server IP (anti-pollution bootstrap)
+///
+/// [[kind.Client.routing.rule]]
+/// domain_suffix = ["cn", "baidu.com"]
+/// action = "direct"
+/// ```
+#[derive(Debug, Default, Deserialize)]
+pub struct RoutingSpec {
+    /// `"proxy"` (default) or `"direct"` for unmatched connections.
+    pub default: Option<String>,
+    /// AAAA strategy in fakeip mode: `auto` (default) | `fake` | `empty`.
+    pub aaaa: Option<String>,
+    /// Optional explicit resolver for direct-routed domains ("ip:port").
+    pub direct_dns: Option<String>,
+    /// Optional pinned server IP (bootstrapping without plaintext DNS).
+    pub server_ip: Option<String>,
+    /// Ordered rules; first match wins.
+    #[serde(default)]
+    pub rule: Vec<RoutingRule>,
+}
+
+impl RoutingSpec {
+    pub fn default_action(&self) -> RouteAction {
+        match self.default.as_deref() {
+            Some("direct") => RouteAction::Direct,
+            _ => RouteAction::Proxy,
+        }
+    }
+}
+
+/// One routing rule. Omitted fields don't match; a rule with several
+/// match fields creates one matcher per field (each checked in order).
+#[derive(Debug, Default, Deserialize)]
+pub struct RoutingRule {
+    /// Label-aligned suffix: `qq.com` matches `weixin.qq.com`.
+    pub domain_suffix: Option<Vec<String>>,
+    /// Exact domain match (case-insensitive).
+    pub domain: Option<Vec<String>>,
+    /// Real-IP connections in these CIDRs (v4 and v6).
+    pub ip_cidr: Option<Vec<String>>,
+    /// Loyalsoldier/v2ray suffix list file, one domain per line.
+    pub list_file: Option<String>,
+    /// `"proxy"` or `"direct"` (default when omitted: direct).
+    pub action: Option<RouteAction>,
+}
+
+impl RoutingRule {
+    pub fn action_or_direct(&self) -> RouteAction {
+        self.action.unwrap_or(RouteAction::Direct)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteAction {
+    Proxy,
+    Direct,
+}
+

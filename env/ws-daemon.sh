@@ -7,10 +7,11 @@ PIDFILE=/tmp/ws-client.pid
 LOGFILE=/tmp/ws.log
 
 start() {
+    CFG="${1:-/etc/magicalane/client-ws.toml}"
     if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
         exit 0  # already running
     fi
-    setsid magicalane --config /etc/magicalane/client-ws.toml \
+    setsid magicalane --config "$CFG" \
         </dev/null >"$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
 }
@@ -21,11 +22,13 @@ stop() {
         rm -f "$PIDFILE"
     fi
     # fallback: kill by pattern
-    pkill -f client-ws.toml 2>/dev/null
+    pkill -f "client-ws.*toml" 2>/dev/null
 }
 
-case "${1:-start}" in
-    start) start ;;
+SCRIPT_CMD="${1:-start}"
+SCRIPT_CFG="${2:-}"
+case "$SCRIPT_CMD" in
+    start) start "$SCRIPT_CFG" ;;
     stop) stop ;;
     status)
         if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then

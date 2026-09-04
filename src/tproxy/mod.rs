@@ -12,12 +12,47 @@ use std::os::unix::io::FromRawFd;
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
 };
 
 use log::{info, warn};
 use tokio::{net::TcpListener, spawn};
 
-use crate::{connector::Connector, proxy::Proxy, socks5::proto::Addr};
+use crate::{
+    connector::{Connector, DirectConnector},
+    dns::FakeIpMap,
+    proxy::Proxy,
+    routing::{Action, RoutingEngine, Target},
+    socks5::proto::Addr,
+};
+
+/// Everything the transparent TCP path needs to route a connection.
+#[derive(Clone)]
+pub struct TproxyRouter {
+    /// Fake-token map shared with the DNS interceptor.
+    pub fake_map: Arc<FakeIpMap>,
+    /// Split-routing rules.
+    pub routing: Arc<RoutingEngine>,
+    /// Direct-path connector (local resolution, SO_MARK'd sockets).
+    pub direct: DirectConnector,
+}
+
+impl TproxyRouter {
+    /// Resolve an intercepted destination to (final Addr, action).
+    /// Fake tokens map back to their domain before rule evaluation.
+    pub fn route(&self, dst: SocketAddr) -> (Addr, Action) {
+        if let Some(domain) = self.fake_map.lookup(dst.ip()) {
+            info!("tproxy: fake {} -> {domain}", dst.ip());
+            let action = self.routing.decide(Target::Domain(&domain));
+            let addr = Addr::DomainName(domain.into_bytes(), dst.port());
+            (addr, action)
+        } else {
+            let action = self.routing.decide(Target::Ip(dst.ip()));
+            (Addr::SocketAddr(dst), action)
+        }
+    }
+}
+
 
 /// Bind the transparent TCP listener using raw libc syscalls (identical
 /// to the proven isolation test; avoids socket2 abstraction differences).
@@ -57,7 +92,12 @@ pub fn bind(port: u16) -> io::Result<TcpListener> {
 }
 
 /// Serve accepted transparent connections until the listener errors out.
-pub async fn serve<C, IO>(listener: TcpListener, connector: C, bandwidth: usize)
+pub async fn serve<C, IO>(
+    listener: TcpListener,
+    connector: C,
+    router: TproxyRouter,
+    bandwidth: usize,
+)
 where
     C: Connector<Connection = IO> + Send + 'static + Clone,
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -84,9 +124,10 @@ where
                     }
                 };
                 let connector = connector.clone();
+                let router = router.clone();
                 log::info!("tproxy accepted conn, original dst {dst}");
                 spawn(async move {
-                    match relay(stream, dst, connector, bandwidth).await {
+                    match relay(stream, dst, connector, router, bandwidth).await {
                         Ok(()) => log::info!("tproxy relay {dst} done"),
                         Err(err) => log::warn!("tproxy relay {dst} error: {err}"),
                     }
@@ -100,23 +141,94 @@ where
     }
 }
 
+/// Uniform remote for the proxy relay: tunnel stream or direct socket.
+/// (Unpin when IO is — Proxy requires it.)
+pub enum Remote<IO> {
+    Tunnel(IO),
+    Direct(tokio::net::TcpStream),
+}
+
+impl<IO> tokio::io::AsyncRead for Remote<IO>
+where
+    IO: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Remote::Tunnel(inner) => std::pin::Pin::new(inner).poll_read(cx, buf),
+            Remote::Direct(inner) => std::pin::Pin::new(inner).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<IO> tokio::io::AsyncWrite for Remote<IO>
+where
+    IO: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            Remote::Tunnel(inner) => std::pin::Pin::new(inner).poll_write(cx, buf),
+            Remote::Direct(inner) => std::pin::Pin::new(inner).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Remote::Tunnel(inner) => std::pin::Pin::new(inner).poll_flush(cx),
+            Remote::Direct(inner) => std::pin::Pin::new(inner).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Remote::Tunnel(inner) => std::pin::Pin::new(inner).poll_shutdown(cx),
+            Remote::Direct(inner) => std::pin::Pin::new(inner).poll_shutdown(cx),
+        }
+    }
+}
+
 async fn relay<C, IO>(
     client: tokio::net::TcpStream,
     dst: SocketAddr,
     mut connector: C,
+    router: TproxyRouter,
     bandwidth: usize,
 ) -> io::Result<()>
 where
     C: Connector<Connection = IO> + Send + 'static + Clone,
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    log::info!("tproxy relay {dst}: opening tunnel");
-    let addr = Addr::SocketAddr(dst);
-    let tunnel = connector
-        .connect(addr)
-        .await
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    let proxy = Proxy::new(client, tunnel, bandwidth);
+    let (addr, action) = router.route(dst);
+    let proxy = match action {
+        Action::Proxy => {
+            log::info!("tproxy relay {dst}: tunnel via {addr:?}");
+            let tunnel = connector
+                .connect(addr)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Proxy::new(client, Remote::Tunnel(tunnel), bandwidth)
+        }
+        Action::Direct => {
+            log::info!("tproxy relay {dst}: direct via {addr:?}");
+            let mut direct = router.direct.clone();
+            let out = direct
+                .connect(addr)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Proxy::new(client, Remote::Direct(out), bandwidth)
+        }
+    };
     let _ = std::pin::pin!(proxy).await;
     Ok(())
 }

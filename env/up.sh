@@ -124,6 +124,7 @@ ensure_run magicalane-client \
     -e RUST_LOG=info \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws.toml:/etc/magicalane/client-ws.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-ws-fakeip.toml:/etc/magicalane/client-ws-fakeip.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 

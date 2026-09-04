@@ -1,0 +1,11 @@
+# Workstation-mode client with FAKE-IP DNS + split routing.
+# Second instance config: magicalane --config client-ws-fakeip.toml
+#
+# - DNS: answered locally from the fake map (dns_mode = "fakeip")
+# - Routing: `origin` suffix → DIRECT (real local resolution + direct
+#   connect, origin sees the CLIENT ip); everything else → tunnel
+#   (server-side resolution, testsvc sees the SERVER ip).
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp" }, socks5_port = 1082, tproxy = { mode = "tproxy", tcp_port = 7897, udp_port = 7898, dns_port = 15355, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", rule = [ { domain_suffix = [ "origin" ], action = "direct" } ] } } }

@@ -73,8 +73,10 @@ ws_start_cfg() {
     local cfg="$1"
     if ws_running; then return 0; fi
     $CE exec magicalane-client /usr/local/bin/ws-daemon.sh start "$cfg"
+    # Wait for listeners AND the nat rules: the listener binds before
+    # the rules apply, and a racing query would leak past the interceptor.
     for _ in $(seq 1 40); do
-        if $CE exec magicalane-client sh -c "ss -ltn | grep -q ':7897 '" >/dev/null 2>&1; then
+        if $CE exec magicalane-client sh -c "ss -ltn | grep -q ':7897 ' && iptables -t nat -n -L MGL-NAT >/dev/null 2>&1" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5

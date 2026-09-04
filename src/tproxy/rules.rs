@@ -303,8 +303,7 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         teardown(spec);
     })?;
     // v6 mirror (best effort; installed iff the host has usable v6).
-    let v6 = v6_available();
-    if v6 {
+    if v6_available() {
         if let Err(err) = apply_v6(spec) {
             warn!("v6 plane skipped: {err}");
             teardown_v6();
@@ -320,6 +319,7 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
 
 /// Remove exactly what we added. Idempotent; safe on a clean system.
 pub fn teardown(_spec: &RuleSpec) {
+    let _t0 = std::time::Instant::now();
     // Nuclear fallback: if iptables-nft reports chain incompatibility
     // (stale state from a different iptables API version), flush the
     // entire ruleset. In containers/dedicated systems this is safe.
@@ -359,22 +359,19 @@ pub fn teardown(_spec: &RuleSpec) {
         );
     }
     run_ok("ip", &["route", "flush", "table", &TABLE.to_string()]);
+    info!("v4 teardown took {:?}", _t0.elapsed());
+    let _t1 = std::time::Instant::now();
     teardown_v6();
-    info!("tproxy rules removed");
-}
-
-/// Whether our chains currently exist (stale-state detection helper).
-pub fn is_installed() -> bool {
-    run("iptables", &["-t", "mangle", "-n", "-L", CHAIN_OUT]).is_ok()
-}
-
-// keep warn import used when compiled without logging side effects
-#[allow(dead_code)]
-fn _warn_placeholder() {
-    warn!("unused");
+    info!("tproxy rules removed (v6 {:?})", _t1.elapsed());
 }
 
 // ---------------------------------------------------------------- v6 plane
+
+/// Whether the v6 plane SHOULD be attempted (pre-apply capability probe;
+/// used to decide listener binding before rules exist).
+pub fn v6_plane_wanted() -> bool {
+    v6_available()
+}
 
 /// Host capability: a GLOBAL v6 route (not just link-local) and the
 /// ip6tools present. Does NOT mean the mirror is installed — see
@@ -388,19 +385,13 @@ fn v6_available() -> bool {
 }
 
 /// Whether the MGL6 mirror is ACTUALLY installed right now. This is the
-/// truth source for the fake-AAAA "auto" strategy: tokens are only
-/// handed out when the interception plane can catch them.
+/// truth source for the fake-AAAA "auto" strategy.
 pub fn v6_installed() -> bool {
     run("ip6tables", &["-t", "mangle", "-n", "-L", CHAIN6_OUT]).is_ok()
 }
 
-/// Install the v6 mirror of the v4 rules (workstation mode):
-///   nat    MGL6-NAT  — REDIRECT local v6 TCP + udp/53
-///   mangle MGL6-OUT  — mark local UDP (except our own / direct-marked)
-///   mangle MGL6-PRE  — TPROXY marked UDP on lo (+ gateway mirror)
-/// plus policy routing (fwmark -> table -> local ::/0 dev lo).
+/// Install the v6 mirror of the v4 rules (workstation mode).
 fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
-    // policy routing
     run(
         "ip",
         &[
@@ -416,8 +407,6 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         ],
     )?;
 
-    // nat: REDIRECT local v6 TCP to the transparent v6 listener, and
-    // udp/53 to the v6 DNS listener.
     let mut nat = String::new();
     nat.push_str("*nat\n");
     nat.push_str(&format!(":{CHAIN6_NAT} - [0:0]\n"));
@@ -442,7 +431,6 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     nat.push_str(&format!("-A OUTPUT -j {CHAIN6_NAT}\n"));
     nat.push_str("COMMIT\n");
 
-    // mangle: TPROXY for local v6 UDP (REDIRECT can't carry orig dst).
     let mut blob = String::new();
     blob.push_str("*mangle\n");
     blob.push_str(&format!(":{CHAIN6_OUT} - [0:0]\n"));
@@ -464,12 +452,12 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             ));
         }
         blob.push_str(&format!(
-            "-A {CHAIN6_OUT} -p udp --sport {} -j RETURN\n", spec.udp_port
+            "-A {CHAIN6_OUT} -p udp --sport {} -j RETURN\n", spec.udp_port + 1
         ));
         blob.push_str(&format!("-A {CHAIN6_OUT} -p udp -j MARK --set-mark {MARK}\n"));
         blob.push_str(&format!(
             "-A {CHAIN6_PRE} -i lo -p udp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
-            spec.udp_port
+            spec.udp_port + 1
         ));
     }
     if spec.gateway {
@@ -482,7 +470,7 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             blob.push_str(&format!("-A {CHAIN6_PRE} ! -i lo -p udp -j MARK --set-mark {MARK}\n"));
             blob.push_str(&format!(
                 "-A {CHAIN6_PRE} ! -i lo -p udp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
-                spec.udp_port
+                spec.udp_port + 1
             ));
         }
     }
@@ -498,6 +486,7 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
 
 /// Remove the v6 plane. Idempotent.
 pub fn teardown_v6() {
+    let _t0 = std::time::Instant::now();
     if !std::path::Path::new("/usr/sbin/ip6tables").exists() {
         return;
     }
@@ -522,4 +511,26 @@ pub fn teardown_v6() {
         );
     }
     run_ok("ip", &["-6", "route", "flush", "table", &TABLE.to_string()]);
+    log::info!("v6 teardown took {:?}", _t0.elapsed());
+}
+
+/// Whether our chains currently exist (stale-state detection helper).
+pub fn is_installed() -> bool {
+    run("iptables", &["-t", "mangle", "-n", "-L", CHAIN_OUT]).is_ok()
+}
+
+// keep warn import used when compiled without logging side effects
+#[allow(dead_code)]
+fn _warn_placeholder() {
+    warn!("unused");
+}
+
+/// Whether this host has usable IPv6 (route + ip6tables). Drives the
+/// fake-AAAA "auto" strategy: v6 tokens are only handed out when the
+/// interception plane can actually catch them.
+pub fn v6_interception_available() -> bool {
+    // CP3 installs the MGL6 mirror; until then fake-AAAA must stay off
+    // (tokens without interception would blackhole apps). Once the
+    // mirror exists, extend with: global v6 route + ip6tables present.
+    false
 }

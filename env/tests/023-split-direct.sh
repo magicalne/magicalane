@@ -51,7 +51,10 @@ case "$result" in
     *) fail "split: direct fetch via token failed: $result" ;;
 esac
 
-peer="$($CE logs --since 2m magicalane-origin 2>&1 | grep 'GET /fixtures/hostname' | tail -1 | grep -oE '^([0-9]+\.){3}[0-9]+' || true)"
+# Peer may log as plain v4 or v4-mapped v6 (::ffff:10.x) — origin binds ::
+logline="$($CE logs --since 2m magicalane-origin 2>&1 | grep 'GET /fixtures/hostname' | tail -1)"
+peer="$(echo "$logline" | grep -oE '::ffff:([0-9]+\.){3}[0-9]+' | sed 's/::ffff://' )"
+[ -n "$peer" ] || peer="$(echo "$logline" | grep -oE '^([0-9]+\.){3}[0-9]+')"
 [ -n "$peer" ] || fail "split: no access-log entry for the direct fetch"
 assert_eq "$peer" "$CLIENT_NET_IP" "split: origin saw CLIENT ip (direct, not tunneled)"
 
@@ -61,6 +64,8 @@ assert_eq "$peer" "$CLIENT_NET_IP" "split: origin saw CLIENT ip (direct, not tun
 ws_start
 exec_c curl -fsS --max-time 10 http://origin/fixtures/hello.txt >/dev/null 2>&1
 ws_stop
-peer2="$($CE logs --since 2m magicalane-origin 2>&1 | grep 'GET /fixtures/hello.txt' | tail -1 | grep -oE '^([0-9]+\.){3}[0-9]+' || true)"
+logline2="$($CE logs --since 2m magicalane-origin 2>&1 | grep 'GET /fixtures/hello.txt' | tail -1)"
+peer2="$(echo "$logline2" | grep -oE '::ffff:([0-9]+\.){3}[0-9]+' | sed 's/::ffff://')"
+[ -n "$peer2" ] || peer2="$(echo "$logline2" | grep -oE '^([0-9]+\.){3}[0-9]+')"
 [ -n "$peer2" ] || fail "split: no access-log entry for the tunneled fetch"
 assert_eq "$peer2" "$SERVER_NET_IP" "split: plain config tunnels (origin saw SERVER ip)"

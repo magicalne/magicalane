@@ -30,7 +30,12 @@ use tokio::{
     sync::mpsc,
 };
 
-use crate::connector::Connector;
+use crate::{
+    connector::{Connector, DirectConnector},
+    dns::FakeIpMap,
+    routing::{Action, RoutingEngine, Target},
+    socks5::proto::Addr,
+};
 
 pub const UDP_MAGIC_HOST: &[u8] = b"magicalane-udp";
 pub const UDP_MAGIC_PORT: u16 = 1;
@@ -161,8 +166,13 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
 }
 
 /// v6 sibling of `bind_client` (IPV6_TRANSPARENT + IPV6_RECVORIGDSTADDR,
-/// v6-only socket so v4 traffic keeps using the v4 interceptor).
+/// v6-only socket so v4 traffic keeps using the v4 interceptor). Listens
+/// on port+1: two REUSEADDR sockets on the same wildcard port confuse
+/// the kernel's TPROXY socket lookup.
 pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
+    // Listen on port+1: two REUSEADDR sockets on the same wildcard port
+    // break the kernel TPROXY socket lookup (packets queue silently).
+    let port = port + 1;
     const IPV6_TRANSPARENT: libc::c_int = 72;
     const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
     let socket = socket2::Socket::new(
@@ -201,10 +211,15 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
 
 impl UdpInterceptor {
     async fn recv_one(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+        use tokio::io::Interest;
         loop {
             self.sock.readable().await?;
             let fd = self.sock.as_raw_fd();
-            match recvmsg_origdst(fd, buf) {
+            // try_io clears the readiness flag when the raw recvmsg
+            // reports WouldBlock — a bare readable()+recvmsg loop spins
+            // forever on stale readiness (TPROXY sockets especially).
+            let sock = &*self.sock;
+            match sock.try_io(Interest::READABLE, || recvmsg_origdst(fd, buf)) {
                 Ok(v) => return Ok(v),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(err) => return Err(err),
@@ -213,8 +228,16 @@ impl UdpInterceptor {
     }
 }
 
+/// Everything the UDP path needs to route a datagram flow.
+#[derive(Clone)]
+pub struct UdpRouter {
+    pub fake_map: Arc<FakeIpMap>,
+    pub routing: Arc<RoutingEngine>,
+    pub direct: DirectConnector,
+}
+
 /// Serve intercepted UDP until the socket dies.
-pub async fn serve_client<C, IO>(interceptor: Arc<UdpInterceptor>, connector: C)
+pub async fn serve_client<C, IO>(interceptor: Arc<UdpInterceptor>, connector: C, router: UdpRouter)
 where
     C: Connector<Connection = IO> + Send + 'static + Clone,
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -265,7 +288,8 @@ where
                     let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
                     let connector = connector.clone();
                     let sock = sock.clone();
-                    tokio::spawn(flow_task(key, rx, connector, sock));
+                    let router = router.clone();
+                    tokio::spawn(flow_task(key, rx, connector, sock, router));
                     flows.insert(key, tx.clone());
                     tx
                 }
@@ -281,6 +305,109 @@ where
 
 async fn flow_task<C, IO>(
     key: (SocketAddr, SocketAddr),
+    rx: mpsc::Receiver<Vec<u8>>,
+    connector: C,
+    sock: Arc<UdpSocket>,
+    router: UdpRouter,
+) where
+    C: Connector<Connection = IO> + Send + 'static + Clone,
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (src, dst) = key;
+    // Fake tokens map back to domains; then the rules decide the path.
+    let (target, action) = if let Some(domain) = router.fake_map.lookup(dst.ip()) {
+        debug!("udp: fake {} -> {domain}", dst.ip());
+        let action = router.routing.decide(Target::Domain(&domain));
+        (Addr::DomainName(domain.into_bytes(), dst.port()), action)
+    } else {
+        let action = router.routing.decide(Target::Ip(dst.ip()));
+        (Addr::SocketAddr(dst), action)
+    };
+
+    match action {
+        Action::Direct => {
+            udp_direct_flow(src, dst, target, rx, sock, router.direct).await;
+        }
+        Action::Proxy => {
+            udp_tunnel_flow(src, dst, target, rx, connector, sock).await;
+        }
+    }
+}
+
+/// Direct path: resolve locally (marked probe) + a marked UDP socket,
+/// relaying datagrams without touching the tunnel.
+async fn udp_direct_flow(
+    src: SocketAddr,
+    dst: SocketAddr,
+    target: Addr,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    sock: Arc<UdpSocket>,
+    direct: DirectConnector,
+) {
+    let addrs: Vec<SocketAddr> = match &target {
+        Addr::SocketAddr(a) => vec![*a],
+        Addr::DomainName(host, port) => {
+            let host = String::from_utf8_lossy(host).into_owned();
+            match direct.resolve(&host, *port).await {
+                Ok(a) => a.into_iter().map(|a| SocketAddr::new(a.ip(), *port)).collect(),
+                Err(err) => {
+                    debug!("udp direct {host} resolve failed: {err}");
+                    return;
+                }
+            }
+        }
+    };
+    let first = match addrs.first() {
+        Some(a) => *a,
+        None => return,
+    };
+    let bind: SocketAddr = if first.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    // Marked socket: the interception rules must pass direct UDP.
+    let out = match crate::connector::udp_socket_marked(bind).await {
+        Ok(s) => s,
+        Err(err) => {
+            debug!("udp direct bind failed: {err}");
+            return;
+        }
+    };
+    if let Err(err) = out.connect(first).await {
+        debug!("udp direct connect {first} failed: {err}");
+        return;
+    }
+    debug!("udp flow {dst}: direct via {first}");
+
+    let mut recv_buf = vec![0u8; 65536];
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                let Some(dg) = maybe else { break };
+                if out.send(&dg).await.is_err() {
+                    break;
+                }
+            }
+            read = out.recv(&mut recv_buf) => {
+                match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = sock.send_to(&recv_buf[..n], src).await;
+                    }
+                }
+            }
+        }
+    }
+    debug!("udp direct flow {src} -> {dst} ended");
+}
+
+/// Tunnel path: unchanged framing, but the destination frame can be a
+/// domain (the server resolves it server-side).
+async fn udp_tunnel_flow<C, IO>(
+    src: SocketAddr,
+    dst: SocketAddr,
+    target: Addr,
     mut rx: mpsc::Receiver<Vec<u8>>,
     mut connector: C,
     sock: Arc<UdpSocket>,
@@ -288,7 +415,6 @@ async fn flow_task<C, IO>(
     C: Connector<Connection = IO> + Send + 'static + Clone,
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (src, dst) = key;
     let mut stream = match connector.connect(magic_addr()).await {
         Ok(s) => s,
         Err(err) => {
@@ -296,8 +422,13 @@ async fn flow_task<C, IO>(
             return;
         }
     };
-    // first frame: destination as ascii
-    let dst_ascii = format!("{dst}");
+    // first frame: destination as ascii (ip:port or domain:port)
+    let dst_ascii = match &target {
+        Addr::SocketAddr(a) => format!("{a}"),
+        Addr::DomainName(host, port) => {
+            format!("{}:{port}", String::from_utf8_lossy(host))
+        }
+    };
     let mut hello = Vec::with_capacity(2 + dst_ascii.len());
     hello.put_u16(dst_ascii.len() as u16);
     hello.extend_from_slice(dst_ascii.as_bytes());
@@ -352,6 +483,8 @@ pub struct UdpFramedStream {
     /// datagrams to send upstream (populated by poll_write, drained in poll_flush)
     outq: Vec<Vec<u8>>,
     read_pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
+    /// Domain dst being resolved (fake-IP flows carry domains).
+    pending_resolve: Option<tokio::task::JoinHandle<io::Result<SocketAddr>>>,
 }
 
 impl UdpFramedStream {
@@ -363,6 +496,7 @@ impl UdpFramedStream {
             sock: None,
             outq: Vec::new(),
             read_pending: None,
+            pending_resolve: None,
         }
     }
 
@@ -376,7 +510,7 @@ impl UdpFramedStream {
             let mut frame = self.wbuf.split_to(2 + len);
             frame.advance(2);
             let payload = frame.to_vec();
-            if self.dst.is_none() {
+            if self.dst.is_none() && self.pending_resolve.is_none() {
                 let text = String::from_utf8_lossy(&payload).to_string();
                 match text.parse::<SocketAddr>() {
                     Ok(a) => {
@@ -384,12 +518,40 @@ impl UdpFramedStream {
                         info!("udp relay flow to {a}");
                     }
                     Err(_) => {
-                        warn!("udp relay: bad dst frame {text:?}");
-                        return;
+                        // domain:port — resolve server-side; datagrams
+                        // arriving meanwhile stay buffered in outq.
+                        info!("udp relay flow to {text} (resolving)");
+                        self.pending_resolve = Some(tokio::spawn(async move {
+                            let addr = tokio::net::lookup_host(&text)
+                                .await
+                                .map_err(|e| io::Error::other(e.to_string()))?
+                                .next()
+                                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addr"))?;
+                            Ok(addr)
+                        }));
                     }
                 }
             } else if payload.len() <= MAX_DGRAM {
                 self.outq.push(payload);
+            }
+        }
+    }
+
+    /// Poll a pending domain resolution to completion.
+    fn poll_resolve(&mut self, cx: &mut Context<'_>) {
+        if let Some(handle) = self.pending_resolve.as_mut() {
+            if let std::task::Poll::Ready(res) =
+                std::future::Future::poll(std::pin::Pin::new(handle), cx)
+            {
+                self.pending_resolve = None;
+                match res {
+                    Ok(Ok(a)) => {
+                        info!("udp relay domain resolved: {a}");
+                        self.dst = Some(a);
+                    }
+                    Ok(Err(e)) => warn!("udp relay domain resolve failed: {e}"),
+                    Err(e) => warn!("udp relay resolve task: {e}"),
+                }
             }
         }
     }
@@ -445,6 +607,7 @@ impl AsyncRead for UdpFramedStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         self.drain_wbuf();
+        self.poll_resolve(cx);
         if let Err(e) = self.flush_outq(cx) {
             return Poll::Ready(Err(e));
         }
@@ -464,6 +627,13 @@ impl AsyncRead for UdpFramedStream {
                     Ok(s) => s,
                     Err(e) => return Poll::Ready(Err(e)),
                 };
+                // The socket just came into existence (possibly after an
+                // async dst resolution): flush anything buffered in outq
+                // NOW or single-datagram flows deadlock (the top-level
+                // flush ran before bind, and no further writes may come).
+                if let Err(e) = self.flush_outq(cx) {
+                    return Poll::Ready(Err(e));
+                }
                 self.read_pending = Some(tokio::spawn(async move {
                     let mut b = vec![0u8; 65536];
                     let (n, _) = tokio::time::timeout(FLOW_IDLE, sock.recv_from(&mut b))
@@ -517,6 +687,7 @@ impl AsyncWrite for UdpFramedStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.drain_wbuf();
+        this.poll_resolve(cx);
         match this.flush_outq(cx) {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => Poll::Pending,

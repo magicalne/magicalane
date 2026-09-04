@@ -47,8 +47,8 @@ async fn start_with_config(config: Config) -> Result<()> {
                 tcp_port: tproxy.tcp_port,
                 udp_port: tproxy.udp_port,
                 dns_port: tproxy.dns_port(),
-                server_ip6: None,
-            });
+                                server_ip6: None,
+                            });
         }
     }
 
@@ -205,21 +205,25 @@ where
         routing_cfg.default_action(), routing_cfg.rule.len());
 
     // Transparent listeners must exist BEFORE rules are installed.
-    // v6 siblings bind best-effort (hosts without v6 degrade to v4).
     let tcp_listener = match mode {
         TproxyMode::Tproxy => Some(lib::tproxy::bind(tproxy.tcp_port)?),
         _ => None,
     };
     let tcp6_listener = match mode {
-        TproxyMode::Tproxy => lib::tproxy::bind6(tproxy.tcp_port).ok(),
+        TproxyMode::Tproxy if lib::tproxy::rules::v6_plane_wanted() => lib::tproxy::bind6(tproxy.tcp_port).ok(),
         _ => None,
     };
     let udp_interceptor = match mode {
         TproxyMode::Tproxy => Some(lib::udp::bind_client(tproxy.udp_port)?),
         _ => None,
     };
+    // v6 UDP interceptor ONLY when the v6 plane will install: a second
+    // REUSEADDR wildcard socket breaks v4 TPROXY delivery on this
+    // kernel/podman combination (packets queue without waking tokio).
     let udp6_interceptor = match mode {
-        TproxyMode::Tproxy => lib::udp::bind_client_v6(tproxy.udp_port).ok(),
+        TproxyMode::Tproxy if lib::tproxy::rules::v6_plane_wanted() => {
+            lib::udp::bind_client_v6(tproxy.udp_port).ok()
+        }
         _ => None,
     };
 
@@ -245,7 +249,9 @@ where
         _ => None,
     };
     let dns6_sock = match (mode, tproxy.dns_port()) {
-        (TproxyMode::Tproxy, p) if p != 0 => lib::dns::bind_client_v6(p).ok(),
+        (TproxyMode::Tproxy, p) if p != 0 && lib::tproxy::rules::v6_plane_wanted() => {
+            lib::dns::bind_client_v6(p).ok()
+        }
         _ => None,
     };
 
@@ -260,11 +266,16 @@ where
     if let Some(l6) = tcp6_listener {
         tokio::spawn(lib::tproxy::serve6(l6, connector.clone(), router.clone(), bandwidth));
     }
+    let udp_router = lib::udp::UdpRouter {
+        fake_map: fake_map.clone(),
+        routing: router.routing.clone(),
+        direct: router.direct.clone(),
+    };
     if let Some(u) = udp_interceptor {
-        tokio::spawn(lib::udp::serve_client(u, connector.clone()));
+        tokio::spawn(lib::udp::serve_client(u, connector.clone(), udp_router.clone()));
     }
     if let Some(u6) = udp6_interceptor {
-        tokio::spawn(lib::udp::serve_client(u6, connector.clone()));
+        tokio::spawn(lib::udp::serve_client(u6, connector.clone(), udp_router.clone()));
     }
 
     // Rules last; removed on exit paths below.
@@ -339,8 +350,8 @@ where
                     tcp_port: tproxy.tcp_port,
                     udp_port: tproxy.udp_port,
                     dns_port: tproxy.dns_port(),
-                    server_ip6: None,
-                });
+                                        server_ip6: None,
+                                    });
             }
             anyhow::bail!("socks server exited: {r:?}");
         }
@@ -353,8 +364,8 @@ where
             tcp_port: tproxy.tcp_port,
             udp_port: tproxy.udp_port,
             dns_port: tproxy.dns_port(),
-            server_ip6: None,
-        });
+                        server_ip6: None,
+                    });
     }
     std::process::exit(0);
 }

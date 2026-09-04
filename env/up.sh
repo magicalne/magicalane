@@ -23,6 +23,7 @@ CLIENT_CONFIG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --ipv6) IPV6=1 ;;
+        --profile) : ;;
         tproxy) PROFILE="tproxy" ;;
         --transport) TRANSPORT="$2"; shift ;;
         quic|kcp|kcp-plain) TRANSPORT="$1" ;;

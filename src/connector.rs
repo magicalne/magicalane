@@ -68,7 +68,7 @@ impl DirectConnector {
     /// then name+search suffix until an answer). NEVER falls back to
     /// plain getaddrinfo: an unmarked query would be answered by our
     /// own fake-IP layer and blackhole the direct path.
-    async fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+    pub async fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
         let resolver = self
             .effective_resolver()
             .ok_or_else(|| io::Error::other("direct: no resolver available"))?;
@@ -253,7 +253,7 @@ async fn resolve_name_via(host: &str, resolver: std::net::SocketAddr) -> io::Res
 }
 
 /// Marked UDP socket (SO_MARK_DIRECT) for direct-path DNS probes.
-async fn udp_socket_marked(bind: std::net::SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+pub async fn udp_socket_marked(bind: std::net::SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = match bind {
         std::net::SocketAddr::V4(_) => Domain::IPV4,

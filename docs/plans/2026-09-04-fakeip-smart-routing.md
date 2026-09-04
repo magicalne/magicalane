@@ -269,25 +269,25 @@ tricks can't leak; bootstrapping no longer depends on plaintext DNS.
 
 ## Files touched
 
-- [ ] `src/dns/fakeip.rs` (new)
-- [ ] `src/dns/proto.rs` (new)
-- [ ] `src/dns/mod.rs` (fakeip mode)
-- [ ] `src/routing/mod.rs` (new)
-- [ ] `src/connector.rs` (DirectConnector + SO_MARK)
-- [ ] `src/tproxy/mod.rs` (dispatch + v6 listeners)
-- [ ] `src/tproxy/rules.rs` (mark exclusion + ip6tables mirror + v6 routes)
-- [ ] `src/udp/mod.rs` (fake dst routing + direct UDP)
-- [ ] `src/config.rs` (routing config)
-- [ ] `src/main.rs` (wiring)
-- [ ] `src/lib.rs` (module exports)
-- [ ] `env/up.sh` / `env/down.sh` (dual-stack network)
-- [ ] `env/fixtures/china-list.txt` (new fixture)
-- [ ] `env/configs/*` (routing sections)
-- [ ] `env/tests/022-fakeip-a.sh` … `027-hardcoded-dns-udp.sh` (6 new)
-- [ ] `env/tests/018-tproxy-ws-dns.sh` (update expectations)
-- [ ] `env/verify.sh` (register new tests + v6 profile)
-- [ ] `env/bench.sh` (fakeip profile)
-- [ ] `README.md`, `AGENTS.md`
+- [x] `src/dns/fakeip.rs` (new)
+- [x] `src/dns/proto.rs` (new)
+- [x] `src/dns/mod.rs` (fakeip mode)
+- [x] `src/routing/mod.rs` (new)
+- [x] `src/connector.rs` (DirectConnector + SO_MARK)
+- [x] `src/tproxy/mod.rs` (dispatch + v6 listeners)
+- [x] `src/tproxy/rules.rs` (mark exclusion + ip6tables mirror + v6 routes)
+- [x] `src/udp/mod.rs` (fake dst routing + direct UDP)
+- [x] `src/config.rs` (routing config)
+- [x] `src/main.rs` (wiring)
+- [x] `src/lib.rs` (module exports)
+- [x] `env/up.sh` / `env/down.sh` (dual-stack network)
+- [x] `env/fixtures/china-list.txt` (new fixture)
+- [x] `env/configs/*` (routing sections)
+- [x] `env/tests/022-fakeip-a.sh` … `027-hardcoded-dns-udp.sh` (6 new)
+- [x] `env/tests/018-tproxy-ws-dns.sh` (update expectations)
+- [x] `env/verify.sh` (register new tests + v6 profile)
+- [x] `env/bench.sh` (fakeip profile)
+- [x] `README.md`, `AGENTS.md`
 
 ## Risks & mitigations
 
@@ -337,16 +337,16 @@ tricks can't leak; bootstrapping no longer depends on plaintext DNS.
 
 ## Acceptance criteria (mirrors checkpoints; each independently verifiable)
 
-- [ ] `getent hosts <tunneled-domain>` returns 198.18.0.0/15 in <50ms; connection works
-- [ ] `dig AAAA <tunneled-domain>` returns fc00::/18 (dual-stack env, `aaaa=auto/fake`)
-- [ ] Direct-suffix fetch shows client egress; tunneled fetch shows server egress
-- [ ] Direct-path resolution does NOT use the tunnel (no dns magic-addr traffic)
-- [ ] Literal v6 connection is intercepted (server-side egress proof) — no leak
-- [ ] `iptables -S` + `ip6tables -S` after kill -9: zero MGL/MGL6 chains; no mark rules
-- [ ] `env/verify.sh full` green: 26 existing (018 adapted) + 6 new, ×3 consecutive runs
-- [ ] `cargo test` green incl. new unit tests; `cargo clippy` 0 warnings
-- [ ] Bench: DNS p50 <1ms local; connect p50 <2ms (QUIC) via fake path
-- [ ] README + AGENTS.md document routing config and dual-stack env usage
+- [x] `getent hosts <tunneled-domain>` returns 198.18.0.0/15 in <50ms; connection works
+- [x] `dig AAAA <tunneled-domain>` returns fc00::/18 (dual-stack env, `aaaa=auto/fake`)
+- [x] Direct-suffix fetch shows client egress; tunneled fetch shows server egress
+- [x] Direct-path resolution does NOT use the tunnel (no dns magic-addr traffic)
+- [x] Literal v6 connection is intercepted (server-side egress proof) — no leak
+- [x] `iptables -S` + `ip6tables -S` after kill -9: zero MGL/MGL6 chains; no mark rules
+- [x] `env/verify.sh full` green: 26 existing (018 adapted) + 6 new, ×3 consecutive runs
+- [x] `cargo test` green incl. new unit tests; `cargo clippy` 0 warnings
+- [x] Bench: DNS p50 <1ms local; connect p50 <2ms (QUIC) via fake path
+- [x] README + AGENTS.md document routing config and dual-stack env usage
 
 
 ## Results (final)

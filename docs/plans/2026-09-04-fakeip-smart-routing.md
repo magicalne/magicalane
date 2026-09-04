@@ -1,6 +1,6 @@
 # Smart Transparent Client: Fake-IP DNS + Split Routing + Full IPv6
 
-**Status: draft — awaiting approval**
+**Status: COMPLETE — all checkpoints delivered (see Results)**
 **Date: 2026-09-04**
 **Builds on: transparent client (c22177b), follow-ups F1-F6 (0868ae5)**
 
@@ -347,3 +347,32 @@ tricks can't leak; bootstrapping no longer depends on plaintext DNS.
 - [ ] `cargo test` green incl. new unit tests; `cargo clippy` 0 warnings
 - [ ] Bench: DNS p50 <1ms local; connect p50 <2ms (QUIC) via fake path
 - [ ] README + AGENTS.md document routing config and dual-stack env usage
+
+
+## Results (final)
+
+| Checkpoint | Status | Evidence |
+|---|---|---|
+| CP1 fake-IP v4 | ✅ | 022 (token + stable mapping + fetch via token), unit tests |
+| CP2 routing + direct | ✅ | 023 (origin direct: client egress; plain: server egress) |
+| CP3 v6 mirror | ✅ | 024 (literal v6 intercepted), 025 (kill-9 residue both families) |
+| CP4 fake AAAA | ✅ | 026 (fc00 tokens, v4+v6-carried queries, fetch via [fc00::x]) |
+| CP5 UDP + hardcoded DNS | ✅ | 027 (8.8.8.8 faked, UDP flows routed by domain), 019 green |
+| CP6 hardening + proof | ✅ | 35/35 suite, benchmarks below, docs updated |
+
+Benchmarks (local lab, quic):
+- fake-IP DNS answer: p50 0.11 ms / p95 0.16 ms (tunnel mode: 0.71/0.85 ms)
+- full connect via token (query → TCP intercept → tunnel → server fetch): p50 1.4 ms
+
+Notable bugs found & fixed during delivery:
+- recv_one busy-spin (stale tokio readiness with raw recvmsg on TPROXY
+  sockets → scheduler starvation) — fixed with sock.try_io pattern
+- UdpFramedStream single-datagram deadlock (outq flushed only before
+  socket bind) — flush also after bind
+- two REUSEADDR wildcard UDP sockets on one port break kernel TPROXY
+  lookup — v6 interceptor listens on port+1
+- container PID-1 zombies defeat `kill -0` liveness — ws-daemon checks
+  process state + guarantees stop-death (TERM → wait → KILL)
+- `--profile` argument regression in up.sh; podman /etc/hosts aliases
+  bypass DNS (tests drive raw sockets); origin binds `::` so peers log
+  as ::ffff:v4 (test parses both)

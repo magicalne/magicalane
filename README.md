@@ -27,3 +27,39 @@ kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca
 ```
 
 Then start each with `magicalane --config <file>`; the client serves SOCKS5 on `socks5_port`.
+
+## Transparent mode + fake-IP DNS + split routing
+
+Set `tproxy.mode = "tproxy"` for transparent interception (all TCP/UDP,
+both IPv4 and IPv6, firewall-based; routes/rules are transactional —
+removed on any exit, adopted from crashes on restart).
+
+With `dns_mode = "fakeip"`, DNS is answered LOCALLY with tokens
+(198.18.0.0/15 for A, fc00::/18 for AAAA): no real query ever crosses
+your network, so DNS pollution is impossible by construction.
+Connections to tokens are mapped back to their domain at connect time
+and routed by rules — for example China domains direct, everything
+else through the tunnel (direct connections resolve locally, getting
+correct in-country CDN answers):
+
+```toml
+kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca.pem", protocol = "quic" }, socks5_port = 1080,
+  tproxy = { mode = "tproxy", tcp_port = 7895, udp_port = 7896, dns_port = 15353, dns_mode = "fakeip" },
+  routing = { default = "proxy", aaaa = "auto",
+    rule = [ { domain_suffix = [ "cn", "baidu.com", "qq.com" ], action = "direct" },
+              { ip_cidr = [ "192.168.0.0/16", "10.0.0.0/8" ], action = "direct" },
+              { list_file = "/etc/magicalane/china-list.txt", action = "direct" } ] } } }
+```
+
+- Rules evaluate top-to-bottom, first match wins; `default` catches the rest.
+- `list_file` loads Loyalsoldier/v2ray-format domain lists (one domain
+  per line, `#` comments, optional `domain:`/`full:` prefixes).
+- `aaaa = "auto"` hands out fc00::/18 tokens only when the IPv6
+  interception plane is actually installed (dual-stack hosts).
+- Hardcoded resolvers (8.8.8.8) can't bypass: the udp/53 redirect is
+  destination-agnostic.
+- UDP (incl. QUIC/HTTP3-style flows) routes by the same rules; tunnel
+  destinations are resolved server-side.
+
+Measured (local lab): fake-IP answers p50 ≈ 0.11 ms; full connect via
+token p50 ≈ 1.4 ms.

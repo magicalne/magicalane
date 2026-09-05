@@ -217,6 +217,9 @@ pub struct RoutingSpec {
     pub direct_dns: Option<String>,
     /// Optional pinned server IP (bootstrapping without plaintext DNS).
     pub server_ip: Option<String>,
+    /// Directory holding per-country CIDR lists for `geoip` rules
+    /// (default "/etc/magicalane/geoip"; `geoip = "cn"` loads cn.txt).
+    pub geoip_dir: Option<String>,
     /// Ordered rules; first match wins.
     #[serde(default)]
     pub rule: Vec<RoutingRule>,
@@ -242,7 +245,13 @@ pub struct RoutingRule {
     /// Real-IP connections in these CIDRs (v4 and v6).
     pub ip_cidr: Option<Vec<String>>,
     /// Loyalsoldier/v2ray suffix list file, one domain per line.
+    /// Lines containing `/` are parsed as CIDRs, so one file may mix
+    /// domains and IP ranges (auto-detected per line).
     pub list_file: Option<String>,
+    /// Country code rule (`geoip = "cn"`): loads `<geoip_dir>/<cc>.txt`
+    /// (plain CIDR list, chnroutes2/gaoyifan format). Matches real-IP
+    /// connections; inert with a warning if the file is missing.
+    pub geoip: Option<String>,
     /// `"proxy"` or `"direct"` (default when omitted: direct).
     pub action: Option<RouteAction>,
 }

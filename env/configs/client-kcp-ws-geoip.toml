@@ -1,0 +1,7 @@
+# Workstation fakeip client with GEOIP routing (A+B combined):
+# domains via suffix rules, real-IP connections via geoip = "cn"
+# (loads /tmp/geoip/cn.txt — plain CIDR list, chnroutes2 format).
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp" }, socks5_port = 1083, tproxy = { mode = "tproxy", tcp_port = 7899, udp_port = 7900, dns_port = 15357, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", geoip_dir = "/tmp/geoip", rule = [ { geoip = "cn", action = "direct" } ] } } }

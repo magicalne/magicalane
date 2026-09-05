@@ -53,7 +53,17 @@ kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca
 
 - Rules evaluate top-to-bottom, first match wins; `default` catches the rest.
 - `list_file` loads Loyalsoldier/v2ray-format domain lists (one domain
-  per line, `#` comments, optional `domain:`/`full:` prefixes).
+  per line, `#` comments, optional `domain:`/`full:` prefixes). Lines
+  with `/` are auto-detected as CIDRs, so one file can mix domains and
+  IP ranges.
+- `geoip = "cn"` classifies REAL-IP connections (literal IPs, DoH-resolved,
+  hardcoded) by country: it loads `<geoip_dir>/cn.txt` (default
+  `/etc/magicalane/geoip`), a plain CIDR list — use chnroutes2
+  (`chnroutes.txt` / `chnroute6.txt`) or gaoyifan/china-operator-ip
+  (`china.txt` / `china6.txt`), e.g.
+  `curl -o /etc/magicalane/geoip/cn.txt .../china.txt`. Other countries
+  work the same way (`geoip = "us"` → `us.txt`). Missing file = warning,
+  rule stays inert.
 - `aaaa = "auto"` hands out fc00::/18 tokens whenever the IPv6
   interception plane installs (it only needs local interception, so
   even v4-only clients can reach v6-only sites through the tunnel —

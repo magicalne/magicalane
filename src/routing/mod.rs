@@ -14,7 +14,7 @@
 
 use std::{
     collections::HashSet,
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
 };
 
 use crate::config::{RouteAction as CfgAction, RoutingSpec};
@@ -48,7 +48,101 @@ enum Matcher {
     /// Exact match (case-insensitive).
     DomainExact(HashSet<String>),
     /// CIDR ranges for real-IP connections.
-    IpCidr(Vec<(IpAddr, u8)>),
+    IpCidr(IpRanges),
+    /// Country-code CIDR set (`<geoip_dir>/<cc>.txt`).
+    GeoIp(IpRanges),
+}
+
+/// Sorted, merged u128 intervals covering both address families
+/// (v4 zero-extended; v4 and v6 ranges never collide). Binary search.
+#[derive(Debug, Default)]
+pub struct IpRanges {
+    /// (start, end) inclusive, sorted, non-overlapping.
+    spans: Vec<(u128, u128)>,
+}
+
+impl IpRanges {
+    pub fn from_cidrs(cidrs: &[(IpAddr, u8)]) -> Self {
+        let mut spans: Vec<(u128, u128)> = cidrs
+            .iter()
+            .map(|&(addr, len)| {
+                let bits = ip_to_u128(addr); // v4 zero-extends into low 32 bits
+                let mask = family_mask(addr, len);
+                // host part must stay inside the family width: inverting
+                // a zero-extended v4 mask would set every high bit and
+                // make the span cover all larger addresses.
+                let family = family_all_ones(addr);
+                (bits & mask, bits | (!mask & family))
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(u128, u128)> = Vec::with_capacity(spans.len());
+        for (start, end) in spans {
+            match merged.last_mut() {
+                Some((_, last_end)) if start <= *last_end + 1 => {
+                    *last_end = (*last_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        Self { spans: merged }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let bits = ip_to_u128(ip);
+        match self.spans.partition_point(|&(start, _)| start <= bits) {
+            0 => false,
+            i => {
+                let (start, end) = self.spans[i - 1];
+                bits >= start && bits <= end
+            }
+        }
+    }
+}
+
+fn ip_to_u128(ip: IpAddr) -> u128 {
+    match ip {
+        IpAddr::V4(v4) => u32::from(v4) as u128,
+        IpAddr::V6(v6) => u128::from(v6),
+    }
+}
+
+/// Family-aware prefix mask: v4 lengths apply to the low 32 bits
+/// (zero-extended), v6 lengths to all 128.
+fn family_all_ones(addr: IpAddr) -> u128 {
+    match addr {
+        IpAddr::V4(_) => 0xFFFF_FFFF,
+        IpAddr::V6(_) => u128::MAX,
+    }
+}
+
+fn family_mask(addr: IpAddr, len: u8) -> u128 {
+    match addr {
+        IpAddr::V4(_) => {
+            if len >= 32 {
+                u128::MAX
+            } else if len == 0 {
+                0
+            } else {
+                ((u32::MAX << (32 - len)) as u128) & 0xFFFF_FFFF
+            }
+        }
+        IpAddr::V6(_) => {
+            if len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - len)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -87,12 +181,32 @@ impl RoutingEngine {
                 for c in cidrs {
                     parsed.push(parse_cidr(c)?);
                 }
-                rules.push(Rule { matcher: Matcher::IpCidr(parsed), action });
+                rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&parsed)), action });
+            }
+            if let Some(cc) = &r.geoip {
+                let dir = cfg
+                    .geoip_dir
+                    .as_deref()
+                    .unwrap_or("/etc/magicalane/geoip");
+                let path = format!("{dir}/{}.txt", cc.to_ascii_lowercase());
+                let loaded = load_list_file(&path)?;
+                if loaded.cidrs.is_empty() {
+                    log::warn!(
+                        "routing: geoip {cc:?} has no ranges ({path} missing or empty) - rule inert"
+                    );
+                }
+                rules.push(Rule {
+                    matcher: Matcher::GeoIp(IpRanges::from_cidrs(&loaded.cidrs)),
+                    action,
+                });
             }
             if let Some(path) = &r.list_file {
-                let set = load_list_file(path)?;
-                if !set.is_empty() {
-                    rules.push(Rule { matcher: Matcher::DomainSuffix(set), action });
+                let loaded = load_list_file(path)?;
+                if !loaded.domains.is_empty() {
+                    rules.push(Rule { matcher: Matcher::DomainSuffix(loaded.domains), action });
+                }
+                if !loaded.cidrs.is_empty() {
+                    rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&loaded.cidrs)), action });
                 }
             }
         }
@@ -126,7 +240,7 @@ impl RoutingEngine {
                         return rule.action;
                     }
                 }
-                Matcher::IpCidr(_) => {} // domains match only domain rules
+                Matcher::IpCidr(_) | Matcher::GeoIp(_) => {} // IP-only matchers
             }
         }
         self.default
@@ -134,10 +248,9 @@ impl RoutingEngine {
 
     fn decide_ip(&self, ip: IpAddr) -> Action {
         for rule in &self.rules {
-            if let Matcher::IpCidr(cidrs) = &rule.matcher {
-                if cidr_contains(cidrs, ip) {
-                    return rule.action;
-                }
+            match &rule.matcher {
+                Matcher::IpCidr(r) | Matcher::GeoIp(r) if r.contains(ip) => return rule.action,
+                _ => {}
             }
         }
         self.default
@@ -188,55 +301,44 @@ fn parse_cidr(s: &str) -> std::io::Result<(IpAddr, u8)> {
     Ok((addr, len))
 }
 
-fn cidr_contains(cidrs: &[(IpAddr, u8)], ip: IpAddr) -> bool {
-    cidrs.iter().any(|&(net, len)| match (net, ip) {
-        (IpAddr::V4(n), IpAddr::V4(i)) => {
-            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-            (u32::from(n) & mask) == (u32::from(i) & mask)
-        }
-        (IpAddr::V6(n), IpAddr::V6(i)) => {
-            let l = len as u32;
-            let mask_hi = if l == 0 { 0 } else if l >= 64 { u64::MAX } else { u64::MAX << (64 - l) };
-            let mask_lo = if l <= 64 { 0 } else { u64::MAX << (128 - l) };
-            let (nh, nl) = split_v6(n);
-            let (ih, il) = split_v6(i);
-            (nh & mask_hi) == (ih & mask_hi) && (nl & mask_lo) == (il & mask_lo)
-        }
-        _ => false, // family mismatch is not a match
-    })
+/// A loaded list file: domain suffixes and/or CIDR ranges, auto-detected
+/// per line (lines with `/` parse as CIDRs, everything else as domains).
+#[derive(Debug, Default)]
+struct LoadedList {
+    domains: HashSet<String>,
+    cidrs: Vec<(IpAddr, u8)>,
 }
 
-fn split_v6(ip: Ipv6Addr) -> (u64, u64) {
-    let o = ip.octets();
-    let hi = u64::from_be_bytes(o[0..8].try_into().unwrap());
-    let lo = u64::from_be_bytes(o[8..16].try_into().unwrap());
-    (hi, lo)
-}
-
-/// Load a suffix list file (Loyalsoldier format).
-fn load_list_file(path: &str) -> std::io::Result<HashSet<String>> {
+fn load_list_file(path: &str) -> std::io::Result<LoadedList> {
     let text = std::fs::read_to_string(path)?;
-    let mut set = HashSet::new();
+    let mut out = LoadedList::default();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
+        // CIDR line: contains '/' (bare IPs also accepted via /32,//128).
+        if line.contains('/') {
+            match parse_cidr(line) {
+                Ok(cidr) => out.cidrs.push(cidr),
+                Err(e) => log::warn!("routing: skipping bad cidr {line:?} in {path}: {e}"),
+            }
+            continue;
+        }
         // Accept `domain:example.com`, `full:example.com` (treated as
-        // exact-ish suffix — exactness handled by match length; suffix
-        // of an apex covers subdomains which is the common intent),
+        // suffix — apex suffix covers subdomains, the common intent),
         // and bare `example.com`.
         let dom = line
             .strip_prefix("domain:")
             .or_else(|| line.strip_prefix("full:"))
             .unwrap_or(line);
         if !dom.is_empty() && dom.contains('.') {
-            set.insert(normalize(dom));
+            out.domains.insert(normalize(dom));
         } else if dom == "localhost" {
-            set.insert("localhost".to_string());
+            out.domains.insert("localhost".to_string());
         }
     }
-    Ok(set)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -250,6 +352,7 @@ mod tests {
             aaaa: None,
             direct_dns: None,
             server_ip: None,
+            geoip_dir: None,
             rule: rules,
         }
     }
@@ -266,16 +369,51 @@ mod tests {
 
     #[test]
     fn cidr_v4_and_v6() {
-        let cidrs = vec![
+        let ranges = IpRanges::from_cidrs(&[
             parse_cidr("192.168.0.0/16").unwrap(),
             parse_cidr("10.0.0.5").unwrap(),
             parse_cidr("fc00::/7").unwrap(),
-        ];
-        assert!(cidr_contains(&cidrs, "192.168.1.100".parse::<IpAddr>().unwrap()));
-        assert!(cidr_contains(&cidrs, "10.0.0.5".parse::<IpAddr>().unwrap()));
-        assert!(!cidr_contains(&cidrs, "10.0.0.6".parse::<IpAddr>().unwrap()));
-        assert!(cidr_contains(&cidrs, "fd12::1".parse::<IpAddr>().unwrap()));
-        assert!(!cidr_contains(&cidrs, "2001:db8::1".parse::<IpAddr>().unwrap()));
+        ]);
+        assert!(ranges.contains("192.168.1.100".parse::<IpAddr>().unwrap()));
+        assert!(ranges.contains("10.0.0.5".parse::<IpAddr>().unwrap()));
+        assert!(!ranges.contains("10.0.0.6".parse::<IpAddr>().unwrap()));
+        assert!(ranges.contains("fd12::1".parse::<IpAddr>().unwrap()));
+        assert!(!ranges.contains("2001:db8::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn mixed_list_file_domains_and_cidrs() {
+        let dir = std::env::temp_dir().join("mgl-routing-mixed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cn.txt");
+        std::fs::write(
+            &path,
+            "# mixed china list\nbaidu.com\n1.0.1.0/24\n1.0.2.0/23\nnot a cidr /line\nqq.com\n240e:0:0::/20\n",
+        )
+        .unwrap();
+        let loaded = load_list_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.domains.len(), 2);
+        assert!(loaded.domains.contains("baidu.com"));
+        let ranges = IpRanges::from_cidrs(&loaded.cidrs);
+        assert_eq!(loaded.cidrs.len(), 3, "bad line skipped");
+        assert!(ranges.contains("1.0.1.53".parse::<IpAddr>().unwrap()));
+        assert!(ranges.contains("1.0.3.99".parse::<IpAddr>().unwrap())); // /23 merge neighbor
+        assert!(ranges.contains("240e:1::1".parse::<IpAddr>().unwrap()));
+        assert!(!ranges.contains("240f::1".parse::<IpAddr>().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adjacent_spans_merge() {
+        // 10.0.0.0/24 + 10.0.1.0/24 are contiguous -> one span
+        let ranges = IpRanges::from_cidrs(&[
+            parse_cidr("10.0.1.0/24").unwrap(),
+            parse_cidr("10.0.0.0/24").unwrap(),
+        ]);
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges.contains("10.0.0.0".parse::<IpAddr>().unwrap()));
+        assert!(ranges.contains("10.0.1.255".parse::<IpAddr>().unwrap()));
+        assert!(!ranges.contains("10.0.2.0".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
@@ -321,12 +459,13 @@ mod tests {
             "# comment\nbaidu.com\n domain:taobao.com\nfull:exact.example\n\nqq.com# trailing\n",
         )
         .unwrap();
-        let set = load_list_file(path.to_str().unwrap()).unwrap();
-        assert!(set.contains("baidu.com"));
-        assert!(set.contains("taobao.com"));
-        assert!(set.contains("exact.example"));
-        assert!(set.contains("qq.com"));
-        assert_eq!(set.len(), 4);
+        let loaded = load_list_file(path.to_str().unwrap()).unwrap();
+        assert!(loaded.domains.contains("baidu.com"));
+        assert!(loaded.domains.contains("taobao.com"));
+        assert!(loaded.domains.contains("exact.example"));
+        assert!(loaded.domains.contains("qq.com"));
+        assert_eq!(loaded.domains.len(), 4);
+        assert!(loaded.cidrs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

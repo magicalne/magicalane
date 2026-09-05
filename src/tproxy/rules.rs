@@ -195,6 +195,9 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         "ip",
         &["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", &TABLE.to_string()],
     )?;
+    // Fake-token range must be locally routable even without a default
+    // route (route lookup precedes the nat OUTPUT REDIRECT).
+    run_ok("ip", &["route", "replace", "local", "198.18.0.0/15", "dev", "lo"]);
 
     // 2. nat rules: REDIRECT local TCP to the transparent listener.
     // REDIRECT (nat) is used for local traffic because TPROXY in
@@ -302,8 +305,9 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     restore_blob("/usr/sbin/iptables-restore", &blob).inspect_err(|_e| {
         teardown(spec);
     })?;
-    // v6 mirror (best effort; installed iff the host has usable v6).
-    if v6_available() {
+    // v6 mirror (best effort; fake tokens only need local interception,
+    // so v4-only clients can also route v6 through the tunnel).
+    if v6_plane_wanted() {
         if let Err(err) = apply_v6(spec) {
             warn!("v6 plane skipped: {err}");
             teardown_v6();
@@ -368,20 +372,14 @@ pub fn teardown(_spec: &RuleSpec) {
 // ---------------------------------------------------------------- v6 plane
 
 /// Whether the v6 plane SHOULD be attempted (pre-apply capability probe;
-/// used to decide listener binding before rules exist).
+/// used to decide listener binding before rules exist). Requires only
+/// ip6tables + a working v6 stack: fake tokens (fc00::/18) are ULA and
+/// need only LOCAL interception, so even v4-only clients can route v6
+/// through the tunnel (server-side v6 egress).
 pub fn v6_plane_wanted() -> bool {
-    v6_available()
-}
-
-/// Host capability: a GLOBAL v6 route (not just link-local) and the
-/// ip6tools present. Does NOT mean the mirror is installed — see
-/// v6_installed().
-fn v6_available() -> bool {
-    let has_route = run("ip", &["-6", "route", "show", "default"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
     let has_restore = std::path::Path::new("/usr/sbin/ip6tables-restore").exists();
-    has_route && has_restore
+    let has_v6_stack = std::path::Path::new("/proc/net/if_inet6").exists();
+    has_restore && has_v6_stack
 }
 
 /// Whether the MGL6 mirror is ACTUALLY installed right now. This is the
@@ -406,6 +404,7 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             "table", &TABLE.to_string(),
         ],
     )?;
+    run_ok("ip", &["-6", "route", "replace", "local", "fc00::/18", "dev", "lo"]);
 
     let mut nat = String::new();
     nat.push_str("*nat\n");

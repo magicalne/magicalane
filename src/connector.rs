@@ -185,6 +185,17 @@ async fn tcp_stream_marked(addr: std::net::SocketAddr) -> io::Result<TcpStream> 
     }
 }
 
+/// Whether the host has a GLOBAL v6 route (RFC 6724 ordering heuristic).
+fn host_has_global_v6() -> bool {
+    std::fs::read_to_string("/proc/net/ipv6_route").map(|t| {
+        t.lines().any(|l| {
+            // default route (::/0): dst = 00000000 00000000 with /0 len
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() > 2 && f[0] == "00000000000000000000000000000000" && f[1] == "00"
+        })
+    }).unwrap_or(false)
+}
+
 /// Search domains from /etc/resolv.conf ("search" or "domain" lines).
 fn search_domains() -> Vec<String> {
     let mut out = Vec::new();
@@ -224,9 +235,15 @@ async fn resolve_via(host: &str, resolver: std::net::SocketAddr) -> io::Result<V
 }
 
 async fn resolve_name_via(host: &str, resolver: std::net::SocketAddr) -> io::Result<Vec<std::net::SocketAddr>> {
-    // Query A first; if empty, try AAAA. IDs are fixed (probe, not cache).
-    let mut out = Vec::new();
-    for qtype in [crate::dns::proto::QTYPE_A, crate::dns::proto::QTYPE_AAAA] {
+    // Query BOTH families, then order like getaddrinfo (RFC 6724): v6
+    // first when the host has a global v6 route — direct-routed traffic
+    // (e.g. China domains on dual-stack clients) then uses native v6.
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for (qtype, sink) in [
+        (crate::dns::proto::QTYPE_AAAA, &mut v6),
+        (crate::dns::proto::QTYPE_A, &mut v4),
+    ] {
         let bind: std::net::SocketAddr = match resolver {
             std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
@@ -238,14 +255,24 @@ async fn resolve_name_via(host: &str, resolver: std::net::SocketAddr) -> io::Res
         let query = build_probe_query(host, qtype);
         sock.send(&query).await?;
         let mut buf = vec![0u8; 1500];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv(&mut buf))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct_dns timeout"))??;
-        collect_a_records(&buf[..n], qtype, &mut out);
-        if !out.is_empty() {
-            break;
-        }
+        let n = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            sock.recv(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "direct_dns timeout")),
+        };
+        collect_a_records(&buf[..n], qtype, sink);
     }
+    let prefer_v6 = !v6.is_empty() && host_has_global_v6();
+    let out: Vec<std::net::SocketAddr> = if prefer_v6 {
+        v6.into_iter().chain(v4).collect()
+    } else {
+        v4.into_iter().chain(v6).collect()
+    };
     if out.is_empty() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "resolver returned no addresses"));
     }

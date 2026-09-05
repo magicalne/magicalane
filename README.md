@@ -54,8 +54,11 @@ kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca
 - Rules evaluate top-to-bottom, first match wins; `default` catches the rest.
 - `list_file` loads Loyalsoldier/v2ray-format domain lists (one domain
   per line, `#` comments, optional `domain:`/`full:` prefixes).
-- `aaaa = "auto"` hands out fc00::/18 tokens only when the IPv6
-  interception plane is actually installed (dual-stack hosts).
+- `aaaa = "auto"` hands out fc00::/18 tokens whenever the IPv6
+  interception plane installs (it only needs local interception, so
+  even v4-only clients can reach v6-only sites through the tunnel —
+  the server connects over its own IPv6 egress; `curl -6 ifconfig.me`
+  then reports the server's IPv6).
 - Hardcoded resolvers (8.8.8.8) can't bypass: the udp/53 redirect is
   destination-agnostic.
 - UDP (incl. QUIC/HTTP3-style flows) routes by the same rules; tunnel

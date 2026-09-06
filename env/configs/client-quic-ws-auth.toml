@@ -1,0 +1,6 @@
+# Security-bundle client: SOCKS5+HTTP auth (RFC 1929 / Basic) and
+# LAN exposure. Tests hit it from inside AND from the server container.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "quic" }, socks5_port = 1085, socks5_users = [ "alice:secret" ], allow_lan = true, tproxy = { mode = "off", tcp_port = 0, udp_port = 0 } } }

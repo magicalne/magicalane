@@ -139,6 +139,7 @@ ensure_run magicalane-client \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-fakeip.toml:/etc/magicalane/client-ws-fakeip.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-geoip.toml:/etc/magicalane/client-ws-geoip.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-dnslayer.toml:/etc/magicalane/client-ws-dnslayer.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-ws-auth.toml:/etc/magicalane/client-ws-auth.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 

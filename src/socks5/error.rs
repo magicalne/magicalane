@@ -8,6 +8,8 @@ pub enum Error {
     ConnectionClose,
     #[error("InvalidMessage")]
     InvalidMessage(),
+    #[error("auth failed")]
+    AuthFailed(),
     #[error("InvalidVersion: {0}")]
     InvalidVersion(u8),
     #[error("InvalidMethod: {0}")]

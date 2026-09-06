@@ -40,7 +40,7 @@ pub async fn client_test() -> Result<()> {
     )
     .await?;
     let connector = QuicConnector::new(quic_client);
-    let mut socks_server = lib::socks5::server::Server::new(None, connector, 8024).await?;
+    let mut socks_server = lib::socks5::server::Server::new(None, None, false, vec![], connector, 8024).await?;
     socks_server.run().await?;
     Ok(())
 }

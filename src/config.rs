@@ -129,6 +129,7 @@ impl Protocol {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Kind {
     Server {
         port: u16,
@@ -140,6 +141,14 @@ pub enum Kind {
     Client {
         proxy: ProxyConfig,
         socks5_port: u16,
+        /// SOCKS5/HTTP users ("user:pass" entries); absent = no auth.
+        /// NOTE: with no auth, bind defaults to 127.0.0.1 — set
+        /// allow_lan (and auth!) to expose the port to the network.
+        socks5_users: Option<Vec<String>>,
+        /// Bind address override (wins over allow_lan).
+        bind: Option<String>,
+        /// true = bind 0.0.0.0 (LAN-exposed); default false (127.0.0.1).
+        allow_lan: Option<bool>,
         tproxy: TransparentProxyConfig,
         routing: Option<RoutingSpec>,
     },

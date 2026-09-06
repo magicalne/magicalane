@@ -233,6 +233,25 @@ impl Reply {
 pub struct Decoder;
 
 impl Decoder {
+
+    /// RFC 1929 subnegotiation request: VER ULEN UNAME PLEN PASSWD.
+    pub fn parse_username_password(buf: &[u8]) -> Result<(&[u8], &[u8])> {
+        if buf.len() < 2 || buf[0] != 0x01 {
+            return Err(Error::InvalidMessage());
+        }
+        let ulen = buf[1] as usize;
+        if buf.len() < 2 + ulen + 1 {
+            return Err(Error::InvalidMessage());
+        }
+        let user = &buf[2..2 + ulen];
+        let plen = buf[2 + ulen] as usize;
+        if buf.len() < 2 + ulen + 1 + plen {
+            return Err(Error::InvalidMessage());
+        }
+        let pass = &buf[2 + ulen + 1..2 + ulen + 1 + plen];
+        Ok((user, pass))
+    }
+
     // Version and method selection message.
     pub fn parse_connecting(buf: &[u8]) -> Result<(Version, Vec<Method>)> {
         if buf.len() < 3 {
@@ -270,6 +289,12 @@ impl Decoder {
 pub struct Encoder;
 
 impl Encoder {
+    /// RFC 1929 status reply: VER STATUS (0x00 ok / 0xff fail).
+    pub fn encode_auth_status<B: BufMut>(ok: bool, buf: &mut B) {
+        buf.put_u8(0x01);
+        buf.put_u8(if ok { 0x00 } else { 0xFF });
+    }
+
     pub fn encode_method_select_msg<B: BufMut>(ver: Version, method: &Method, buf: &mut B) {
         buf.put_u8(ver.get_u8());
         buf.put_u8(method.get_u8());

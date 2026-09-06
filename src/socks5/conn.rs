@@ -21,6 +21,7 @@ use super::{
 
 enum ConnectingState {
     Negotiation,
+    Auth,
     SubNegotiation,
     OpenRemote,
 }
@@ -32,6 +33,8 @@ struct Connecting<IO, C, O> {
     connector_fut: Option<BoxFuture<'static, io::Result<O>>>,
     ver: Option<Version>,
     addr: Option<Addr>,
+    /// user:pass entries; empty = auth disabled.
+    users: Vec<(String, String)>,
 }
 
 impl<IO, C, O> Unpin for Connecting<IO, C, O> {}
@@ -42,7 +45,7 @@ where
     C: Connector<Connection = O>,
     O: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(io: IO, connector: C) -> Self {
+    fn new(io: IO, connector: C, users: Vec<(String, String)>) -> Self {
         let buf = BytesMut::new();
         Self {
             io: Some(io),
@@ -52,6 +55,7 @@ where
             connector_fut: None,
             ver: None,
             addr: None,
+            users,
         }
     }
 
@@ -61,6 +65,9 @@ where
             match &mut me.state {
                 ConnectingState::Negotiation => {
                     ready!(me.poll_negotiation(cx))?;
+                }
+                ConnectingState::Auth => {
+                    ready!(me.poll_auth(cx))?;
                 }
                 ConnectingState::SubNegotiation => {
                     ready!(me.poll_subnegotiation(cx))?;
@@ -87,7 +94,23 @@ where
         }
         let buf = self.buf.chunk();
         let (ver, methods) = Decoder::parse_connecting(buf)?;
-        let m = methods.first().unwrap();
+        // Pick the strongest method we support: with users configured
+        // require username/password (RFC 1929); otherwise no-auth.
+        let m = if self.users.is_empty() {
+            if methods.iter().any(|m| matches!(m, super::proto::Method::NoAuth)) {
+                &super::proto::Method::NoAuth
+            } else {
+                &super::proto::Method::NoAcceptableMethod
+            }
+        } else if methods
+            .iter()
+            .any(|m| matches!(m, super::proto::Method::UsernamePassword))
+        {
+            &super::proto::Method::UsernamePassword
+        } else {
+            &super::proto::Method::NoAcceptableMethod
+        };
+        let going_auth = matches!(m, super::proto::Method::UsernamePassword);
         self.buf.clear();
         Encoder::encode_method_select_msg(ver, m, &mut self.buf);
         trace!("poll negotiation writing: {:?}", self.buf);
@@ -100,6 +123,46 @@ where
             return Poll::Ready(Err(Error::ConnectionClose));
         }
         ready!(Pin::new(self.io.as_mut().unwrap()).poll_flush(cx))?;
+        self.state = if going_auth {
+            ConnectingState::Auth
+        } else {
+            ConnectingState::SubNegotiation
+        };
+        Poll::Ready(Ok(()))
+    }
+
+    /// RFC 1929 username/password subnegotiation.
+    fn poll_auth(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.buf.clear();
+        let n = ready!(poll_read_buf(
+            Pin::new(self.io.as_mut().unwrap()),
+            cx,
+            &mut self.buf
+        ))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::ConnectionClose));
+        }
+        let (user, pass) = Decoder::parse_username_password(self.buf.chunk())?;
+        let user = String::from_utf8_lossy(user);
+        let pass = String::from_utf8_lossy(pass);
+        let ok = self
+            .users
+            .iter()
+            .any(|(u, p)| u == &user && p == &pass);
+        self.buf.clear();
+        Encoder::encode_auth_status(ok, &mut self.buf);
+        let n = ready!(poll_write_buf(
+            Pin::new(self.io.as_mut().unwrap()),
+            cx,
+            &mut self.buf
+        ))?;
+        if n == 0 {
+            return Poll::Ready(Err(Error::ConnectionClose));
+        }
+        ready!(Pin::new(self.io.as_mut().unwrap()).poll_flush(cx))?;
+        if !ok {
+            return Poll::Ready(Err(Error::AuthFailed()));
+        }
         self.state = ConnectingState::SubNegotiation;
         Poll::Ready(Ok(()))
     }
@@ -204,8 +267,8 @@ where
     C: Connector<Connection = O>,
     O: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn new(io: IO, connector: C, bandwidth: usize) -> Self {
-        let connecting = Connecting::new(io, connector);
+    pub fn new(io: IO, connector: C, users: Vec<(String, String)>, bandwidth: usize) -> Self {
+        let connecting = Connecting::new(io, connector, users);
         Self {
             bandwidth,
             state: ConnState::Connecting(connecting),

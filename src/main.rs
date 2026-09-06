@@ -122,6 +122,9 @@ async fn start_with_config(config: Config) -> Result<()> {
         Kind::Client {
             proxy,
             socks5_port,
+            socks5_users,
+            bind,
+            allow_lan,
             tproxy: tproxy_cfg,
             routing,
         } => {
@@ -145,6 +148,9 @@ async fn start_with_config(config: Config) -> Result<()> {
                     run_client(
                         connector,
                         socks5_port,
+                        socks5_users,
+                        bind,
+                        allow_lan.unwrap_or(false),
                         tproxy_cfg,
                         routing,
                         &proxy.host,
@@ -167,6 +173,9 @@ async fn start_with_config(config: Config) -> Result<()> {
                     run_client(
                         connector,
                         socks5_port,
+                        socks5_users,
+                        bind,
+                        allow_lan.unwrap_or(false),
                         tproxy_cfg,
                         routing,
                         &proxy.host,
@@ -188,6 +197,9 @@ async fn start_with_config(config: Config) -> Result<()> {
 async fn run_client<C, IO>(
     connector: C,
     socks5_port: u16,
+    socks5_users: Option<Vec<String>>,
+    bind: Option<String>,
+    allow_lan: bool,
     tproxy: lib::config::TransparentProxyConfig,
     routing: Option<lib::config::RoutingSpec>,
     server_host: &str,
@@ -288,8 +300,15 @@ where
     };
 
     // SOCKS5 stays available alongside transparent interception.
-    let mut socks =
-        lib::socks5::server::Server::new(Some(socks5_port), connector.clone(), bandwidth).await?;
+    let mut socks = lib::socks5::server::Server::new(
+        Some(socks5_port),
+        bind.as_deref(),
+        allow_lan,
+        socks5_users.unwrap_or_default(),
+        connector.clone(),
+        bandwidth,
+    )
+    .await?;
     let socks_task = tokio::spawn(async move { socks.run().await });
 
     if let Some(l) = tcp_listener {

@@ -290,6 +290,11 @@ impl Resolver {
     pub async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
 
+        // 0. IP literals: no lookup at all.
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+
         // 1. cache
         if let Some(hit) = self.cache_get(&host) {
             debug!("resolve[{host}]: cache hit ({:?})", hit.len());

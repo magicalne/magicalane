@@ -13,6 +13,7 @@ pub mod error;
 pub mod kcp;
 pub(crate) mod proxy;
 pub mod dns;
+pub mod httpfetch;
 pub mod httpin;
 pub mod tproxy;
 pub mod routing;

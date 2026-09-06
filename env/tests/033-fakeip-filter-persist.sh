@@ -45,7 +45,7 @@ $CE exec magicalane-client /usr/local/bin/ws-daemon.sh stop >/dev/null 2>&1 || t
 $CE exec magicalane-client sh -c 'test -s /tmp/fakeip.cache' || fail "fakeip cache not written on shutdown"
 $CE exec magicalane-client /usr/local/bin/ws-daemon.sh start "$FILTER_CFG"
 for _ in $(seq 1 40); do
-    $CE exec magicalane-client sh -c "ss -ltn | grep -q ':7903 '" >/dev/null 2>&1 && break
+    $CE exec magicalane-client sh -c "ss -ltn | grep -q ':7903 ' && iptables -t nat -n -L MGL-NAT >/dev/null 2>&1" >/dev/null 2>&1 && break
     sleep 0.5
 done
 token2="$(query origin 1)"

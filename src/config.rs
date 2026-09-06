@@ -241,6 +241,32 @@ pub struct RoutingSpec {
     /// Ordered rules; first match wins.
     #[serde(default)]
     pub rule: Vec<RoutingRule>,
+    /// Remote rule providers (fetched by URL, refreshed on interval).
+    #[serde(default)]
+    pub provider: Vec<ProviderSpec>,
+}
+
+/// A remote rule list: fetched over HTTP(S), auto-refreshed, swapped
+/// atomically into the engine (no restart).
+///
+/// ```toml
+/// [[kind.Client.routing.provider]]
+/// name = "china-domains"
+/// url = "https://example.com/china.txt"
+/// interval = 86400        # seconds (default: daily)
+/// via = "proxy"           # fetch through the tunnel (default) | "direct"
+/// action = "direct"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderSpec {
+    pub name: String,
+    pub url: String,
+    /// Refresh interval in seconds (default 86400).
+    pub interval: Option<u64>,
+    /// Fetch path: "proxy" (through the tunnel, default) or "direct".
+    pub via: Option<String>,
+    /// Action for matched entries (default: direct).
+    pub action: Option<RouteAction>,
 }
 
 impl RoutingSpec {

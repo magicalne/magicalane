@@ -214,7 +214,7 @@ pub async fn serve_client_fakeip<C, IO>(
     map: Arc<FakeIpMap>,
     aaaa: AaaaMode,
     v6_intercept_active: bool,
-    filter: Arc<Vec<String>>,
+    filter: Arc<std::sync::RwLock<Vec<String>>>,
     resolver: std::sync::Arc<resolve::Resolver>,
     connector: C,
 ) where
@@ -257,7 +257,7 @@ async fn answer_fakeip<C, IO>(
     map: Arc<FakeIpMap>,
     aaaa: AaaaMode,
     v6_intercept_active: bool,
-    filter: Arc<Vec<String>>,
+    filter: Arc<std::sync::RwLock<Vec<String>>>,
     resolver: std::sync::Arc<resolve::Resolver>,
     connector: C,
     query: Vec<u8>,
@@ -271,7 +271,12 @@ where
     };
     // Filtered domains (STUN/NTP/games...) get REAL answers: tokens
     // would break endpoints that validate addresses.
-    if filter.iter().any(|f| suffix_matches(&q.domain, f)) {
+    if filter
+        .read()
+        .unwrap()
+        .iter()
+        .any(|f| suffix_matches(&q.domain, f))
+    {
         debug!("fakeip filter hit: {} (real answer)", q.domain);
         let addrs = resolver.resolve(&q.domain, 0).await.unwrap_or_default();
         let ttl = 30;

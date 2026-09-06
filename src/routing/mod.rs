@@ -51,6 +51,11 @@ enum Matcher {
     IpCidr(IpRanges),
     /// Country-code CIDR set (`<geoip_dir>/<cc>.txt`).
     GeoIp(IpRanges),
+    /// Remote provider list (hot-swappable): domains + CIDRs.
+    Provider {
+        name: String,
+        set: std::sync::Arc<std::sync::RwLock<LoadedList>>,
+    },
 }
 
 /// Sorted, merged u128 intervals covering both address families
@@ -153,14 +158,32 @@ struct Rule {
 
 #[derive(Debug)]
 pub struct RoutingEngine {
-    rules: Vec<Rule>,
-    default: Action,
+    inner: std::sync::Arc<std::sync::RwLock<Vec<Rule>>>,
+    default: std::sync::Arc<std::sync::RwLock<Action>>,
+    /// Live provider sets (name -> swappable content).
+    providers: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::RwLock<LoadedList>>>>,
+    >,
 }
 
 impl RoutingEngine {
     /// Build from parsed config. `list_file` paths are resolved relative
     /// to nothing special — absolute paths expected (same as certs).
     pub fn from_config(cfg: &RoutingSpec) -> std::io::Result<Self> {
+        let engine = Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            default: std::sync::Arc::new(std::sync::RwLock::new(Action::Proxy)),
+            providers: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+        };
+        engine.reload(cfg)?;
+        Ok(engine)
+    }
+
+    /// Rebuild all rules from a (possibly new) config. Provider sets
+    /// keep their live content when the provider name already exists.
+    pub fn reload(&self, cfg: &RoutingSpec) -> std::io::Result<()> {
         let mut rules = Vec::new();
         for r in &cfg.rule {
             let action = r.action_or_direct().into();
@@ -210,13 +233,50 @@ impl RoutingEngine {
                 }
             }
         }
-        Ok(Self { rules, default: cfg.default_action().into() })
+        // Providers: rule per provider; content fetched asynchronously
+        // (starts empty, fills in once the first fetch lands).
+        for p in &cfg.provider {
+            let set = {
+                let mut provs = self.providers.write().unwrap();
+                provs.entry(p.name.clone())
+                    .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(LoadedList::default())))
+                    .clone()
+            };
+            rules.push(Rule {
+                matcher: Matcher::Provider { name: p.name.clone(), set },
+                action: p.action.unwrap_or(crate::config::RouteAction::Direct).into(),
+            });
+        }
+        *self.inner.write().unwrap() = rules;
+        *self.default.write().unwrap() = cfg.default_action().into();
+        Ok(())
+    }
+
+    /// Swap a provider's content atomically (hot rule update).
+    pub fn update_provider(&self, name: &str, text: &str) {
+        let parsed = parse_list_content(text);
+        let provs = self.providers.read().unwrap();
+        if let Some(set) = provs.get(name) {
+            let mut guard = set.write().unwrap();
+            *guard = parsed;
+            log::info!(
+                "routing: provider {name:?} updated ({} domains, {} cidrs)",
+                guard.domains.len(),
+                guard.cidrs.len()
+            );
+        }
     }
 
     /// A pass-through engine: everything → default (used when no
     /// `[routing]` section exists).
     pub fn all(action: Action) -> Self {
-        Self { rules: Vec::new(), default: action }
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            default: std::sync::Arc::new(std::sync::RwLock::new(action)),
+            providers: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+        }
     }
 
     pub fn decide(&self, target: Target<'_>) -> Action {
@@ -228,7 +288,8 @@ impl RoutingEngine {
 
     fn decide_domain(&self, domain: &str) -> Action {
         let d = normalize(domain);
-        for rule in &self.rules {
+        let rules = self.inner.read().unwrap();
+        for rule in rules.iter() {
             match &rule.matcher {
                 Matcher::DomainSuffix(set) => {
                     if suffix_match(&d, set) {
@@ -240,20 +301,40 @@ impl RoutingEngine {
                         return rule.action;
                     }
                 }
+                Matcher::Provider { name, set } => {
+                    let guard = set.read().unwrap();
+                    if !guard.domains.is_empty() && suffix_match(&d, &guard.domains) {
+                        log::debug!("routing: matched provider {name} for {d}");
+                        return rule.action;
+                    }
+                }
                 Matcher::IpCidr(_) | Matcher::GeoIp(_) => {} // IP-only matchers
             }
         }
-        self.default
+        *self.default.read().unwrap()
     }
 
     fn decide_ip(&self, ip: IpAddr) -> Action {
-        for rule in &self.rules {
+        let rules = self.inner.read().unwrap();
+        for rule in rules.iter() {
             match &rule.matcher {
                 Matcher::IpCidr(r) | Matcher::GeoIp(r) if r.contains(ip) => return rule.action,
+                Matcher::Provider { name, set } => {
+                    let guard = set.read().unwrap();
+                    if !guard.cidrs.is_empty() {
+                        // provider CIDRs are compiled on the fly per
+                        // lookup only if present (usually domain lists)
+                        let ranges = IpRanges::from_cidrs(&guard.cidrs);
+                        if ranges.contains(ip) {
+                            log::debug!("routing: matched provider {name} for {ip}");
+                            return rule.action;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        self.default
+        *self.default.read().unwrap()
     }
 }
 
@@ -304,13 +385,18 @@ fn parse_cidr(s: &str) -> std::io::Result<(IpAddr, u8)> {
 /// A loaded list file: domain suffixes and/or CIDR ranges, auto-detected
 /// per line (lines with `/` parse as CIDRs, everything else as domains).
 #[derive(Debug, Default)]
-struct LoadedList {
+pub struct LoadedList {
     domains: HashSet<String>,
     cidrs: Vec<(IpAddr, u8)>,
 }
 
 fn load_list_file(path: &str) -> std::io::Result<LoadedList> {
     let text = std::fs::read_to_string(path)?;
+    Ok(parse_list_content(&text))
+}
+
+/// Parse list content: domains and/or CIDRs, auto-detected per line.
+pub fn parse_list_content(text: &str) -> LoadedList {
     let mut out = LoadedList::default();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -321,7 +407,7 @@ fn load_list_file(path: &str) -> std::io::Result<LoadedList> {
         if line.contains('/') {
             match parse_cidr(line) {
                 Ok(cidr) => out.cidrs.push(cidr),
-                Err(e) => log::warn!("routing: skipping bad cidr {line:?} in {path}: {e}"),
+                Err(e) => log::warn!("routing: skipping bad cidr {line:?}: {e}"),
             }
             continue;
         }
@@ -332,13 +418,11 @@ fn load_list_file(path: &str) -> std::io::Result<LoadedList> {
             .strip_prefix("domain:")
             .or_else(|| line.strip_prefix("full:"))
             .unwrap_or(line);
-        if !dom.is_empty() && dom.contains('.') {
+        if !dom.is_empty() {
             out.domains.insert(normalize(dom));
-        } else if dom == "localhost" {
-            out.domains.insert("localhost".to_string());
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -356,6 +440,7 @@ mod tests {
             fakeip_filter: None,
             fakeip_cache: None,
             rule: rules,
+            provider: Vec::new(),
         }
     }
 

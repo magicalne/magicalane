@@ -15,10 +15,11 @@ struct Opt {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Opt = Opt::from_args();
-    let content = std::fs::read(opt.config)?;
+    let config_path = opt.config.clone();
+    let content = std::fs::read(&opt.config)?;
     let config: Config = toml::from_slice(&content)?;
 
-    start_with_config(config).await?;
+    start_with_config(config, Some(config_path)).await?;
     Ok(())
 }
 
@@ -26,7 +27,7 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-async fn start_with_config(config: Config) -> Result<()> {
+async fn start_with_config(config: Config, config_path: Option<String>) -> Result<()> {
     let password = config.password;
     let bandwidth = config.bandwidth;
     let server_dns = config.dns;
@@ -153,6 +154,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         allow_lan.unwrap_or(false),
                         tproxy_cfg,
                         routing,
+                        config_path.clone(),
                         &proxy.host,
                         proxy.port,
                         bandwidth,
@@ -178,6 +180,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                         allow_lan.unwrap_or(false),
                         tproxy_cfg,
                         routing,
+                        config_path.clone(),
                         &proxy.host,
                         proxy.port,
                         bandwidth,
@@ -202,6 +205,7 @@ async fn run_client<C, IO>(
     allow_lan: bool,
     tproxy: lib::config::TransparentProxyConfig,
     routing: Option<lib::config::RoutingSpec>,
+    config_path: Option<String>,
     server_host: &str,
     server_port: u16,
     bandwidth: usize,
@@ -236,9 +240,16 @@ where
     }
     let direct = lib::connector::DirectConnector::new(Some(direct_dns));
     let direct_resolver = direct.resolver();
+    let engine = std::sync::Arc::new(engine);
+    spawn_provider_tasks(
+        engine.clone(),
+        routing_cfg.provider.clone(),
+        direct.clone(),
+        connector.clone(),
+    );
     let router = lib::tproxy::TproxyRouter {
         fake_map: fake_map.clone(),
-        routing: std::sync::Arc::new(engine),
+        routing: engine.clone(),
         direct,
     };
     let aaaa = routing_cfg
@@ -247,11 +258,15 @@ where
         .and_then(lib::dns::AaaaMode::parse)
         .unwrap_or(lib::dns::AaaaMode::Auto);
     // fake-ip exceptions: these domains get REAL answers (STUN/NTP/…)
-    let fakeip_filter: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
-        routing_cfg.fakeip_filter.clone().unwrap_or_default(),
-    );
-    if !fakeip_filter.is_empty() {
-        log::info!("routing: fakeip filter entries: {}", fakeip_filter.len());
+    let fakeip_filter: std::sync::Arc<std::sync::RwLock<Vec<String>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(
+            routing_cfg.fakeip_filter.clone().unwrap_or_default(),
+        ));
+    {
+        let f = fakeip_filter.read().unwrap();
+        if !f.is_empty() {
+            log::info!("routing: fakeip filter entries: {}", f.len());
+        }
     }
     // Persistence: restore tokens, periodic save, save on shutdown.
     if let Some(path) = routing_cfg.fakeip_cache.clone() {
@@ -409,11 +424,83 @@ where
     // Wait for a termination signal, then honor the clean-exit contract.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    // SIGHUP is deliberately ignored: daemons started from podman exec -d
-    // or nohup receive it when the spawning session closes.
+    // SIGHUP: hot reload of the ROUTING layer (rules, providers, geoip
+    // lists, fakeip filter). Transport/listener changes need a restart.
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let reload_ctx = (
+        config_path.clone(),
+        engine.clone(),
+        fakeip_filter.clone(),
+        router.direct.clone(),
+    );
+    let connector_for_reload = connector.clone();
     tokio::select! {
         _ = sigterm.recv() => {},
         _ = sigint.recv() => {},
+        _ = sighup.recv() => {
+            log::info!("SIGHUP: reloading routing configuration");
+            let (path, engine, filter, direct) = reload_ctx;
+            if let Some(path) = path {
+                match std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("read: {}", e))
+                    .and_then(|b| toml::from_slice::<lib::config::Config>(&b).map_err(|e| anyhow::anyhow!("parse: {}", e)))
+                {
+                    Ok(cfg) => {
+                        if let lib::config::Kind::Client { routing: Some(spec), .. } = &cfg.kind {
+                            if let Err(e) = engine.reload(spec) {
+                                log::warn!("SIGHUP: routing reload failed: {e}");
+                            } else {
+                                *filter.write().unwrap() =
+                                    spec.fakeip_filter.clone().unwrap_or_default();
+                                spawn_provider_tasks(
+                                    engine.clone(),
+                                    spec.provider.clone(),
+                                    direct.clone(),
+                                    connector_for_reload.clone(),
+                                );
+                                log::info!("SIGHUP: routing reloaded ({} rules' spec + {} providers)",
+                                    spec.rule.len(), spec.provider.len());
+                            }
+                        } else {
+                            log::warn!("SIGHUP: config has no routing section; nothing to reload");
+                        }
+                    }
+                    Err(e) => log::warn!("SIGHUP: config reload failed: {e}"),
+                }
+            } else {
+                log::warn!("SIGHUP: no config path known (embedded config?); cannot reload");
+            }
+            // After a reload we keep running (do not exit).
+            loop {
+                tokio::select! {
+                    _ = sigterm.recv() => break,
+                    _ = sigint.recv() => break,
+                    _ = sighup.recv() => {
+                        log::info!("SIGHUP: reload again");
+                        let (path, engine, filter, direct) = (config_path.clone(), engine.clone(), filter.clone(), direct.clone());
+                        if let Some(path) = &path {
+                            if let Some(cfg) = std::fs::read(path)
+                                .ok()
+                                .and_then(|b| toml::from_slice::<lib::config::Config>(&b).ok())
+                            {
+                                if let lib::config::Kind::Client { routing: Some(spec), .. } = &cfg.kind {
+                                    if engine.reload(spec).is_ok() {
+                                        *filter.write().unwrap() =
+                                            spec.fakeip_filter.clone().unwrap_or_default();
+                                        spawn_provider_tasks(
+                                            engine.clone(),
+                                            spec.provider.clone(),
+                                            direct.clone(),
+                                            connector_for_reload.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         _ = socks_task => {
             // socks server failed/exited without a signal
             if mode == TproxyMode::Tproxy {
@@ -445,4 +532,75 @@ where
                     });
     }
     std::process::exit(0);
+}
+
+/// Spawn fetch tasks for every configured rule provider: immediate
+/// fetch + refresh loop on the configured interval.
+#[allow(clippy::too_many_arguments)]
+fn spawn_provider_tasks<C, IO>(
+    engine: std::sync::Arc<lib::routing::RoutingEngine>,
+    providers: Vec<lib::config::ProviderSpec>,
+    direct: lib::connector::DirectConnector,
+    connector: C,
+) where
+    C: lib::connector::Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    for p in providers {
+        let engine = engine.clone();
+        let mut direct = direct.clone();
+        let mut connector = connector.clone();
+        let interval = std::time::Duration::from_secs(p.interval.unwrap_or(86400));
+        let via_direct = p.via.as_deref() == Some("direct");
+        let name = p.name.clone();
+        let url = p.url.clone();
+        tokio::spawn(async move {
+            loop {
+                match fetch_provider(url.as_str(), via_direct, &mut direct, &mut connector).await {
+                    Ok(text) => engine.update_provider(&name, &text),
+                    Err(e) => log::warn!("provider {name:?} fetch failed: {e}"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+}
+
+/// One provider fetch: URL -> body text.
+async fn fetch_provider<C, IO>(
+    url: &str,
+    via_direct: bool,
+    direct: &mut lib::connector::DirectConnector,
+    connector: &mut C,
+) -> anyhow::Result<String>
+where
+    C: lib::connector::Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let u = lib::httpfetch::parse_url(url)?;
+    let addr = lib::httpfetch::url_addr(&u);
+    if via_direct {
+        let stream = lib::connector::Connector::connect(direct, addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("direct connect: {}", e))?;
+        fetch_on(stream, &u).await
+    } else {
+        let stream = lib::connector::Connector::connect(connector, addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("tunnel connect: {}", e))?;
+        fetch_on(stream, &u).await
+    }
+}
+
+async fn fetch_on<S>(stream: S, u: &lib::httpfetch::Url<'_>) -> anyhow::Result<String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let body = if u.tls {
+        let tls = lib::httpfetch::tls_wrap(stream, u.host).await?;
+        lib::httpfetch::fetch_over(tls, u).await?
+    } else {
+        lib::httpfetch::fetch_over(stream, u).await?
+    };
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }

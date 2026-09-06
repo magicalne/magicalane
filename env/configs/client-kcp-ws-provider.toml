@@ -1,0 +1,7 @@
+# Provider + hot-reload client: rules come from a local HTTP provider
+# (refreshed every 5s); the config itself is copied to /tmp and edited
+# by the test to prove SIGHUP reload.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp" }, socks5_port = 1087, tproxy = { mode = "tproxy", tcp_port = 7905, udp_port = 7906, dns_port = 15363, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", provider = [ { name = "live-list", url = "http://127.0.0.1:8082/list.txt", interval = 5, via = "direct", action = "direct" } ] } } }

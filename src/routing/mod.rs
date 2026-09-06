@@ -403,6 +403,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Real-world snapshot from gaoyifan/china-operator-ip (the ranges
+    /// covering AliDNS/114DNS/Baidu/ChinaTelecom/Unicom + their v6
+    /// allocations). Asserts the geoip pipeline against REAL China
+    /// allocations, not synthetic ranges.
+    #[test]
+    fn geoip_real_china_snapshot() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/env/fixtures/china-snapshot.txt"
+        );
+        let loaded = load_list_file(path).expect("snapshot fixture");
+        assert!(loaded.domains.is_empty(), "pure CIDR file");
+        let ranges = IpRanges::from_cidrs(&loaded.cidrs);
+        assert!(ranges.len() >= 9);
+
+        // Known China addresses (must classify as CN):
+        for cn in [
+            "223.5.5.5",     // AliDNS
+            "114.114.114.114", // 114DNS (Jiangsu)
+            "39.156.69.79",  // baidu.com
+            "180.76.76.76",  // Baidu DNS
+            "119.29.29.29",  // DNSPod (Tencent)
+            "202.96.209.133", // Shanghai Telecom
+            "240e:1::1",     // China Telecom v6
+            "2408:8000::1",  // China Unicom v6
+            "2001:250::1",   // CERNET
+        ] {
+            assert!(
+                ranges.contains(cn.parse::<IpAddr>().unwrap()),
+                "{cn} should be in the real China snapshot"
+            );
+        }
+        // Known non-China (must not):
+        for not_cn in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "104.244.42.1", // twitter
+            "2606:4700::1", // cloudflare v6
+            "2a00:1450::1", // google v6
+        ] {
+            assert!(
+                !ranges.contains(not_cn.parse::<IpAddr>().unwrap()),
+                "{not_cn} must NOT be in the China snapshot"
+            );
+        }
+    }
+
     #[test]
     fn adjacent_spans_merge() {
         // 10.0.0.0/24 + 10.0.1.0/24 are contiguous -> one span

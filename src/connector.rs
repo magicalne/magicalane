@@ -100,6 +100,11 @@ impl DirectConnector {
     pub async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
         self.resolver.resolve(host, port).await
     }
+
+    /// Shared layered resolver (used by the fake-IP filter path).
+    pub fn resolver(&self) -> std::sync::Arc<crate::dns::resolve::Resolver> {
+        self.resolver.clone()
+    }
 }
 
 /// SO_MARK via raw setsockopt (avoids socket2's "all" feature).

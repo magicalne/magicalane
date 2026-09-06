@@ -1,0 +1,7 @@
+# fakeip-filter + persistence client: "testsvc" and "*.filtered.example"
+# get REAL answers (STUN/NTP-style compat); everything else gets tokens.
+# The map persists to /tmp/fakeip.cache across restarts.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp" }, socks5_port = 1086, tproxy = { mode = "tproxy", tcp_port = 7903, udp_port = 7904, dns_port = 15361, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", fakeip_filter = [ "testsvc", "*.filtered.example" ], fakeip_cache = "/tmp/fakeip.cache" } } }

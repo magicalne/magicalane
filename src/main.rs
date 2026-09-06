@@ -235,6 +235,7 @@ where
         log::info!("routing: direct resolvers (racing): {direct_dns:?}");
     }
     let direct = lib::connector::DirectConnector::new(Some(direct_dns));
+    let direct_resolver = direct.resolver();
     let router = lib::tproxy::TproxyRouter {
         fake_map: fake_map.clone(),
         routing: std::sync::Arc::new(engine),
@@ -245,6 +246,25 @@ where
         .as_deref()
         .and_then(lib::dns::AaaaMode::parse)
         .unwrap_or(lib::dns::AaaaMode::Auto);
+    // fake-ip exceptions: these domains get REAL answers (STUN/NTP/…)
+    let fakeip_filter: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        routing_cfg.fakeip_filter.clone().unwrap_or_default(),
+    );
+    if !fakeip_filter.is_empty() {
+        log::info!("routing: fakeip filter entries: {}", fakeip_filter.len());
+    }
+    // Persistence: restore tokens, periodic save, save on shutdown.
+    if let Some(path) = routing_cfg.fakeip_cache.clone() {
+        let restored = fake_map.load(&path);
+        log::info!("routing: fakeip cache: restored {restored} entries from {path}");
+        let map = fake_map.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                map.save(&path);
+            }
+        });
+    }
     log::info!("routing: default={:?} rules={} aaaa={aaaa:?}",
         routing_cfg.default_action(), routing_cfg.rule.len());
 
@@ -370,6 +390,8 @@ where
                             fake_map.clone(),
                             aaaa,
                             v6_active,
+                            fakeip_filter.clone(),
+                            direct_resolver.clone(),
                             connector.clone(),
                         ));
                     }
@@ -406,6 +428,10 @@ where
             }
             anyhow::bail!("socks server exited: {r:?}");
         }
+    }
+    if let Some(path) = &routing_cfg.fakeip_cache {
+        fake_map.save(path);
+        log::info!("fakeip cache saved to {path}");
     }
     log::info!("terminating: removing network state");
     if mode == TproxyMode::Tproxy {

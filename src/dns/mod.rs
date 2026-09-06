@@ -189,6 +189,19 @@ where
     Ok(resp)
 }
 
+/// Label-aligned suffix match for fakeip_filter entries.
+fn suffix_matches(domain: &str, entry: &str) -> bool {
+    let entry = entry.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
+    if entry.is_empty() {
+        return false;
+    }
+    let d = domain.to_ascii_lowercase();
+    if d == entry {
+        return true;
+    }
+    d.ends_with(&format!(".{entry}"))
+}
+
 // ---------------------------------------------------------------- fakeip mode
 
 /// Serve DNS in fakeip mode: every A query is answered LOCALLY with a
@@ -201,6 +214,8 @@ pub async fn serve_client_fakeip<C, IO>(
     map: Arc<FakeIpMap>,
     aaaa: AaaaMode,
     v6_intercept_active: bool,
+    filter: Arc<Vec<String>>,
+    resolver: std::sync::Arc<resolve::Resolver>,
     connector: C,
 ) where
     C: Connector<Connection = IO> + Send + 'static + Clone,
@@ -212,11 +227,16 @@ pub async fn serve_client_fakeip<C, IO>(
             Ok((n, from)) => {
                 let query = buf[..n].to_vec();
                 let map = map.clone();
+                let filter = filter.clone();
+                let resolver = resolver.clone();
                 let connector = connector.clone();
                 let sock = sock.clone();
                 spawn(async move {
                     let _permit = INFLIGHT.acquire().await;
-                    let resp = answer_fakeip(map, aaaa, v6_intercept_active, connector, query).await;
+                    let resp = answer_fakeip(
+                        map, aaaa, v6_intercept_active, filter, resolver, connector, query,
+                    )
+                    .await;
                     if let Ok(resp) = resp {
                         let _ = sock.send_to(&resp, from).await;
                     } else if let Err(err) = resp {
@@ -237,6 +257,8 @@ async fn answer_fakeip<C, IO>(
     map: Arc<FakeIpMap>,
     aaaa: AaaaMode,
     v6_intercept_active: bool,
+    filter: Arc<Vec<String>>,
+    resolver: std::sync::Arc<resolve::Resolver>,
     connector: C,
     query: Vec<u8>,
 ) -> io::Result<Vec<u8>>
@@ -247,6 +269,32 @@ where
     let Some(q) = proto::parse_query(&query) else {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "unparseable dns query"));
     };
+    // Filtered domains (STUN/NTP/games...) get REAL answers: tokens
+    // would break endpoints that validate addresses.
+    if filter.iter().any(|f| suffix_matches(&q.domain, f)) {
+        debug!("fakeip filter hit: {} (real answer)", q.domain);
+        let addrs = resolver.resolve(&q.domain, 0).await.unwrap_or_default();
+        let ttl = 30;
+        match q.qtype {
+            proto::QTYPE_A => {
+                for a in &addrs {
+                    if let IpAddr::V4(v4) = a.ip() {
+                        return Ok(proto::build_a_response_ttl(&q, v4, ttl));
+                    }
+                }
+                return Ok(proto::build_empty_response(&q));
+            }
+            proto::QTYPE_AAAA => {
+                for a in &addrs {
+                    if let IpAddr::V6(v6) = a.ip() {
+                        return Ok(proto::build_aaaa_response_ttl(&q, v6, ttl));
+                    }
+                }
+                return Ok(proto::build_empty_response(&q));
+            }
+            _ => {}
+        }
+    }
     match q.qtype {
         proto::QTYPE_A => {
             let ip = map.assign_v4(&q.domain);

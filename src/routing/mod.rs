@@ -353,6 +353,8 @@ mod tests {
             direct_dns: None,
             server_ip: None,
             geoip_dir: None,
+            fakeip_filter: None,
+            fakeip_cache: None,
             rule: rules,
         }
     }

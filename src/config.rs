@@ -232,6 +232,12 @@ pub struct RoutingSpec {
     /// Directory holding per-country CIDR lists for `geoip` rules
     /// (default "/etc/magicalane/geoip"; `geoip = "cn"` loads cn.txt).
     pub geoip_dir: Option<String>,
+    /// Domains that must NOT get fake tokens (STUN/NTP/games/captive
+    /// portals): answered with REAL resolution instead. Suffix match,
+    /// leading "*." optional: ["stun.*.*", "*.ntp.org", "localhost"].
+    pub fakeip_filter: Option<Vec<String>>,
+    /// Persist the fake-IP map across restarts (path). Absent = off.
+    pub fakeip_cache: Option<String>,
     /// Ordered rules; first match wins.
     #[serde(default)]
     pub rule: Vec<RoutingRule>,

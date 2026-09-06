@@ -174,6 +174,63 @@ fn insert(inner: &mut Inner, domain: String, ip: IpAddr) {
 
 
 impl FakeIpMap {
+    /// Persist the map: one "ip domain" line per entry (atomic tmp+rename).
+    pub fn save(&self, path: &str) {
+        let inner = self.inner.lock().unwrap();
+        let mut out = String::with_capacity(inner.ip_to_domain.len() * 40);
+        for (ip, domain) in &inner.ip_to_domain {
+            out.push_str(&format!("{ip} {domain}\n"));
+        }
+        drop(inner);
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, out).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    /// Load a previously saved map; allocators resume after the highest
+    /// token. Returns the number of restored entries.
+    pub fn load(&self, path: &str) -> usize {
+        let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+        let mut inner = self.inner.lock().unwrap();
+        let mut n = 0;
+        for line in text.lines() {
+            let mut it = line.splitn(2, ' ');
+            let (Some(ip), Some(domain)) = (it.next(), it.next()) else { continue };
+            let Ok(ip) = ip.parse::<IpAddr>() else { continue };
+            if domain.is_empty() {
+                continue;
+            }
+            // Only OUR token ranges make sense to restore.
+            if !Self::is_fake(ip) {
+                continue;
+            }
+            if inner.ip_to_domain.contains_key(&ip) || inner.domain_to_ip.contains_key(domain) {
+                continue;
+            }
+            inner.ip_to_domain.insert(ip, domain.to_string());
+            inner.domain_to_ip.insert(domain.to_string(), ip);
+            inner.lru.push_back(domain.to_string());
+            n += 1;
+            // advance allocators past restored tokens
+            match ip {
+                IpAddr::V4(v4) => {
+                    let num = u32::from(v4);
+                    if num >= inner.v4_next && num <= FAKE_V4_RANGE.1 {
+                        inner.v4_next = num + 1;
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    let num = u128::from(v6);
+                    if num >= inner.v6_next && num <= FAKE_V6_BASE | ((1u128 << FAKE_V6_PREFIX) - 1) {
+                        inner.v6_next = num + 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
     /// Test/debug helper: is a domain currently mapped?
     #[cfg(test)]
     fn lookup_by_domain(&self, domain: &str) -> bool {

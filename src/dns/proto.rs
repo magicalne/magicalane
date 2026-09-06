@@ -149,9 +149,39 @@ pub fn build_a_response(q: &DnsQuery<'_>, ip: Ipv4Addr) -> Vec<u8> {
     assemble(q, 0, Some(&a_answer(ip)))
 }
 
+/// A-record response with an explicit TTL (real answers).
+pub fn build_a_response_ttl(q: &DnsQuery<'_>, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
+    assemble(q, 0, Some(&a_answer_ttl(ip, ttl)))
+}
+
+fn a_answer_ttl(ip: Ipv4Addr, ttl: u32) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[0] = 0xC0;
+    a[1] = 0x0C;
+    a[2..4].copy_from_slice(&QTYPE_A.to_be_bytes());
+    a[4..6].copy_from_slice(&1u16.to_be_bytes());
+    a[6..10].copy_from_slice(&ttl.to_be_bytes());
+    a[10..12].copy_from_slice(&4u16.to_be_bytes());
+    a[12..16].copy_from_slice(&ip.octets());
+    a
+}
+
 /// Response carrying a fake AAAA record.
 pub fn build_aaaa_response(q: &DnsQuery<'_>, ip: Ipv6Addr) -> Vec<u8> {
     assemble(q, 0, Some(&aaaa_answer(ip)))
+}
+
+/// AAAA-record response with an explicit TTL (real answers).
+pub fn build_aaaa_response_ttl(q: &DnsQuery<'_>, ip: Ipv6Addr, ttl: u32) -> Vec<u8> {
+    let mut a = [0u8; 28];
+    a[0] = 0xC0;
+    a[1] = 0x0C;
+    a[2..4].copy_from_slice(&QTYPE_AAAA.to_be_bytes());
+    a[4..6].copy_from_slice(&1u16.to_be_bytes());
+    a[6..10].copy_from_slice(&ttl.to_be_bytes());
+    a[10..12].copy_from_slice(&16u16.to_be_bytes());
+    a[12..28].copy_from_slice(&ip.octets());
+    assemble(q, 0, Some(&a))
 }
 
 /// NODATA response (rcode OK, zero answers) — e.g. AAAA when disabled.

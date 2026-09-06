@@ -1,0 +1,5 @@
+# TUN-mode client: no iptables at all — a userspace TCP/IP stack (mgl0).
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "quic" }, socks5_port = 1089, tproxy = { mode = "tun", tcp_port = 0, udp_port = 0, dns_port = 0 } } }

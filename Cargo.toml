@@ -46,12 +46,11 @@ structopt = "0.3.0"
 pin-project = "1.0.7"
 socket2 = "0.5"
 rustls-pki-types = "1"
-tun = { version = "0.8", features = ["async"], optional = true }
-smoltcp = { version = "0.14", features = ["proto-ipv4", "medium-ip", "socket-tcp", "socket-udp"], optional = true }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "proto-ipv4", "proto-ipv6", "medium-ip", "socket-tcp", "socket-udp"], optional = true }
 base64 = "0.22"
 webpki-roots = "0.26"
 
 
 [features]
 default = []
-tun-mode = ["dep:tun", "dep:smoltcp"]
+tun-mode = ["dep:smoltcp"]

@@ -109,7 +109,7 @@ fn run(cmd: &str, args: &[&str]) -> io::Result<String> {
 }
 
 /// Best-effort variant used for teardown (tolerates absence).
-fn run_ok(cmd: &str, args: &[&str]) {
+pub(crate) fn run_ok(cmd: &str, args: &[&str]) {
     let _ = run(cmd, args);
 }
 

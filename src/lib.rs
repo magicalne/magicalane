@@ -15,6 +15,8 @@ pub(crate) mod proxy;
 pub mod dns;
 pub mod httpfetch;
 pub mod httpin;
+#[cfg(feature = "tun-mode")]
+pub mod tun;
 pub mod tproxy;
 pub mod routing;
 pub mod udp;

@@ -70,6 +70,9 @@ wait_exec() { # name cmd... (retry until cmd succeeds inside container, 30s)
 cd "$ROOT"
 say "building release binary"
 cargo build --release
+# TUN feature binary (default build stays lean; env image ships both)
+cargo build --release --features tun-mode
+cp -f target/release/magicalane "$ENV_DIR/.build/magicalane-tun"
 
 say "staging build context"
 mkdir -p "$ENV_DIR/.build"
@@ -133,6 +136,7 @@ ensure_run magicalane-client \
     $CE run -d --name magicalane-client --label "$LABEL" \
     --network "$NET" \
     --cap-add NET_ADMIN \
+    --device /dev/net/tun \
     -e RUST_LOG=info \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws.toml:/etc/magicalane/client-ws.toml:ro" \
@@ -142,6 +146,7 @@ ensure_run magicalane-client \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-auth.toml:/etc/magicalane/client-ws-auth.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-fakefilter.toml:/etc/magicalane/client-ws-fakefilter.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-provider.toml:/etc/magicalane/client-ws-provider.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-ws-tun.toml:/etc/magicalane/client-ws-tun.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 

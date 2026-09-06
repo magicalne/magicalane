@@ -283,6 +283,32 @@ where
     log::info!("routing: default={:?} rules={} aaaa={aaaa:?}",
         routing_cfg.default_action(), routing_cfg.rule.len());
 
+    // TUN mode: full userspace stack, no iptables at all.
+    #[cfg(feature = "tun-mode")]
+    if mode == lib::config::TproxyMode::Tun {
+        let server_ip_v4 = (server_host, server_port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.find(|a| a.is_ipv4()))
+            .and_then(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("TUN mode requires an IPv4-resolvable server address"))?;
+        let mut socks = lib::socks5::server::Server::new(
+            Some(socks5_port),
+            bind.as_deref(),
+            allow_lan,
+            socks5_users.clone().unwrap_or_default(),
+            connector.clone(),
+            bandwidth,
+        )
+        .await?;
+        tokio::spawn(async move { socks.run().await });
+        lib::tun::serve(connector, router.clone(), bandwidth, server_ip_v4).await?;
+        return Ok(());
+    }
+
     // Transparent listeners must exist BEFORE rules are installed.
     let tcp_listener = match mode {
         TproxyMode::Tproxy => Some(lib::tproxy::bind(tproxy.tcp_port)?),

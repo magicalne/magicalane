@@ -1,90 +1,53 @@
-//! TUN route management (clean-exit contract).
-//! Routes are tagged with a reserved protocol number (96) so teardown
-//! is exact-match; the TUN device itself is destroyed when the fd closes.
+//! TUN route management (clean-exit contract). Interface addressing +
+//! default route with the server exception; all applied via the same
+//! raw fork/execve runner as the tproxy rules.
 
-use std::{io, net::Ipv4Addr, process::{Command, Stdio}};
+use std::io;
 
 use log::info;
 
-use super::ROUTE_PROTO;
+use crate::tproxy::rules::run_ok;
 
-#[derive(Debug, Clone)]
-pub struct RouteSpec {
-    pub server_ip: Ipv4Addr,
-    pub dev: String,
-    pub gateway: String,
-}
-
-fn run(cmd: &str, args: &[&str]) -> io::Result<String> {
-    let out = Command::new(cmd)
-        .args(args)
-        .stderr(Stdio::null())
-        .output()?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
-    } else {
-        Err(io::Error::other(format!(
-            "{cmd} {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )))
+/// Apply device addressing + routes. Idempotent.
+pub fn tun_apply(
+    dev: &str,
+    v4: &str,
+    v6: &str,
+    server_ip: std::net::Ipv4Addr,
+) -> io::Result<()> {
+    tun_teardown(dev, server_ip);
+    // Device addressing (kernel needs an address to source/route).
+    for (addr, fam) in [(v4, "4"), (v6, "-6")] {
+        run_ok("ip", &[fam, "addr", "add", addr, "dev", dev]);
     }
-}
-
-fn run_ok(cmd: &str, args: &[&str]) {
-    let _ = run(cmd, args);
-}
-
-/// Install routes: server exception + default via TUN.
-/// Tagged with ROUTE_PROTO for exact-match teardown.
-pub fn apply(spec: &RouteSpec) -> io::Result<()> {
-    teardown(spec);
-
-    // Exception: server reachable via the main routing table
-    run(
-        "ip",
-        &[
-            "route", "add",
-            &spec.server_ip.to_string(),
-            "dev", "eth0",
-            "proto", &ROUTE_PROTO.to_string(),
-        ],
-    )?;
-
-    // Default: everything else goes through the TUN
-    run(
-        "ip",
-        &[
-            "route", "replace", "default",
-            "via", &spec.gateway,
-            "dev", &spec.dev,
-            "metric", "100",
-            "proto", &ROUTE_PROTO.to_string(),
-        ],
-    )?;
-
-    info!("TUN routes applied (proto {ROUTE_PROTO})");
+    run_ok("ip", &["link", "set", dev, "up"]);
+    // The tproxy plane's fake-range local routes (local 198.18.0.0/15
+    // dev lo) live in the LOCAL table: they (and their kernel dst
+    // cache) pin token destinations to loopback and REFUSE TUN-mode
+    // connections. Remove them and flush the cache.
+    run_ok("ip", &["route", "del", "local", "198.18.0.0/15", "dev", "lo"]);
+    run_ok("ip", &["-6", "route", "del", "local", "fc00::/18", "dev", "lo"]);
+    run_ok("ip", &["route", "flush", "cache"]);
+    run_ok("ip", &["-6", "route", "flush", "cache"]);
+    // Server + local subnet exceptions via the main table (more
+    // specific than any default route).
+    run_ok("ip", &[
+        "route", "add", &server_ip.to_string(), "via", "255.255.255.255", "dev", "eth0",
+        "onlink",
+    ]);
+    // Default via the TUN, metric 50 (wins over the kernel's eth0
+    // default at metric 100 in the lab; any lower-than-existing metric
+    // works — use metric 1 for real deployments).
+    run_ok("ip", &["route", "add", "default", "dev", dev, "metric", "1"]);
+    run_ok("ip", &["-6", "route", "add", "default", "dev", dev, "metric", "1"]);
+    info!("tun routes applied ({dev} default metric 1, server {server_ip} via eth0)");
     Ok(())
 }
 
-/// Remove exactly what we added (by proto tag).
-pub fn teardown(_spec: &RouteSpec) {
-    // Remove all routes tagged with our proto
-    run_ok("ip", &["route", "del", "default", "proto", &ROUTE_PROTO.to_string()]);
-    // The server exception has a specific prefix
-    run_ok(
-        "ip",
-        &[
-            "route", "del",
-            &_spec.server_ip.to_string(),
-            "proto", &ROUTE_PROTO.to_string(),
-        ],
-    );
-    info!("TUN routes removed");
-}
-
-/// Whether TUN routes are currently installed.
-pub fn is_installed() -> bool {
-    run("ip", &["route", "show", "proto", &ROUTE_PROTO.to_string()])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false)
+/// Remove what we added. Idempotent; safe when nothing exists.
+pub fn tun_teardown(dev: &str, _server_ip: std::net::Ipv4Addr) {
+    run_ok("ip", &["route", "del", "default", "dev", dev]);
+    run_ok("ip", &["-6", "route", "del", "default", "dev", dev]);
+    run_ok("ip", &["link", "set", dev, "down"]);
+    info!("tun routes removed ({dev})");
 }

@@ -55,7 +55,7 @@ async fn kcp_full_stack() -> anyhow::Result<()> {
 
     // KCP server
     let mut server = KcpServer::new(
-        LocalConnector,
+        LocalConnector::default(),
         (key_path.clone(), cert_path.clone()),
         0,
         PASSWORD.to_string(),

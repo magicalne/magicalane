@@ -16,6 +16,8 @@ use std::{
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use std::net::SocketAddr;
+
 use crate::{
     connector::{Connector, LocalConnector},
     dns::DnsRelayStream,
@@ -79,22 +81,25 @@ impl AsyncWrite for Remote {
 }
 
 /// Wraps the local connector and intercepts magic destinations.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DispatchConnector {
     local: LocalConnector,
+    dns_upstreams: Vec<SocketAddr>,
 }
 
 impl DispatchConnector {
     pub fn new() -> Self {
-        Self {
-            local: LocalConnector,
-        }
+        Self::default()
     }
-}
 
-impl Default for DispatchConnector {
-    fn default() -> Self {
-        Self::new()
+    /// Server-side resolution through the layered resolver (cache ->
+    /// hosts -> racing `[dns] upstream`), used for both TCP relays and
+    /// the DNS magic relay.
+    pub fn with_resolver(resolver: std::sync::Arc<crate::dns::resolve::Resolver>) -> Self {
+        Self {
+            local: LocalConnector::new(resolver.clone()),
+            dns_upstreams: resolver.upstreams().to_vec(),
+        }
     }
 }
 
@@ -104,7 +109,8 @@ impl Connector for DispatchConnector {
     fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<Self::Connection>> {
         match a {
             Addr::DomainName(ref host, _) if host.as_slice() == crate::dns::DNS_MAGIC_HOST => {
-                Box::pin(async { Ok(Remote::Dns(DnsRelayStream::new())) })
+                let upstreams = self.dns_upstreams.clone();
+                Box::pin(async move { Ok(Remote::Dns(DnsRelayStream::new(upstreams))) })
             }
             Addr::DomainName(ref host, _) if host.as_slice() == crate::udp::UDP_MAGIC_HOST => {
                 Box::pin(async { Ok(Remote::Udp(UdpFramedStream::new())) })

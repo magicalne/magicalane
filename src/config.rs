@@ -4,6 +4,8 @@ use serde::Deserialize;
 pub struct Config {
     pub kind: Kind,
     pub password: String,
+    /// Server-side DNS ([dns] upstream/cache_size).
+    pub dns: Option<ServerDns>,
     pub bandwidth: usize,
     pub verbose: bool,
     pub tuning: Option<Tuning>,
@@ -213,8 +215,9 @@ pub struct RoutingSpec {
     pub default: Option<String>,
     /// AAAA strategy in fakeip mode: `auto` (default) | `fake` | `empty`.
     pub aaaa: Option<String>,
-    /// Optional explicit resolver for direct-routed domains ("ip:port").
-    pub direct_dns: Option<String>,
+    /// Resolver(s) for direct-routed domains: a single "ip:port" or a
+    /// list (racing + failover). Default: all nameservers in resolv.conf.
+    pub direct_dns: Option<OneOrMany>,
     /// Optional pinned server IP (bootstrapping without plaintext DNS).
     pub server_ip: Option<String>,
     /// Directory holding per-country CIDR lists for `geoip` rules
@@ -267,5 +270,38 @@ impl RoutingRule {
 pub enum RouteAction {
     Proxy,
     Direct,
+}
+
+/// A config value that accepts either a single string or a list
+/// (`upstream = "1.1.1.1:53"` or `upstream = ["1.1.1.1:53", "8.8.8.8:53"]`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s.clone()],
+            OneOrMany::Many(v) => v.clone(),
+        }
+    }
+}
+
+/// Server-side DNS configuration (`[dns]`).
+///
+/// ```toml
+/// [dns]
+/// upstream = ["1.1.1.1:53", "8.8.8.8:53"]   # racing + failover
+/// cache_size = 4096                          # answer cache cap (0 = off)
+/// ```
+#[derive(Debug, Default, Deserialize)]
+pub struct ServerDns {
+    /// Racing upstream list (default: every nameserver in resolv.conf).
+    pub upstream: Option<OneOrMany>,
+    /// Cache entry cap (default 4096; 0 disables caching).
+    pub cache_size: Option<usize>,
 }
 

@@ -22,21 +22,53 @@ pub trait Connector: Clone {
     fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<Self::Connection>>;
 }
 
-#[derive(Clone)]
-pub struct LocalConnector;
+/// Server-side connector to real destinations. With a resolver, domain
+/// destinations resolve through the layered engine (cache -> hosts ->
+/// racing `[dns] upstream`); without one, the system resolver is used.
+#[derive(Clone, Default)]
+pub struct LocalConnector {
+    resolver: Option<std::sync::Arc<crate::dns::resolve::Resolver>>,
+}
+
+impl LocalConnector {
+    pub fn new(resolver: std::sync::Arc<crate::dns::resolve::Resolver>) -> Self {
+        Self { resolver: Some(resolver) }
+    }
+}
 
 impl Connector for LocalConnector {
     type Connection = TcpStream;
 
     fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<Self::Connection>> {
-        match a {
-            Addr::SocketAddr(addr) => Box::pin(TcpStream::connect(addr)),
-            Addr::DomainName(host, port) => {
-                let addr = (String::from_utf8(host).unwrap(), port);
-                Box::pin(TcpStream::connect(addr))
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            match a {
+                Addr::SocketAddr(addr) => TcpStream::connect(addr).await,
+                Addr::DomainName(host, port) => {
+                    let host = String::from_utf8_lossy(&host).into_owned();
+                    match resolver {
+                        Some(r) => {
+                            let addrs = r.resolve(&host, port).await?;
+                            connect_first(&addrs).await
+                        }
+                        None => TcpStream::connect((host.as_str(), port)).await,
+                    }
+                }
             }
+        })
+    }
+}
+
+/// Try addresses in order; first success wins.
+async fn connect_first(addrs: &[std::net::SocketAddr]) -> io::Result<TcpStream> {
+    let mut last = io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses");
+    for a in addrs {
+        match TcpStream::connect(a).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
         }
     }
+    Err(last)
 }
 
 /// Direct-route connector for the split-routing client: resolves the
@@ -47,47 +79,27 @@ impl Connector for LocalConnector {
 /// in-country CDN affinity.
 #[derive(Clone)]
 pub struct DirectConnector {
-    /// Optional explicit upstream resolver for domain lookups.
-    resolver: Option<std::net::SocketAddr>,
+    /// Layered resolver: cache -> /etc/hosts -> racing upstream probes.
+    /// Upstream sockets are SO_MARK'd so interception rules pass them.
+    resolver: std::sync::Arc<crate::dns::resolve::Resolver>,
 }
 
 impl DirectConnector {
-    pub fn new(resolver: Option<std::net::SocketAddr>) -> Self {
-        Self { resolver }
-    }
-
-    /// Effective resolver: configured one, else the first nameserver in
-    /// /etc/resolv.conf (the client's own resolver — real answers, and
-    /// the rules exempt it from the fake-IP redirect).
-    pub fn effective_resolver(&self) -> Option<std::net::SocketAddr> {
-        self.resolver.or_else(system_resolver)
-    }
-
-    /// Resolve `host:port` locally via the marked DNS probe (search
-    /// domains from resolv.conf applied, glibc-style: bare name first,
-    /// then name+search suffix until an answer). NEVER falls back to
-    /// plain getaddrinfo: an unmarked query would be answered by our
-    /// own fake-IP layer and blackhole the direct path.
-    pub async fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
-        let resolver = self
-            .effective_resolver()
-            .ok_or_else(|| io::Error::other("direct: no resolver available"))?;
-        resolve_via(host, resolver).await
-    }
-}
-
-/// First nameserver from /etc/resolv.conf (the client's own resolver).
-fn system_resolver() -> Option<std::net::SocketAddr> {
-    let text = std::fs::read_to_string("/etc/resolv.conf").ok()?;
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("nameserver") else {
-            continue;
+    /// `resolver`: configured list (single value or racing list); None
+    /// uses every nameserver in /etc/resolv.conf.
+    pub fn new(resolver: Option<Vec<std::net::SocketAddr>>) -> Self {
+        let list = match resolver {
+            Some(l) if !l.is_empty() => l,
+            _ => crate::dns::resolve::nameservers(),
         };
-        if let Ok(addr) = rest.trim().parse::<std::net::IpAddr>() {
-            return Some(std::net::SocketAddr::new(addr, 53));
+        Self {
+            resolver: std::sync::Arc::new(crate::dns::resolve::Resolver::new(list, None)),
         }
     }
-    None
+
+    pub async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+        self.resolver.resolve(host, port).await
+    }
 }
 
 /// SO_MARK via raw setsockopt (avoids socket2's "all" feature).
@@ -113,7 +125,7 @@ impl Connector for DirectConnector {
     type Connection = TcpStream;
 
     fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<Self::Connection>> {
-        let resolver = self.resolver;
+        let resolver = self.resolver.clone();
         Box::pin(async move {
             match a {
                 Addr::SocketAddr(addr) => connect_marked(&[addr]).await,
@@ -185,100 +197,6 @@ async fn tcp_stream_marked(addr: std::net::SocketAddr) -> io::Result<TcpStream> 
     }
 }
 
-/// Whether the host has a GLOBAL v6 route (RFC 6724 ordering heuristic).
-fn host_has_global_v6() -> bool {
-    std::fs::read_to_string("/proc/net/ipv6_route").map(|t| {
-        t.lines().any(|l| {
-            // default route (::/0): dst = 00000000 00000000 with /0 len
-            let f: Vec<&str> = l.split_whitespace().collect();
-            f.len() > 2 && f[0] == "00000000000000000000000000000000" && f[1] == "00"
-        })
-    }).unwrap_or(false)
-}
-
-/// Search domains from /etc/resolv.conf ("search" or "domain" lines).
-fn search_domains() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("search").or_else(|| line.strip_prefix("domain")) {
-                for d in rest.split_whitespace() {
-                    if !d.is_empty() {
-                        out.push(d.trim_end_matches('.').to_string());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Resolve `host` via an explicit UDP resolver: bare name first, then
-/// search-domain candidates (glibc order). Probes are SO_MARK_DIRECT'd
-/// so the interception rules pass them through to the real resolver.
-async fn resolve_via(host: &str, resolver: std::net::SocketAddr) -> io::Result<Vec<std::net::SocketAddr>> {
-    let host = host.trim_end_matches('.');
-    let mut candidates = vec![host.to_string()];
-    for suffix in search_domains() {
-        candidates.push(format!("{host}.{suffix}"));
-    }
-    let mut last_err: Option<io::Error> = None;
-    for name in candidates {
-        match resolve_name_via(&name, resolver).await {
-            Ok(addrs) if !addrs.is_empty() => return Ok(addrs),
-            Ok(_) => continue, // NODATA/NXDOMAIN: try next candidate
-            Err(e) => last_err = Some(e), // timeouts etc: keep trying
-        }
-    }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no resolution")))
-}
-
-async fn resolve_name_via(host: &str, resolver: std::net::SocketAddr) -> io::Result<Vec<std::net::SocketAddr>> {
-    // Query BOTH families, then order like getaddrinfo (RFC 6724): v6
-    // first when the host has a global v6 route — direct-routed traffic
-    // (e.g. China domains on dual-stack clients) then uses native v6.
-    let mut v4 = Vec::new();
-    let mut v6 = Vec::new();
-    for (qtype, sink) in [
-        (crate::dns::proto::QTYPE_AAAA, &mut v6),
-        (crate::dns::proto::QTYPE_A, &mut v4),
-    ] {
-        let bind: std::net::SocketAddr = match resolver {
-            std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
-        };
-        // Marked probe: exempt from the nat REDIRECT so it reaches the
-        // real resolver instead of our fake-IP layer.
-        let sock = udp_socket_marked(bind).await?;
-        sock.connect(resolver).await?;
-        let query = build_probe_query(host, qtype);
-        sock.send(&query).await?;
-        let mut buf = vec![0u8; 1500];
-        let n = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            sock.recv(&mut buf),
-        )
-        .await
-        {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "direct_dns timeout")),
-        };
-        collect_a_records(&buf[..n], qtype, sink);
-    }
-    let prefer_v6 = !v6.is_empty() && host_has_global_v6();
-    let out: Vec<std::net::SocketAddr> = if prefer_v6 {
-        v6.into_iter().chain(v4).collect()
-    } else {
-        v4.into_iter().chain(v6).collect()
-    };
-    if out.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "resolver returned no addresses"));
-    }
-    Ok(out)
-}
-
 /// Marked UDP socket (SO_MARK_DIRECT) for direct-path DNS probes.
 pub async fn udp_socket_marked(bind: std::net::SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -291,95 +209,6 @@ pub async fn udp_socket_marked(bind: std::net::SocketAddr) -> io::Result<tokio::
     socket.set_nonblocking(true)?;
     socket.bind(&bind.into())?;
     tokio::net::UdpSocket::from_std(socket.into())
-}
-
-fn build_probe_query(host: &str, qtype: u16) -> Vec<u8> {
-    let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-    for label in host.trim_end_matches('.').split('.') {
-        q.push(label.len() as u8);
-        q.extend_from_slice(label.as_bytes());
-    }
-    q.push(0);
-    q.extend_from_slice(&qtype.to_be_bytes());
-    q.extend_from_slice(&1u16.to_be_bytes());
-    q
-}
-
-/// Extract A/AAAA rdata from a response (skip name via pointer/labels).
-fn collect_a_records(resp: &[u8], qtype: u16, out: &mut Vec<std::net::SocketAddr>) {
-    let _ = qtype;
-    if resp.len() < 12 {
-        return;
-    }
-    let ancount = u16::from_be_bytes([resp[6], resp[7]]);
-    // Skip question section.
-    let _pos = 12usize;
-    let mut rest = resp;
-    {
-        let mut r = rest;
-        // qname
-        loop {
-            let Some(&len) = r.first() else { return };
-            if len == 0 {
-                r = &r[1..];
-                break;
-            }
-            if len & 0xC0 == 0xC0 {
-                r = &r[2..];
-                break;
-            }
-            if r.len() < 1 + len as usize {
-                return;
-            }
-            r = &r[1 + len as usize..];
-        }
-        if r.len() < 4 {
-            return;
-        }
-        rest = &r[4..];
-    }
-    let port = 0u16; // filled by caller semantics; we only collect ips
-    for _ in 0..ancount {
-        // answer name (pointer or labels)
-        let mut r = rest;
-        loop {
-            let Some(&len) = r.first() else { return };
-            if len & 0xC0 == 0xC0 {
-                r = &r[2..];
-                break;
-            }
-            if len == 0 {
-                r = &r[1..];
-                break;
-            }
-            if r.len() < 1 + len as usize {
-                return;
-            }
-            r = &r[1 + len as usize..];
-        }
-        if r.len() < 10 {
-            return;
-        }
-        let rtype = u16::from_be_bytes([r[0], r[1]]);
-        let rdlen = u16::from_be_bytes([r[8], r[9]]) as usize;
-        let rdata = &r[10..10 + rdlen.min(r.len().saturating_sub(10))];
-        match rtype {
-            1 if rdata.len() == 4 => {
-                let ip = std::net::Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]);
-                out.push(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port));
-            }
-            28 if rdata.len() == 16 => {
-                let mut o = [0u8; 16];
-                o.copy_from_slice(rdata);
-                out.push(std::net::SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(o)),
-                    port,
-                ));
-            }
-            _ => {}
-        }
-        rest = &r[10 + rdlen..];
-    }
 }
 
 #[derive(Clone)]

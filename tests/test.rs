@@ -15,7 +15,7 @@ pub async fn server_test() -> Result<()> {
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("no global subscriber has been set");
-    let connector = LocalConnector;
+    let connector = LocalConnector::default();
     let key_cert = generate_key_and_cert_der("tls", "org", "examples")?;
     let mut server = Server::new(connector, key_cert, 3333, String::from("pwd"), 8024, None)?;
     server.run().await?;

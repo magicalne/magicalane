@@ -1,0 +1,7 @@
+# Layered-DNS client: direct_dns is a LIST — first entry is a dead
+# TEST-NET address (guaranteed timeout), second is the working resolver.
+# Direct-routed (origin) resolution must fail over and still go direct.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "kcp" }, socks5_port = 1084, tproxy = { mode = "tproxy", tcp_port = 7901, udp_port = 7902, dns_port = 15359, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", direct_dns = [ "192.0.2.1:53", "10.89.0.1:53" ], rule = [ { domain_suffix = [ "origin" ], action = "direct" } ] } } }

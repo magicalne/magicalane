@@ -74,5 +74,26 @@ kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca
 - UDP (incl. QUIC/HTTP3-style flows) routes by the same rules; tunnel
   destinations are resolved server-side.
 
+### Layered DNS (both sides)
+
+Resolution is cached, hosts-aware, and redundant:
+
+- client `direct_dns` accepts a single resolver or a **list** — probes
+  race across all upstreams, first answer wins, dead entries cost
+  nothing (`direct_dns = ["223.5.5.5:53", "119.29.29.29:53"]`)
+- the server resolves tunnel-routed domains through `[dns] upstream`
+  (same racing; defaults to every nameserver in resolv.conf) with a
+  TTL-bound answer cache:
+
+```toml
+[dns]
+upstream = ["1.1.1.1:53", "8.8.8.8:53"]
+cache_size = 4096
+```
+
+Lookup order everywhere: cache → /etc/hosts → racing probes (search
+domains applied) → system resolver. Answers order getaddrinfo-style
+(v6 first on dual-stack hosts).
+
 Measured (local lab): fake-IP answers p50 ≈ 0.11 ms; full connect via
 token p50 ≈ 1.4 ms.

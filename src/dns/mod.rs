@@ -35,6 +35,7 @@ use crate::{
 
 pub mod fakeip;
 pub mod proto;
+pub mod resolve;
 
 pub use fakeip::FakeIpMap;
 
@@ -306,39 +307,49 @@ pub struct DnsRelayStream {
     rbuf: BytesMut,
     /// In-flight upstream exchange (query sent, awaiting response).
     pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
-    upstream: SocketAddr,
+    /// Failover list (sequential, short timeout each).
+    upstreams: Vec<SocketAddr>,
 }
 
 impl DnsRelayStream {
-    pub fn new() -> Self {
+    pub fn new(upstreams: Vec<SocketAddr>) -> Self {
         Self {
             wbuf: BytesMut::new(),
             rbuf: BytesMut::new(),
             pending: None,
-            upstream: upstream(),
+            upstreams: if upstreams.is_empty() { vec![upstream()] } else { upstreams },
         }
     }
 
     fn start_exchange(&mut self, query: &[u8]) {
-        let upstream = self.upstream;
+        let upstreams = self.upstreams.clone();
         let query = query.to_vec();
         self.pending = Some(spawn(async move {
-            let sock = UdpSocket::bind(("0.0.0.0", 0)).await?;
-            sock.connect(upstream).await?;
-            sock.send(&query).await?;
-            let mut buf = vec![0u8; 65536];
-            let n = tokio::time::timeout(QUERY_TIMEOUT, sock.recv(&mut buf))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns upstream timeout"))??;
-            buf.truncate(n);
-            Ok(buf)
+            let mut last_err = io::Error::other("no upstreams");
+            // Sequential failover with a short per-upstream timeout; this
+            // path only carries rare non-fakeable qtypes (MX/TXT/SRV).
+            for upstream in upstreams {
+                let sock = match UdpSocket::bind(("0.0.0.0", 0)).await {
+                    Ok(s) => s,
+                    Err(e) => { last_err = e; continue; }
+                };
+                if let Err(e) = sock.connect(upstream).await { last_err = e; continue; }
+                if let Err(e) = sock.send(&query).await { last_err = e; continue; }
+                let mut buf = vec![0u8; 65536];
+                match tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await {
+                    Ok(Ok(n)) => { buf.truncate(n); return Ok(buf); }
+                    Ok(Err(e)) => { last_err = e; }
+                    Err(_) => { last_err = io::Error::new(io::ErrorKind::TimedOut, "dns upstream timeout"); }
+                }
+            }
+            Err(last_err)
         }));
     }
 }
 
 impl Default for DnsRelayStream {
     fn default() -> Self {
-        Self::new()
+        Self::new(Vec::new())
     }
 }
 

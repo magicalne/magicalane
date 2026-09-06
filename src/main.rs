@@ -29,6 +29,7 @@ fn install_crypto_provider() {
 async fn start_with_config(config: Config) -> Result<()> {
     let password = config.password;
     let bandwidth = config.bandwidth;
+    let server_dns = config.dns;
     let kind = config.kind;
     let tuning = config.tuning.clone().unwrap_or_default();
     env_logger::init();
@@ -60,12 +61,31 @@ async fn start_with_config(config: Config) -> Result<()> {
             protocol,
             tls,
         } => {
+            // Layered resolver for server-side lookups: [dns] upstream
+            // list (racing + failover) or every nameserver; answer cache.
+            let upstreams: Vec<std::net::SocketAddr> = server_dns
+                .as_ref()
+                .and_then(|d| d.upstream.as_ref())
+                .map(|o| {
+                    o.to_vec()
+                        .iter()
+                        .filter_map(|s| s.parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !upstreams.is_empty() {
+                log::info!("dns: server upstreams (racing): {upstreams:?}");
+            }
+            let resolver = std::sync::Arc::new(lib::dns::resolve::Resolver::new(
+                upstreams,
+                server_dns.as_ref().and_then(|d| d.cache_size),
+            ));
             let protocol = Protocol::from_opt(&protocol)
                 .with_context(|| "unknown protocol (expected \"quic\" or \"kcp\")")?;
             let tls = tls.unwrap_or(true);
             match protocol {
                 Protocol::Quic => {
-                    let connector = lib::dispatch::DispatchConnector::new();
+                    let connector = lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
                     let key_cert = match (key, ca) {
                         (Some(key), Some(cert)) => (key.into(), cert.into()),
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
@@ -81,7 +101,7 @@ async fn start_with_config(config: Config) -> Result<()> {
                     server.run().await?;
                 }
                 Protocol::Kcp => {
-                    let connector = lib::dispatch::DispatchConnector::new();
+                    let connector = lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
                     let key_cert = match (key, ca) {
                         (Some(key), Some(cert)) => (key.into(), cert.into()),
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
@@ -189,8 +209,20 @@ where
         Err(err) => anyhow::bail!("routing config invalid: {}", err),
     };
     let fake_map = std::sync::Arc::new(lib::dns::FakeIpMap::new());
-    let direct_dns = routing_cfg.direct_dns.as_deref().and_then(|s| s.parse().ok());
-    let direct = lib::connector::DirectConnector::new(direct_dns);
+    let direct_dns: Vec<std::net::SocketAddr> = routing_cfg
+        .direct_dns
+        .as_ref()
+        .map(|o| {
+            o.to_vec()
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !direct_dns.is_empty() {
+        log::info!("routing: direct resolvers (racing): {direct_dns:?}");
+    }
+    let direct = lib::connector::DirectConnector::new(Some(direct_dns));
     let router = lib::tproxy::TproxyRouter {
         fake_map: fake_map.clone(),
         routing: std::sync::Arc::new(engine),

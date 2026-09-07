@@ -119,3 +119,10 @@ env/bench.sh --matrix --transports quic,quic-bbr,kcp --badnet cn-us --under-load
 - Public API errors: use `crate::error::{Result, Error}` rather than ad-hoc error types (SOCKS5 module has its own `error.rs`).
 - Keep async code on tokio; connection/stream logic lives in `conn.rs`/`stream.rs` per module.
 - Do not bump dependency versions casually: `quinn` 0.7 / `rustls` 0.18 / `tokio-util` 0.6 are tightly version-coupled (see Cargo.toml).
+
+## Config compatibility (hard rule)
+
+- The user-facing examples in `configs/` and the fixtures in `env/configs/` are load-bearing documentation: `cargo test --test configs` parse-checks every one of them as part of `cargo test`.
+- **Any change that adds, renames, or removes a config field, changes a default, or alters accepted values must keep those configs valid — update them in the same commit.** Never leave the shipped examples broken.
+- `kind` must stay an inline table (`kind = { Client = {...} }`); the TOML parser rejects `[kind.Client]` header syntax (enum limitation in toml 0.5). `tests/configs.rs` enforces that this constraint stays documented in `configs/README.md`.
+- When introducing a new config capability, extend an example in `configs/` so the parse surface stays covered, and keep top-level `[table]` sections after all bare keys (a bare key after a table header belongs to that table).

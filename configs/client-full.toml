@@ -1,0 +1,27 @@
+# Feature tour — every client-side option in one file. Pick the parts
+# you need; see README.md "Configuration" for per-field docs.
+# NOTE: the `kind` value must stay a (single-line) inline table — the
+# parser rejects [kind.Client] headers (details in configs/README.md).
+
+password = "change-me"
+bandwidth = 65536
+verbose = true
+
+# The `kind` table: primary server ("default") + two extras (mixed
+# transports in one pool) + automatic groups + routing. Line is long —
+# that is the TOML inline-table constraint, not a style choice.
+kind = { Client = { proxy = { host = "my-server.example.com", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "quic" }, server = [ { name = "hk", host = "hk.example.com", port = 4433, protocol = "kcp", ca_path = "/etc/magicalane/certs/ca.pem" }, { name = "work", host = "work.example.com", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" } ], group = [ { name = "auto", gtype = "url-test", servers = ["default", "hk", "work"], url = "http://www.gstatic.com/generate_204", interval = 300, tolerance = 50 }, { name = "backup", gtype = "fallback", servers = ["work", "auto"], interval = 300 }, { name = "lb", gtype = "load-balance", strategy = "sticky", servers = ["default", "hk"] } ], socks5_port = 1080, socks5_users = ["alice:secret"], allow_lan = true, tproxy = { mode = "tproxy", tcp_port = 7895, udp_port = 7896, dns_port = 15353, dns_mode = "fakeip" }, routing = { default = "auto", aaaa = "auto", direct_dns = ["223.5.5.5:53", "119.29.29.29:53"], geoip_dir = "/etc/magicalane/geoip", fakeip_filter = ["stun.*.*", "*.ntp.org", "localhost"], fakeip_cache = "/var/lib/magicalane/fakeip.map", server_ip = "203.0.113.10", rule = [ { domain_suffix = ["*.corp.example.com", "corp.example.com"], action = "work" }, { domain_keyword = ["mirror"], action = "lb" }, { domain_suffix = ["cn", "baidu.com", "qq.com"], action = "direct" }, { geoip = "cn", action = "direct" }, { ip_cidr = ["192.168.0.0/16", "10.0.0.0/8", "fc00::/7"], action = "direct" }, { list_file = "/etc/magicalane/gfwlist.txt", action = "proxy" } ], provider = [ { name = "gfw", url = "https://example.com/gfwlist.txt", interval = 86400, via = "proxy", action = "proxy" } ] } } }
+
+# Top-level table sections go AFTER the plain keys and `kind` (a TOML
+# key after a [table] header would belong to that table).
+
+# Server-side DNS (racing + cache) for tunnel-routed domains.
+[dns]
+upstream = ["1.1.1.1:53", "8.8.8.8:53"]
+cache_size = 4096
+
+[tuning.quic]
+congestion = "bbr"          # cubic (default) | bbr | new-reno
+# send_window = 16777216
+# receive_window = 16777216
+# stream_receive_window = 8388608

@@ -1,0 +1,16 @@
+# KCP+TLS server variant. KCP is a reliable-UDP transport that can
+# outperform QUIC on lossy links (see docs/reports/*benchmarks*).
+# Tuning knobs live under [tuning.kcp] (defaults are fast already).
+password = "change-me"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4433, ca = "/etc/magicalane/certs/server.pem", key = "/etc/magicalane/certs/server.key", protocol = "kcp", tls = true } }
+
+# [tuning.kcp]
+# interval = 10     # internal clock ms
+# nodelay = true
+# resend = 2
+# nc = true         # disable congestion control (fastest on clean links)
+# sndwnd = 512
+# rcvwnd = 512
+# mtu = 1200

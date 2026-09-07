@@ -1,0 +1,14 @@
+# Minimal QUIC server — copy me and edit the certificate paths.
+# Certificates: see configs/README.md ("Quick start") for one-shot
+# openssl commands. The server side needs server.pem + server.key;
+# ca_path on clients refers to the matching ca.pem.
+password = "change-me"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4433, ca = "/etc/magicalane/certs/server.pem", key = "/etc/magicalane/certs/server.key" } }
+
+# Optional: server-side DNS resolution for tunnel-routed domains
+# (racing upstreams + answer cache; defaults to resolv.conf servers).
+# [dns]
+# upstream = ["1.1.1.1:53", "8.8.8.8:53"]
+# cache_size = 4096

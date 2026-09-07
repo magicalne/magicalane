@@ -1,0 +1,9 @@
+# TUN mode: a userspace TCP/IP stack on device mgl0 intercepts
+# everything WITHOUT iptables — same routing engine, same fake-IP DNS.
+# Requires: cargo build --release --features tun-mode
+# Requires: /dev/net/tun (containers: --device /dev/net/tun) and
+# CAP_NET_ADMIN for route setup. The clean-exit contract applies.
+password = "change-me"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "my-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" }, socks5_port = 1080, tproxy = { mode = "tun", tcp_port = 0, udp_port = 0, dns_port = 0, dns_mode = "fakeip" }, routing = { default = "proxy", rule = [ { domain_suffix = ["cn"], action = "direct" } ] } } }

@@ -1,0 +1,7 @@
+# Minimal QUIC client — copy me and edit host/port.
+# Serves SOCKS5 + HTTP proxy on 127.0.0.1:1080 (LAN-exposed only with
+# allow_lan = true AND socks5_users, see client-full.toml).
+password = "change-me"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "my-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" }, socks5_port = 1080, tproxy = { mode = "off", tcp_port = 0, udp_port = 0, dns_port = 0 } } }

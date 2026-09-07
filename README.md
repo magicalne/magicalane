@@ -1,168 +1,283 @@
-# Magicalane - A QUIC based proxy
+# Magicalane — a QUIC/KCP proxy with transparent interception and split routing
 
-## Download
+A local proxy client forwards traffic through an encrypted tunnel
+(QUIC by default, KCP+TLS as an alternative transport) to a relay
+server. Beyond a plain SOCKS5/HTTP inbound, the client can intercept
+**all** traffic transparently — TCP, UDP and DNS, IPv4 and IPv6 —
+answer DNS locally with fake IPs so no real query ever leaks, and
+route every connection by domain/IP rules: China direct, the rest
+through the tunnel, per-domain server selection, load balancing and
+automatic failover across multiple tunnel servers.
 
-Checkout the recent releases.
+Feature highlights:
 
-## Run
+- **Transports**: QUIC (built-in TLS via rustls/quinn) and KCP+TLS
+  (reliable UDP; often faster on lossy links), tunable per side
+- **Inbounds**: SOCKS5 with user/password auth (RFC 1929) and an
+  HTTP proxy on the same port (CONNECT + absolute-form); LAN exposure
+  is opt-in
+- **Transparent modes**: firewall-based TPROXY (IPv4+IPv6, no local
+  DNS dependency) or a fully userspace TUN TCP/IP stack (no iptables
+  at all)
+- **Fake-IP DNS**: local token answers (198.18.0.0/15 / fc00::/18)
+  make DNS pollution impossible by construction; a filter list hands
+  real answers to STUN/NTP/games; the token map persists across
+  restarts
+- **Split routing**: first-match rules on domain suffix (wildcard),
+  exact domain, keyword, IP CIDR, list files (Loyalsoldier/v2ray
+  format), GeoIP country lists; actions `direct`, `proxy`, or a
+  named server/group
+- **Multi-server pools**: mix QUIC and KCP servers in one config;
+  automatic groups — `url-test` (fastest wins with hysteresis),
+  `fallback` (priority failover), `load-balance` (round-robin or
+  sticky-by-destination) — all health-probed through each server's
+  own tunnel
+- **Remote rule providers**: rule lists fetched by URL over the
+  tunnel or direct, auto-refreshed, atomically hot-swapped
+- **Hot reload**: `SIGHUP` re-reads routing rules, providers, geoip
+  lists and the fake-IP filter without dropping the tunnel
+- **Layered DNS** on both sides: answer cache → /etc/hosts → racing
+  upstream probes (dead resolvers cost nothing)
+- **Clean-exit contract**: every firewall/route mutation is
+  transactional and reverted on any exit — including `kill -9`
+  (adopted and cleaned up on the next start)
+- **IPv6 end-to-end**: dual-stack interception, v6-through-tunnel for
+  v4-only clients, per-server v4/v6 loop-prevention exceptions
 
-Both sides read a TOML config via `--config`. The tunnel transport is `quic` (default) or `kcp`; KCP can additionally layer TLS (`tls = true`, default).
+Benchmarks, design notes and lab reports live in `docs/`.
 
-`server`:
+## Quick start
+
+Build (Rust stable):
+
+```sh
+cargo build --release          # TUN mode additionally:
+cargo build --release --features tun-mode
+```
+
+Generate a CA and server certificate once (SAN must match the name
+clients dial):
+
+```sh
+mkdir -p /etc/magicalane/certs && cd /etc/magicalane/certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout ca.key -out ca.pem -subj "/CN=my magicalane CA"
+openssl req -newkey rsa:2048 -nodes \
+    -keyout server.key -out server.csr -subj "/CN=my-server"
+printf 'subjectAltName=DNS:my-server,DNS:localhost,IP:203.0.113.10\n' > ext.cnf
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+    -out server.pem -days 825 -extfile ext.cnf
+```
+
+Copy the starting configs and edit hosts/paths/password:
+
+```sh
+cp configs/server.toml /etc/magicalane/server.toml   # server side
+cp configs/client.toml /etc/magicalane/client.toml   # client side
+```
+
+Run both sides and test through the local proxy:
+
+```sh
+magicalane --config /etc/magicalane/server.toml
+magicalane --config /etc/magicalane/client.toml
+curl --socks5-hostname 127.0.0.1:1080 https://example.com
+```
+
+More examples — KCP, TUN mode, a full feature tour — are in
+[`configs/`](configs/README.md); every shipped config is
+parse-checked by the test suite.
+
+## Configuration
+
+Both sides read one TOML file via `--config`. Common top-level keys:
+`password`, `bandwidth` (bytes/s pacing hint), `verbose`.
+
+> **Format note**: `kind` must be an **inline table**
+> (`kind = { Client = { ... } }`) — the parser rejects `[kind.Client]`
+> headers. Top-level `[table]` sections (`[dns]`, `[tuning.*]`) go
+> **after** all bare keys.
+
+### Server
 
 ```toml
-password = "your-password"
+password = "change-me"
 bandwidth = 65536
 verbose = true
-kind = { Server = { port = 4433, ca = "server.pem", key = "server.key", protocol = "kcp", tls = true } }
-```
+kind = { Server = { port = 4433,
+                    ca = "/etc/magicalane/certs/server.pem",
+                    key = "/etc/magicalane/certs/server.key",
+                    protocol = "kcp",   # quic (default) | kcp
+                    tls = true } }      # kcp only; default true
 
-`client`:
-
-```toml
-password = "your-password"
-bandwidth = 65536
-verbose = true
-kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca.pem", protocol = "kcp", tls = true }, socks5_port = 1080, tproxy = { tcp_port = 7895, udp_port = 7896 } } }
-```
-
-Then start each with `magicalane --config <file>`; the client serves SOCKS5 on `socks5_port`.
-
-## Transparent mode + fake-IP DNS + split routing
-
-Set `tproxy.mode = "tproxy"` for transparent interception (all TCP/UDP,
-both IPv4 and IPv6, firewall-based; routes/rules are transactional —
-removed on any exit, adopted from crashes on restart).
-
-With `dns_mode = "fakeip"`, DNS is answered LOCALLY with tokens
-(198.18.0.0/15 for A, fc00::/18 for AAAA): no real query ever crosses
-your network, so DNS pollution is impossible by construction.
-Connections to tokens are mapped back to their domain at connect time
-and routed by rules — for example China domains direct, everything
-else through the tunnel (direct connections resolve locally, getting
-correct in-country CDN answers):
-
-```toml
-kind = { Client = { proxy = { host = "your.hostname", port = 4433, ca_path = "ca.pem", protocol = "quic" }, socks5_port = 1080,
-  tproxy = { mode = "tproxy", tcp_port = 7895, udp_port = 7896, dns_port = 15353, dns_mode = "fakeip" },
-  routing = { default = "proxy", aaaa = "auto",
-    rule = [ { domain_suffix = [ "cn", "baidu.com", "qq.com" ], action = "direct" },
-              { ip_cidr = [ "192.168.0.0/16", "10.0.0.0/8" ], action = "direct" },
-              { list_file = "/etc/magicalane/china-list.txt", action = "direct" } ] } } }
-```
-
-- Rules evaluate top-to-bottom, first match wins; `default` catches the rest.
-- `list_file` loads Loyalsoldier/v2ray-format domain lists (one domain
-  per line, `#` comments, optional `domain:`/`full:` prefixes). Lines
-  with `/` are auto-detected as CIDRs, so one file can mix domains and
-  IP ranges.
-- `geoip = "cn"` classifies REAL-IP connections (literal IPs, DoH-resolved,
-  hardcoded) by country: it loads `<geoip_dir>/cn.txt` (default
-  `/etc/magicalane/geoip`), a plain CIDR list — use chnroutes2
-  (`chnroutes.txt` / `chnroute6.txt`) or gaoyifan/china-operator-ip
-  (`china.txt` / `china6.txt`), e.g.
-  `curl -o /etc/magicalane/geoip/cn.txt .../china.txt`. Other countries
-  work the same way (`geoip = "us"` → `us.txt`). Missing file = warning,
-  rule stays inert.
-- `aaaa = "auto"` hands out fc00::/18 tokens whenever the IPv6
-  interception plane installs (it only needs local interception, so
-  even v4-only clients can reach v6-only sites through the tunnel —
-  the server connects over its own IPv6 egress; `curl -6 ifconfig.me`
-  then reports the server's IPv6).
-- Hardcoded resolvers (8.8.8.8) can't bypass: the udp/53 redirect is
-  destination-agnostic.
-- UDP (incl. QUIC/HTTP3-style flows) routes by the same rules; tunnel
-  destinations are resolved server-side.
-
-### Layered DNS (both sides)
-
-Resolution is cached, hosts-aware, and redundant:
-
-- client `direct_dns` accepts a single resolver or a **list** — probes
-  race across all upstreams, first answer wins, dead entries cost
-  nothing (`direct_dns = ["223.5.5.5:53", "119.29.29.29:53"]`)
-- the server resolves tunnel-routed domains through `[dns] upstream`
-  (same racing; defaults to every nameserver in resolv.conf) with a
-  TTL-bound answer cache:
-
-```toml
+# Server-side DNS for tunnel-routed domains (racing + cache).
 [dns]
-upstream = ["1.1.1.1:53", "8.8.8.8:53"]
+upstream = ["1.1.1.1:53", "8.8.8.8:53"]   # default: resolv.conf servers
 cache_size = 4096
 ```
 
-Lookup order everywhere: cache → /etc/hosts → racing probes (search
-domains applied) → system resolver. Answers order getaddrinfo-style
+### Client
+
+```toml
+password = "change-me"
+bandwidth = 65536
+verbose = true
+kind = { Client = {
+    # Primary tunnel server (referenced as "default" by rules/groups).
+    proxy = { host = "my-server", port = 4433,
+              ca_path = "/etc/magicalane/certs/ca.pem",
+              protocol = "quic" },          # quic (default) | kcp (+tls)
+
+    # Additional servers: mixed transports in ONE pool.
+    server = [ { name = "work", host = "work.example.com", port = 4433,
+                 protocol = "kcp",
+                 ca_path = "/etc/magicalane/certs/ca.pem",
+                 ip = "203.0.113.9" } ],    # optional pinned IP
+
+    # Automatic proxy groups (all health-probed; no manual mode).
+    group = [
+      { name = "auto", gtype = "url-test",
+        servers = ["default", "work"],
+        url = "http://www.gstatic.com/generate_204",
+        interval = 300, tolerance = 50 },   # ms switch hysteresis
+      { name = "backup", gtype = "fallback",
+        servers = ["work", "default"] },
+      { name = "lb", gtype = "load-balance", strategy = "sticky",
+        servers = ["default", "work"] },    # round-robin (default) | sticky
+    ],
+
+    # Local inbounds. The port serves SOCKS5 AND HTTP proxy; without
+    # allow_lan it binds 127.0.0.1 only. socks5_users = ["user:pass"]
+    # enables RFC 1929 auth (HTTP side answers 407 + Basic).
+    socks5_port = 1080,
+    socks5_users = ["alice:secret"],
+    allow_lan = true,                        # or bind = "0.0.0.0"
+
+    # Transparent interception: mode = "off" | "tproxy" | "tun".
+    tproxy = { mode = "tproxy", tcp_port = 7895, udp_port = 7896,
+               dns_port = 15353,             # 0 disables DNS handling
+               dns_mode = "fakeip" },        # fakeip | tunnel | off
+
+    routing = {
+      default = "auto",                      # unmatched → a group!
+      aaaa = "auto",                         # auto | fake | empty
+      direct_dns = ["223.5.5.5:53", "119.29.29.29:53"],
+      server_ip = "203.0.113.10",            # pin primary (no DNS bootstrap)
+      geoip_dir = "/etc/magicalane/geoip",
+      fakeip_filter = ["stun.*.*", "*.ntp.org"],   # REAL answers for these
+      fakeip_cache = "/var/lib/magicalane/fakeip.map",  # persist tokens
+      rule = [
+        { domain_suffix = ["*.corp.example.com"], action = "work" },
+        { domain_keyword = ["mirror"],        action = "lb" },
+        { domain_suffix = ["cn", "baidu.com"], action = "direct" },
+        { geoip = "cn",                       action = "direct" },
+        { ip_cidr = ["192.168.0.0/16", "10.0.0.0/8"], action = "direct" },
+        { list_file = "/etc/magicalane/gfwlist.txt", action = "proxy" },
+      ],
+      provider = [
+        { name = "gfw", url = "https://example.com/gfwlist.txt",
+          interval = 86400, via = "proxy", action = "proxy" },
+      ],
+    },
+} }
+```
+
+(The example above is spread out for readability — the real `kind`
+value must be one inline line; see `configs/client-full.toml`.)
+
+**Rule evaluation**: top-to-bottom, first match wins, `default`
+catches the rest. Actions: `direct` (local resolution + connect,
+marked to bypass interception), `proxy` (the primary), or any
+server/group name. Suffix matchers are label-aligned wildcards
+(`qq.com` covers `weixin.qq.com`; a `*.` prefix is accepted syntax).
+GeoIP rules load `<geoip_dir>/<cc>.txt` — plain CIDR lists such as
+gaoyifan/china-operator-ip; a missing file only warns. `list_file`
+accepts Loyalsoldier/v2ray domain lists; lines with `/` are parsed as
+CIDRs, so one file may mix both.
+
+**Transport tuning** (optional, both sides):
+
+```toml
+[tuning.kcp]
+interval = 10        # internal clock ms
+nodelay = true
+resend = 2           # fast retransmit aggressiveness
+nc = true            # disable congestion control
+sndwnd = 512         # packets
+rcvwnd = 512
+mtu = 1200
+
+[tuning.quic]
+congestion = "bbr"   # cubic (default) | bbr | new-reno
+send_window = 16777216
+receive_window = 16777216
+stream_receive_window = 8388608
+```
+
+## How the pieces fit
+
+### Transparent interception
+
+`tproxy.mode = "tproxy"` installs firewall rules (iptables/ip6tables +
+policy routing) redirecting all local TCP/UDP — both address families
+— into the client; rules and routes are removed on exit and adopted
+from crashed runs. `mode = "tun"` instead creates a TUN device and a
+userspace TCP/IP stack (smoltcp): no iptables at all, same routing
+engine — ideal where netfilter is unavailable (needs the `tun-mode`
+build, `/dev/net/tun`, CAP_NET_ADMIN). Every tunnel server's address
+automatically gets loop-prevention exceptions in both modes.
+
+### Fake-IP DNS
+
+With `dns_mode = "fakeip"` the client answers A/AAAA queries locally
+from 198.18.0.0/15 / fc00::/18 (TTL 1). No real query leaves the
+machine — DNS pollution is impossible by construction. Connections to
+tokens are mapped back to their domain at connect time and routed by
+rules; tunnel-routed domains resolve **server-side** (correct CDN
+affinity on the far end), direct-routed domains resolve locally via
+`direct_dns`. `aaaa = "auto"` fakes AAAA whenever the v6 interception
+plane installs — a v4-only client can still reach v6-only sites
+through the server's egress. Filtered domains (STUN/NTP/games) get
+real answers; `fakeip_cache` keeps tokens stable across restarts.
+
+### Multi-server groups
+
+All group selection is automatic. Health probes fire every `interval`
+seconds — an HTTP GET **through each member's own tunnel** — marking
+a server dead after 3 consecutive failures and alive after one
+success. `url-test` serves the fastest member and switches only on a
+win larger than `tolerance` ms; `fallback` walks `servers` in order
+and fails over/restores within one probe interval; `load-balance`
+spreads connections (`round-robin`) or pins them per destination
+(`sticky`). Groups may reference other groups (cycles are rejected at
+startup).
+
+### Layered DNS (both sides)
+
+Lookup order: answer cache → `/etc/hosts` → racing upstream probes
+(first answer wins; search domains applied) → system resolver.
+Client-side `direct_dns` and server-side `[dns] upstream` both accept
+a single address or a list; answers are ordered getaddrinfo-style
 (v6 first on dual-stack hosts).
 
-Measured (local lab): fake-IP answers p50 ≈ 0.11 ms; full connect via
-token p50 ≈ 1.4 ms.
+### Hot reload
 
-## Multiple servers: automatic proxy groups
+`SIGHUP` re-reads the config file and applies the routing layer
+live: rules, providers, geoip lists, the fake-IP filter. Transport
+and listener changes still need a restart. `SIGTERM`/`SIGINT` tear
+down every network mutation (the clean-exit contract).
 
-One client can pool several tunnel servers — **mixed transports in one
-pool** (QUIC and KCP side by side) — and route each connection to a
-server or group by domain rule. All selection is automatic: the
-strategy decides, backed by active health probes (an HTTP GET through
-each server's own tunnel; dead after 3 consecutive failures, alive
-again after one success).
+## Development
 
-```toml
-[kind.Client.proxy]            # primary server, name "default"
-host = "a.example.com"
-port = 4433
-
-[[kind.Client.server]]         # additional servers
-name = "work"                  # referenced by rules/groups
-host = "b.example.com"
-port = 4433
-protocol = "kcp"               # quic | kcp, freely mixed
-ip = "203.0.113.9"             # optional pin (skip DNS for this server)
-
-[[kind.Client.group]]
-name = "auto"
-type = "url-test"              # url-test | fallback | load-balance
-servers = ["default", "work"]  # servers or other groups (no cycles)
-url = "http://www.gstatic.com/generate_204"   # probe (default)
-interval = 300                 # seconds
-tolerance = 50                 # ms: url-test switch hysteresis
-
-[[kind.Client.group]]
-name = "lb"
-type = "load-balance"
-strategy = "round-robin"       # round-robin (default) | sticky
-servers = ["default", "work"]
+```sh
+cargo test                        # unit + config-parse tests
+cargo clippy --all-targets        # lint (CI-clean)
+./env/up.sh                       # isolated podman lab (client/server/origin)
+./env/verify.sh full              # end-to-end suite (51 tests, all modes)
+./env/down.sh                     # tear the lab down
 ```
 
-Group semantics:
-
-- **`url-test`** — probes every member through its own tunnel, serves
-  the fastest; switches only when a challenger beats the incumbent by
-  more than `tolerance` ms (anti-flap)
-- **`fallback`** — strict `servers` priority: the first alive member
-  serves; the next takes over within one probe interval on death, and
-  priority is restored on recovery
-- **`load-balance`** — `round-robin` spreads connections evenly;
-  `sticky` hashes the destination so one site keeps one egress while
-  it lives. Dead members are skipped automatically.
-
-Rules (and `default`, and providers' `action`) accept any server or
-group name in addition to `proxy`/`direct`; suffix rules are
-wildcards (`qq.com` covers subdomains; `*.example.com` is accepted
-syntax). New matcher: `domain_keyword` (substring).
-
-```toml
-[kind.Client.routing]
-default = "auto"               # unmatched traffic → the url-test group
-
-[[kind.Client.routing.rule]]
-domain_suffix = ["*.corp.example.com", "corp.example.com"]
-action = "work"                # → that server
-
-[[kind.Client.routing.rule]]
-domain_keyword = ["mirror"]
-action = "lb"                  # → the load-balance group
-```
-
-Every server's address gets the loop-prevention exceptions (iptables
-RETURN rules + TUN routes) automatically, v4 and v6.
+The lab (`env/`) exercises every feature against real containers:
+transports, transparent modes, fake-IP, routing, groups, providers,
+auth, kill -9 residue checks. Transport benchmarks: `env/bench.sh`.
+Plans and reports: `docs/plans/`, `docs/reports/`.

@@ -50,6 +50,7 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                 gateway: false,
                 tcp_port: tproxy.tcp_port,
                 udp_port: tproxy.udp_port,
+                socks_port: 0,
                 dns_port: tproxy.dns_port(),
                 server_ip6: None,
             });
@@ -84,7 +85,7 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                 server_dns.as_ref().and_then(|d| d.cache_size),
             ));
             let protocol = Protocol::from_opt(&protocol)
-                .with_context(|| "unknown protocol (expected \"quic\" or \"kcp\")")?;
+                .with_context(|| "unknown protocol (expected \"quic\", \"kcp\" or \"tcp\")")?;
             let tls = tls.unwrap_or(true);
             match protocol {
                 Protocol::Quic => {
@@ -117,6 +118,22 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                         bandwidth,
                         tls,
                         tuning.kcp.clone(),
+                    )?;
+                    server.run().await?;
+                }
+                Protocol::Tcp => {
+                    let connector = lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
+                    let key_cert = match (key, ca) {
+                        (Some(key), Some(cert)) => (key.into(), cert.into()),
+                        (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
+                    };
+                    let server = lib::tcp::listener::Server::new(
+                        connector,
+                        key_cert,
+                        port,
+                        password,
+                        bandwidth,
+                        tls,
                     )?;
                     server.run().await?;
                 }
@@ -175,6 +192,16 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                         )?;
                         c.prewarm();
                         Ok(lib::tunnel::TunnelConnector::Kcp(c))
+                    }
+                    lib::config::Protocol::Tcp => {
+                        let c = lib::tcp::connector::TcpConnector::new(
+                            host,
+                            port,
+                            ca_path.map(std::path::PathBuf::from),
+                            password.to_vec(),
+                            tls,
+                        )?;
+                        Ok(lib::tunnel::TunnelConnector::Tcp(c))
                     }
                 }
             }
@@ -507,6 +534,7 @@ async fn run_client(
                 gateway: tproxy.gateway(),
                 tcp_port: tproxy.tcp_port,
                 udp_port: tproxy.udp_port,
+                socks_port: socks5_port,
                 dns_port: tproxy.dns_port(),
             };
             lib::tproxy::rules::apply(&spec)?;
@@ -627,6 +655,7 @@ async fn run_client(
                     extra_server_ips: Vec::new(),
                     extra_server_ip6s: Vec::new(),
                     gateway: false,
+                    socks_port: 0,
                     tcp_port: tproxy.tcp_port,
                     udp_port: tproxy.udp_port,
                     dns_port: tproxy.dns_port(),
@@ -647,6 +676,7 @@ async fn run_client(
             extra_server_ips: Vec::new(),
             extra_server_ip6s: Vec::new(),
             gateway: false,
+            socks_port: 0,
             tcp_port: tproxy.tcp_port,
             udp_port: tproxy.udp_port,
             dns_port: tproxy.dns_port(),

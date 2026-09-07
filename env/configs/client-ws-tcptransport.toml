@@ -1,0 +1,7 @@
+# Workstation-mode client whose tunnel is the TCP+TLS transport
+# (proxy.port 4535 = the 039 second server instance). The lab's own
+# transport (quic/kcp) is irrelevant here: the tunnel under test is TCP.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4535, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "tcp" }, socks5_port = 1085, tproxy = { mode = "tproxy", tcp_port = 7903, udp_port = 7904, dns_port = 15357, dns_mode = "fakeip" } } }

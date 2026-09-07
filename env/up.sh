@@ -129,6 +129,7 @@ ensure_run magicalane-server \
     --cap-add NET_ADMIN \
     -e RUST_LOG=info \
     -v "$SERVER_CFG_PATH:/etc/magicalane/server.toml:ro" \
+    -v "$ENV_DIR/configs/server-tcp.toml:/etc/magicalane/server-tcp.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/server.toml
 
@@ -164,6 +165,7 @@ ensure_run magicalane-client \
     -e RUST_LOG=info \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws.toml:/etc/magicalane/client-ws.toml:ro" \
+    -v "$ENV_DIR/configs/client-ws-tcptransport.toml:/etc/magicalane/client-ws-tcptransport.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-fakeip.toml:/etc/magicalane/client-ws-fakeip.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-geoip.toml:/etc/magicalane/client-ws-geoip.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-dnslayer.toml:/etc/magicalane/client-ws-dnslayer.toml:ro" \

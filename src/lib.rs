@@ -17,6 +17,7 @@ pub mod httpfetch;
 pub mod httpin;
 #[cfg(feature = "tun-mode")]
 pub mod tun;
+pub mod tcp;
 pub mod tproxy;
 pub mod routing;
 pub mod tunnel;

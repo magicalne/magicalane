@@ -1,0 +1,7 @@
+# magicalane test-env: TCP+TLS transport server (port 4535). Started as
+# a second instance inside the server container by test 039; shares the
+# lab certs. protocol "tcp" = TLS-over-TCP tunnel (UDP-blocked paths).
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4535, protocol = "tcp", tls = true, ca = "/etc/magicalane/certs/server.pem", key = "/etc/magicalane/certs/server.key" } }

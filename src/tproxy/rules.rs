@@ -48,6 +48,11 @@ pub struct RuleSpec {
     pub tcp_port: u16,
     /// Transparent UDP listener port (0 = UDP interception disabled).
     pub udp_port: u16,
+    /// Local SOCKS5/HTTP port: in gateway mode, LAN traffic aimed at
+    /// the gateway's own services (socks, dns_port) must not be
+    /// TPROXY'd into the transparent listeners — that swallows the
+    /// connection (relay-to-self loop). 0 = no socks listener.
+    pub socks_port: u16,
     /// DNS module listener port (0 = DNS interception disabled).
     pub dns_port: u16,
 }
@@ -330,6 +335,22 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             // Forwarded DNS takes the nat PREROUTING REDIRECT path
             // (MGL-PRENAT), not TPROXY — mirror of the MGL-OUT skip.
             blob.push_str("-A MGL-PRE -p udp --dport 53 -j RETURN\n");
+            // Clients may also query the DNS interceptor directly on
+            // dns_port; don't capture that either.
+            blob.push_str(&format!(
+                "-A MGL-PRE -p udp --dport {} -j RETURN\n", spec.dns_port
+            ));
+            blob.push_str(&format!(
+                "-A MGL-PRE -p tcp --dport {} -j RETURN\n", spec.dns_port
+            ));
+        }
+        if spec.socks_port != 0 {
+            // The gateway's own SOCKS5/HTTP port serves LAN clients
+            // directly; TPROXY-ing it swallows the connection (the
+            // transparent relay would loop back into the port).
+            blob.push_str(&format!(
+                "-A MGL-PRE -p tcp --dport {} -j RETURN\n", spec.socks_port
+            ));
         }
         // Asymmetric transparent paths prefer loose reverse-path
         // filtering; best-effort (rootless may deny).
@@ -553,6 +574,17 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         }
         if spec.dns_port != 0 {
             blob.push_str("-A MGL6-PRE -p udp --dport 53 -j RETURN\n");
+            blob.push_str(&format!(
+                "-A MGL6-PRE -p udp --dport {} -j RETURN\n", spec.dns_port
+            ));
+            blob.push_str(&format!(
+                "-A MGL6-PRE -p tcp --dport {} -j RETURN\n", spec.dns_port
+            ));
+        }
+        if spec.socks_port != 0 {
+            blob.push_str(&format!(
+                "-A MGL6-PRE -p tcp --dport {} -j RETURN\n", spec.socks_port
+            ));
         }
         let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/rp_filter", b"0");
         blob.push_str(&format!("-A {CHAIN6_PRE} ! -i lo -p tcp -j MARK --set-mark {MARK}\n"));

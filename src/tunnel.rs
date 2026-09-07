@@ -37,6 +37,7 @@ use crate::{
 pub enum TunnelStream {
     Quic(crate::quic::stream::QuicStream),
     Kcp(crate::kcp::connector::EitherKcpStream),
+    Tcp(crate::tcp::connector::TcpTunnelStream),
 }
 
 impl AsyncRead for TunnelStream {
@@ -48,6 +49,7 @@ impl AsyncRead for TunnelStream {
         match self.get_mut() {
             TunnelStream::Quic(s) => Pin::new(s).poll_read(cx, buf),
             TunnelStream::Kcp(s) => Pin::new(s).poll_read(cx, buf),
+            TunnelStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -61,18 +63,21 @@ impl AsyncWrite for TunnelStream {
         match self.get_mut() {
             TunnelStream::Quic(s) => Pin::new(s).poll_write(cx, buf),
             TunnelStream::Kcp(s) => Pin::new(s).poll_write(cx, buf),
+            TunnelStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         match self.get_mut() {
             TunnelStream::Quic(s) => Pin::new(s).poll_flush(cx),
             TunnelStream::Kcp(s) => Pin::new(s).poll_flush(cx),
+            TunnelStream::Tcp(s) => Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         match self.get_mut() {
             TunnelStream::Quic(s) => Pin::new(s).poll_shutdown(cx),
             TunnelStream::Kcp(s) => Pin::new(s).poll_shutdown(cx),
+            TunnelStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -82,6 +87,7 @@ impl AsyncWrite for TunnelStream {
 pub enum TunnelConnector {
     Quic(QuicConnector),
     Kcp(KcpConnector),
+    Tcp(crate::tcp::connector::TcpConnector),
 }
 
 impl TunnelConnector {
@@ -96,6 +102,7 @@ impl TunnelConnector {
         match self {
             TunnelConnector::Quic(_) => "quic",
             TunnelConnector::Kcp(_) => "kcp",
+            TunnelConnector::Tcp(_) => "tcp",
         }
     }
 }
@@ -113,6 +120,10 @@ impl Connector for TunnelConnector {
             TunnelConnector::Kcp(kc) => {
                 let fut = Connector::connect(kc, a);
                 Box::pin(async move { fut.await.map(TunnelStream::Kcp) })
+            }
+            TunnelConnector::Tcp(tc) => {
+                let fut = Connector::connect(tc, a);
+                Box::pin(async move { fut.await.map(TunnelStream::Tcp) })
             }
         }
     }

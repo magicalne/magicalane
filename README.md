@@ -11,8 +11,10 @@ automatic failover across multiple tunnel servers.
 
 Feature highlights:
 
-- **Transports**: QUIC (built-in TLS via rustls/quinn) and KCP+TLS
-  (reliable UDP; often faster on lossy links), tunable per side
+- **Transports**: QUIC (built-in TLS via rustls/quinn), KCP+TLS
+  (reliable UDP; often faster on lossy links) and **TCP+TLS** (one TLS
+  connection per proxy connection — for paths where UDP is filtered;
+  on :443 it is indistinguishable from ordinary HTTPS), tunable per side
 - **Inbounds**: SOCKS5 with user/password auth (RFC 1929) and an
   HTTP proxy on the same port (CONNECT + absolute-form); LAN exposure
   is opt-in

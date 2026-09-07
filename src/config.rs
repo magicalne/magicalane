@@ -116,6 +116,7 @@ pub enum Protocol {
     #[default]
     Quic,
     Kcp,
+    Tcp,
 }
 
 impl Protocol {
@@ -123,6 +124,7 @@ impl Protocol {
         match s.as_deref() {
             None | Some("quic") => Some(Self::Quic),
             Some("kcp") => Some(Self::Kcp),
+            Some("tcp") => Some(Self::Tcp),
             _ => None,
         }
     }

@@ -27,7 +27,7 @@ suite_alias() {
     case "$1" in
         fast) echo "smoke" ;;
         # tproxy tests imply the tproxy profile; smoke runs without it
-        full) echo "smoke transport tproxy regression fakeip routing tun" ;;
+        full) echo "smoke transport tproxy regression fakeip routing tun multi" ;;
         *) echo "$1" ;;
     esac
 }

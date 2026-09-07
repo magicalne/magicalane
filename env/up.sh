@@ -72,11 +72,11 @@ say "building release binary"
 cargo build --release
 # TUN feature binary (default build stays lean; env image ships both)
 cargo build --release --features tun-mode
-cp -f target/release/magicalane "$ENV_DIR/.build/magicalane-tun"
 
 say "staging build context"
 mkdir -p "$ENV_DIR/.build"
 cp -f target/release/magicalane "$ENV_DIR/.build/magicalane"
+cp -f target/release/magicalane "$ENV_DIR/.build/magicalane-tun"
 cp -f target/release/magabench "$ENV_DIR/.build/magabench"
 cp -f "$ENV_DIR/tproxy-rules.sh" "$ENV_DIR/.build/tproxy-rules.sh"
 cp -f "$ENV_DIR/ws-daemon.sh" "$ENV_DIR/.build/ws-daemon.sh"
@@ -132,6 +132,30 @@ ensure_run magicalane-server \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/server.toml
 
+# Second server for multi-server tests: one container, BOTH transports
+# (QUIC :4533, KCP :4534) so client pools can mix protocols.
+ensure_run magicalane-server2 \
+    $CE run -d --name magicalane-server2 --label "$LABEL" \
+    --network "$NET" --network-alias magicalane-server2 \
+    --cap-add NET_ADMIN \
+    -e RUST_LOG=info \
+    -v "$ENV_DIR/configs/server2-quic.toml:/etc/magicalane/server2-quic.toml:ro" \
+    -v "$ENV_DIR/configs/server2-kcp.toml:/etc/magicalane/server2-kcp.toml:ro" \
+    -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
+    "$IMAGE" sh -c 'while :; do
+        if [ ! -f /tmp/mgl-server2-down ]; then
+            magicalane --config /etc/magicalane/server2-quic.toml &
+            magicalane --config /etc/magicalane/server2-kcp.toml &
+            wait
+        fi
+        sleep 1
+    done'
+
+# The supervisor keeps both tunnel processes alive (and the container's
+# IPs stable across kills). Tests take server2 down deterministically:
+#   touch /tmp/mgl-server2-down + pkill -x magicalane   (down)
+#   rm /tmp/mgl-server2-down                             (auto-revive)
+
 ensure_run magicalane-client \
     $CE run -d --name magicalane-client --label "$LABEL" \
     --network "$NET" \
@@ -147,6 +171,7 @@ ensure_run magicalane-client \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-fakefilter.toml:/etc/magicalane/client-ws-fakefilter.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-provider.toml:/etc/magicalane/client-ws-provider.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-tun.toml:/etc/magicalane/client-ws-tun.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-ws-multi.toml:/etc/magicalane/client-ws-multi.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml
 
@@ -162,13 +187,21 @@ $CE exec magicalane-client sh -c "grep -q testsvc /etc/hosts 2>/dev/null || echo
 # server joins the backend network (idempotent) so it - and only it - can
 # reach the private test service
 if ! $CE inspect magicalane-server --format '{{range $k, $_ := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -q " $BACKEND "; then
-    $CE network connect "$BACKEND" magicalane-server
+    $CE network connect "$BACKEND" magicalane-server || true
     say "connected magicalane-server to $BACKEND"
 fi
 # aardvark DNS does not serve internal networks - pin the name on the server
 TESTSVC_IP_NOW="$($CE inspect magicalane-testsvc --format '{{(index .NetworkSettings.Networks "magicalane-backend").IPAddress}}')"
-$CE exec magicalane-server sh -c "grep -q testsvc /etc/hosts 2>/dev/null || echo '$TESTSVC_IP_NOW testsvc' >> /etc/hosts"
+$CE exec magicalane-server sh -c "grep -v ' testsvc' /etc/hosts > /tmp/h 2>/dev/null; cat /tmp/h > /etc/hosts 2>/dev/null; echo '$TESTSVC_IP_NOW testsvc' >> /etc/hosts"
 wait_exec magicalane-server sh -c "curl -fsS --max-time 2 http://testsvc:8080/id >/dev/null"
+
+# server2 (multi-server tests) joins the backend too and gets the same pin.
+if ! $CE inspect magicalane-server2 --format '{{range $k, $_ := .NetworkSettings.Networks}}{{$k}} {{end}}' | grep -q " $BACKEND "; then
+    $CE network connect "$BACKEND" magicalane-server2 || true
+    say "connected magicalane-server2 to $BACKEND"
+fi
+$CE exec magicalane-server2 sh -c "grep -v ' testsvc' /etc/hosts > /tmp/h 2>/dev/null; cat /tmp/h > /etc/hosts 2>/dev/null; echo '$TESTSVC_IP_NOW testsvc' >> /etc/hosts" || true
+$CE exec magicalane-server2 sh -c "grep -q origin /etc/hosts 2>/dev/null || echo '$($CE inspect magicalane-origin --format '{{(index .NetworkSettings.Networks "'"$NET"'").IPAddress}}') origin' >> /etc/hosts" || true
 
 say "core lab up: client socks5 -> $TRANSPORT -> server -> origin (+ private testsvc on $BACKEND)"
 

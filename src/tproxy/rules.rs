@@ -32,8 +32,13 @@ const CHAIN6_NAT: &str = "MGL6-NAT";
 pub struct RuleSpec {
     /// Tunnel server address: our own egress must bypass interception.
     pub server_ip: Ipv4Addr,
+    /// Additional tunnel servers (multi-server configs): their IPs get
+    /// the same interception exceptions as `server_ip`.
+    pub extra_server_ips: Vec<Ipv4Addr>,
     /// Server's IPv6 address, when it has one (v6 plane exception).
     pub server_ip6: Option<std::net::Ipv6Addr>,
+    /// Additional server v6 addresses (multi-server configs).
+    pub extra_server_ip6s: Vec<std::net::Ipv6Addr>,
     /// Gateway mode: intercept FORWARDED traffic too (PREROUTING on real
     /// interfaces). Workstation mode (false) only intercepts local traffic.
     pub gateway: bool,
@@ -215,6 +220,9 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     nat.push_str(&format!(
         "-A {CHAIN_NAT} -d {}/32 -j RETURN\n", spec.server_ip
     ));
+    for ip in &spec.extra_server_ips {
+        nat.push_str(&format!("-A {CHAIN_NAT} -d {ip}/32 -j RETURN\n"));
+    }
     nat.push_str("-A MGL-NAT -d 127.0.0.0/8 -j RETURN\n");
     nat.push_str("-A MGL-NAT -d 224.0.0.0/4 -j RETURN\n");
     nat.push_str("-A MGL-NAT -d 255.255.255.255/32 -j RETURN\n");
@@ -244,6 +252,9 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             crate::connector::SO_MARK_DIRECT
         ));
         blob.push_str(&format!("-A {CHAIN_OUT} -d {}/32 -j RETURN\n", spec.server_ip));
+        for ip in &spec.extra_server_ips {
+            blob.push_str(&format!("-A {CHAIN_OUT} -d {ip}/32 -j RETURN\n"));
+        }
         blob.push_str("-A MGL-OUT -d 127.0.0.0/8 -j RETURN\n");
         if spec.dns_port != 0 {
             // DNS handled by REDIRECT in nat; skip it here
@@ -416,6 +427,9 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     if let Some(srv) = spec.server_ip6 {
         nat.push_str(&format!("-A {CHAIN6_NAT} -d {srv}/128 -j RETURN\n"));
     }
+    for srv in &spec.extra_server_ip6s {
+        nat.push_str(&format!("-A {CHAIN6_NAT} -d {srv}/128 -j RETURN\n"));
+    }
     nat.push_str("-A MGL6-NAT -d ::1/128 -j RETURN\n");
     nat.push_str("-A MGL6-NAT -d fe80::/10 -j RETURN\n");
     nat.push_str("-A MGL6-NAT -d ff00::/8 -j RETURN\n");
@@ -440,6 +454,9 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             crate::connector::SO_MARK_DIRECT
         ));
         if let Some(srv) = spec.server_ip6 {
+            blob.push_str(&format!("-A {CHAIN6_OUT} -d {srv}/128 -j RETURN\n"));
+        }
+        for srv in &spec.extra_server_ip6s {
             blob.push_str(&format!("-A {CHAIN6_OUT} -d {srv}/128 -j RETURN\n"));
         }
         blob.push_str("-A MGL6-OUT -d ::1/128 -j RETURN\n");

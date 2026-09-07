@@ -31,7 +31,7 @@ use tokio::{
 };
 
 use crate::{
-    connector::{Connector, DirectConnector},
+    connector::DirectConnector,
     dns::FakeIpMap,
     routing::{Action, RoutingEngine, Target},
     socks5::proto::Addr,
@@ -237,11 +237,11 @@ pub struct UdpRouter {
 }
 
 /// Serve intercepted UDP until the socket dies.
-pub async fn serve_client<C, IO>(interceptor: Arc<UdpInterceptor>, connector: C, router: UdpRouter)
-where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+pub async fn serve_client(
+    interceptor: Arc<UdpInterceptor>,
+    pool: crate::tunnel::ProxyPool,
+    router: UdpRouter,
+) {
     let sock = interceptor.sock.clone();
     let reaper = Arc::downgrade(&interceptor);
     tokio::spawn(async move {
@@ -286,10 +286,10 @@ where
                 Some(tx) => tx.clone(),
                 None => {
                     let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-                    let connector = connector.clone();
+                    let pool = pool.clone();
                     let sock = sock.clone();
                     let router = router.clone();
-                    tokio::spawn(flow_task(key, rx, connector, sock, router));
+                    tokio::spawn(flow_task(key, rx, pool, sock, router));
                     flows.insert(key, tx.clone());
                     tx
                 }
@@ -303,33 +303,30 @@ where
     }
 }
 
-async fn flow_task<C, IO>(
+async fn flow_task(
     key: (SocketAddr, SocketAddr),
     rx: mpsc::Receiver<Vec<u8>>,
-    connector: C,
+    pool: crate::tunnel::ProxyPool,
     sock: Arc<UdpSocket>,
     router: UdpRouter,
-) where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) {
     let (src, dst) = key;
     // Fake tokens map back to domains; then the rules decide the path.
-    let (target, action) = if let Some(domain) = router.fake_map.lookup(dst.ip()) {
+    let (target, decision) = if let Some(domain) = router.fake_map.lookup(dst.ip()) {
         debug!("udp: fake {} -> {domain}", dst.ip());
-        let action = router.routing.decide(Target::Domain(&domain));
-        (Addr::DomainName(domain.into_bytes(), dst.port()), action)
+        let decision = router.routing.decide(Target::Domain(&domain));
+        (Addr::DomainName(domain.into_bytes(), dst.port()), decision)
     } else {
-        let action = router.routing.decide(Target::Ip(dst.ip()));
-        (Addr::SocketAddr(dst), action)
+        let decision = router.routing.decide(Target::Ip(dst.ip()));
+        (Addr::SocketAddr(dst), decision)
     };
 
-    match action {
+    match decision.action {
         Action::Direct => {
             udp_direct_flow(src, dst, target, rx, sock, router.direct).await;
         }
         Action::Proxy => {
-            udp_tunnel_flow(src, dst, target, rx, connector, sock).await;
+            udp_tunnel_flow(src, dst, target, rx, pool, decision.server, sock).await;
         }
     }
 }
@@ -404,18 +401,16 @@ async fn udp_direct_flow(
 
 /// Tunnel path: unchanged framing, but the destination frame can be a
 /// domain (the server resolves it server-side).
-async fn udp_tunnel_flow<C, IO>(
+async fn udp_tunnel_flow(
     src: SocketAddr,
     dst: SocketAddr,
     target: Addr,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    mut connector: C,
+    pool: crate::tunnel::ProxyPool,
+    server: Option<std::sync::Arc<str>>,
     sock: Arc<UdpSocket>,
-) where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut stream = match connector.connect(magic_addr()).await {
+) {
+    let mut stream = match pool.connect(server.as_deref(), magic_addr(), None).await {
         Ok(s) => s,
         Err(err) => {
             debug!("udp flow to {dst} connect failed: {err}");

@@ -1,0 +1,5 @@
+# Second server (multi-server tests): KCP+TLS on :4534
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4534, ca = "/etc/magicalane/certs/server2.pem", key = "/etc/magicalane/certs/server2.key", protocol = "kcp", tls = true } }

@@ -10,7 +10,8 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/certs"
 mkdir -p "$DIR"
 
-if [ -s "$DIR/ca.pem" ] && [ -s "$DIR/server.pem" ] && [ -s "$DIR/server.key" ]; then
+if [ -s "$DIR/ca.pem" ] && [ -s "$DIR/server.pem" ] && [ -s "$DIR/server.key" ] \
+        && [ -s "$DIR/server2.pem" ] && [ -s "$DIR/server2.key" ]; then
     echo "certs already present in $DIR"
     exit 0
 fi
@@ -31,6 +32,17 @@ printf 'subjectAltName=DNS:magicalane-server,DNS:localhost\n' > "$tmp/ext.cnf"
 openssl x509 -req -in "$tmp/server.csr" \
     -CA "$DIR/ca.pem" -CAkey "$tmp/ca.key" -CAcreateserial \
     -out "$DIR/server.pem" -days 825 -extfile "$tmp/ext.cnf" >/dev/null 2>&1
+
+# Second server (multi-server tests): own key/cert, SAN magicalane-server2.
+openssl req -newkey rsa:2048 -nodes \
+    -keyout "$DIR/server2.key" -out "$tmp/server2.csr" \
+    -subj "/CN=magicalane-server2" >/dev/null 2>&1
+
+printf 'subjectAltName=DNS:magicalane-server2,DNS:localhost\n' > "$tmp/ext2.cnf"
+
+openssl x509 -req -in "$tmp/server2.csr" \
+    -CA "$DIR/ca.pem" -CAkey "$tmp/ca.key" -CAcreateserial \
+    -out "$DIR/server2.pem" -days 825 -extfile "$tmp/ext2.cnf" >/dev/null 2>&1
 
 openssl x509 -in "$DIR/server.pem" -noout -fingerprint -sha256 > "$DIR/fingerprint"
 echo "certs generated in $DIR:"

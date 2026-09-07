@@ -1,0 +1,5 @@
+# Second server (multi-server tests): QUIC on :4533
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Server = { port = 4533, ca = "/etc/magicalane/certs/server2.pem", key = "/etc/magicalane/certs/server2.key" } }

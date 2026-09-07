@@ -140,6 +140,14 @@ pub enum Kind {
     },
     Client {
         proxy: ProxyConfig,
+        /// Additional tunnel servers (the primary in `proxy` is named
+        /// "default"; groups/rules reference entries by name).
+        #[serde(default)]
+        server: Vec<ServerSpec>,
+        /// Automatic proxy groups over servers (url-test / fallback /
+        /// load-balance). No manual mode: the strategy always decides.
+        #[serde(default)]
+        group: Vec<GroupSpec>,
         socks5_port: u16,
         /// SOCKS5/HTTP users ("user:pass" entries); absent = no auth.
         /// NOTE: with no auth, bind defaults to 127.0.0.1 — set
@@ -161,6 +169,57 @@ pub struct ProxyConfig {
     pub ca_path: Option<String>,
     pub protocol: Option<String>,
     pub tls: Option<bool>,
+}
+
+/// An additional tunnel server (`[[kind.Client.server]]`).
+///
+/// ```toml
+/// [[kind.Client.server]]
+/// name = "work"           # required, unique; referenced by rules/groups
+/// host = "b.example.com"
+/// port = 4433
+/// protocol = "kcp"        # quic (default) | kcp — mixed freely
+/// ip = "203.0.113.9"      # optional pin (skip DNS for this server)
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerSpec {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub ca_path: Option<String>,
+    pub protocol: Option<String>,
+    pub tls: Option<bool>,
+    /// Optional pinned IP (anti-pollution bootstrap, per server).
+    pub ip: Option<String>,
+}
+
+/// An automatic proxy group (`[[kind.Client.group]]`).
+///
+/// ```toml
+/// [[kind.Client.group]]
+/// name = "auto"
+/// type = "url-test"        # url-test | fallback | load-balance
+/// servers = ["default", "work"]   # server or group names (no cycles)
+/// url = "http://www.gstatic.com/generate_204"   # probe (default)
+/// interval = 300          # seconds
+/// tolerance = 50          # ms; url-test hysteresis
+/// strategy = "round-robin"  # load-balance only: round-robin | sticky
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupSpec {
+    pub name: String,
+    /// "url-test" | "fallback" | "load-balance".
+    pub gtype: String,
+    /// Ordered member names (servers or groups).
+    pub servers: Vec<String>,
+    /// Probe URL (HTTP 204-style; default gstatic).
+    pub url: Option<String>,
+    /// Probe interval seconds (default 300).
+    pub interval: Option<u64>,
+    /// url-test switch hysteresis in ms (default 50).
+    pub tolerance: Option<u64>,
+    /// load-balance strategy: "round-robin" (default) | "sticky".
+    pub strategy: Option<String>,
 }
 
 /// Client-side transparent interception.
@@ -265,16 +324,37 @@ pub struct ProviderSpec {
     pub interval: Option<u64>,
     /// Fetch path: "proxy" (through the tunnel, default) or "direct".
     pub via: Option<String>,
-    /// Action for matched entries (default: direct).
-    pub action: Option<RouteAction>,
+    /// Action for matched entries: "direct" (default), "proxy", or a
+    /// server/group name.
+    pub action: Option<String>,
 }
 
 impl RoutingSpec {
-    pub fn default_action(&self) -> RouteAction {
-        match self.default.as_deref() {
-            Some("direct") => RouteAction::Direct,
-            _ => RouteAction::Proxy,
+    /// Names referenced by rules/providers/default (for pool
+    /// validation at startup): every non-"proxy" action string and a
+    /// named default. "direct" excluded (not a tunnel target).
+    pub fn tunnel_targets(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in &self.rule {
+            if let Some(a) = &r.action {
+                if a != "direct" && a != "proxy" && !out.contains(a) {
+                    out.push(a.clone());
+                }
+            }
         }
+        for p in &self.provider {
+            if let Some(a) = &p.action {
+                if a != "direct" && a != "proxy" && !out.contains(a) {
+                    out.push(a.clone());
+                }
+            }
+        }
+        if let Some(d) = &self.default {
+            if d != "direct" && d != "proxy" && !out.contains(d) {
+                out.push(d.clone());
+            }
+        }
+        out
     }
 }
 
@@ -292,25 +372,16 @@ pub struct RoutingRule {
     /// Lines containing `/` are parsed as CIDRs, so one file may mix
     /// domains and IP ranges (auto-detected per line).
     pub list_file: Option<String>,
+    /// Substring (keyword) match, case-insensitive.
+    pub domain_keyword: Option<Vec<String>>,
     /// Country code rule (`geoip = "cn"`): loads `<geoip_dir>/<cc>.txt`
     /// (plain CIDR list, chnroutes2/gaoyifan format). Matches real-IP
     /// connections; inert with a warning if the file is missing.
     pub geoip: Option<String>,
-    /// `"proxy"` or `"direct"` (default when omitted: direct).
-    pub action: Option<RouteAction>,
-}
-
-impl RoutingRule {
-    pub fn action_or_direct(&self) -> RouteAction {
-        self.action.unwrap_or(RouteAction::Direct)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RouteAction {
-    Proxy,
-    Direct,
+    /// `"direct"` (default when omitted), `"proxy"`, or a SERVER /
+    /// GROUP name from `[[server]]`/`[[group]]` (e.g. `"work"`):
+    /// matched traffic uses that tunnel target.
+    pub action: Option<String>,
 }
 
 /// A config value that accepts either a single string or a list

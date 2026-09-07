@@ -1,5 +1,5 @@
 //! TUN route management (clean-exit contract). Interface addressing +
-//! default route with the server exception; all applied via the same
+//! default route with per-server exceptions; all applied via the same
 //! raw fork/execve runner as the tproxy rules.
 
 use std::io;
@@ -13,9 +13,9 @@ pub fn tun_apply(
     dev: &str,
     v4: &str,
     v6: &str,
-    server_ip: std::net::Ipv4Addr,
+    server_ips: &[std::net::Ipv4Addr],
 ) -> io::Result<()> {
-    tun_teardown(dev, server_ip);
+    tun_teardown(dev, server_ips);
     // Device addressing (kernel needs an address to source/route).
     for (addr, fam) in [(v4, "4"), (v6, "-6")] {
         run_ok("ip", &[fam, "addr", "add", addr, "dev", dev]);
@@ -31,23 +31,36 @@ pub fn tun_apply(
     run_ok("ip", &["-6", "route", "flush", "cache"]);
     // Server + local subnet exceptions via the main table (more
     // specific than any default route).
-    run_ok("ip", &[
-        "route", "add", &server_ip.to_string(), "via", "255.255.255.255", "dev", "eth0",
-        "onlink",
-    ]);
-    // Default via the TUN, metric 50 (wins over the kernel's eth0
-    // default at metric 100 in the lab; any lower-than-existing metric
-    // works — use metric 1 for real deployments).
+    for ip in server_ips {
+        run_ok("ip", &[
+            "route",
+            "add",
+            &ip.to_string(),
+            "via",
+            "255.255.255.255",
+            "dev",
+            "eth0",
+            "onlink",
+        ]);
+    }
+    // Default via the TUN, metric 1 (wins over the kernel's eth0
+    // default at metric 100 in the lab and on typical hosts).
     run_ok("ip", &["route", "add", "default", "dev", dev, "metric", "1"]);
     run_ok("ip", &["-6", "route", "add", "default", "dev", dev, "metric", "1"]);
-    info!("tun routes applied ({dev} default metric 1, server {server_ip} via eth0)");
+    info!(
+        "tun routes applied ({dev} default metric 1, {} server exception(s) via eth0)",
+        server_ips.len()
+    );
     Ok(())
 }
 
 /// Remove what we added. Idempotent; safe when nothing exists.
-pub fn tun_teardown(dev: &str, _server_ip: std::net::Ipv4Addr) {
+pub fn tun_teardown(dev: &str, server_ips: &[std::net::Ipv4Addr]) {
     run_ok("ip", &["route", "del", "default", "dev", dev]);
     run_ok("ip", &["-6", "route", "del", "default", "dev", dev]);
+    for ip in server_ips {
+        run_ok("ip", &["route", "del", &ip.to_string(), "dev", "eth0", "onlink"]);
+    }
     run_ok("ip", &["link", "set", dev, "down"]);
     info!("tun routes removed ({dev})");
 }

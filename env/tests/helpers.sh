@@ -69,19 +69,21 @@ ws_running() {
 }
 
 # Start the ws client with a specific config (e.g. fakeip profile).
+# Second arg: the config's tproxy tcp_port (readiness oracle; default
+# 7897 = the fakeip profile).
 ws_start_cfg() {
-    local cfg="$1"
+    local cfg="$1" port="${2:-7897}"
     if ws_running; then return 0; fi
     $CE exec magicalane-client /usr/local/bin/ws-daemon.sh start "$cfg"
     # Wait for listeners AND the nat rules: the listener binds before
     # the rules apply, and a racing query would leak past the interceptor.
     for _ in $(seq 1 40); do
-        if $CE exec magicalane-client sh -c "ss -ltn | grep -q ':7897 ' && iptables -t nat -n -L MGL-NAT >/dev/null 2>&1" >/dev/null 2>&1; then
+        if $CE exec magicalane-client sh -c "ss -ltn | grep -q ':$port ' && iptables -t nat -n -L MGL-NAT >/dev/null 2>&1" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5
     done
-    fail "ws fakeip client did not become ready"
+    fail "ws client ($cfg) did not become ready"
 }
 
 ws_start() {

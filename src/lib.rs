@@ -19,6 +19,7 @@ pub mod httpin;
 pub mod tun;
 pub mod tproxy;
 pub mod routing;
+pub mod tunnel;
 pub mod udp;
 pub mod dispatch;
 pub mod quic;

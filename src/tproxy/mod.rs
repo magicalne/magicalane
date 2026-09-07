@@ -22,7 +22,7 @@ use crate::{
     connector::{Connector, DirectConnector},
     dns::FakeIpMap,
     proxy::Proxy,
-    routing::{Action, RoutingEngine, Target},
+    routing::{Action, Decision, RoutingEngine, Target},
     socks5::proto::Addr,
 };
 
@@ -38,17 +38,17 @@ pub struct TproxyRouter {
 }
 
 impl TproxyRouter {
-    /// Resolve an intercepted destination to (final Addr, action).
+    /// Resolve an intercepted destination to (final Addr, decision).
     /// Fake tokens map back to their domain before rule evaluation.
-    pub fn route(&self, dst: SocketAddr) -> (Addr, Action) {
+    pub fn route(&self, dst: SocketAddr) -> (Addr, Decision) {
         if let Some(domain) = self.fake_map.lookup(dst.ip()) {
             info!("tproxy: fake {} -> {domain}", dst.ip());
-            let action = self.routing.decide(Target::Domain(&domain));
+            let decision = self.routing.decide(Target::Domain(&domain));
             let addr = Addr::DomainName(domain.into_bytes(), dst.port());
-            (addr, action)
+            (addr, decision)
         } else {
-            let action = self.routing.decide(Target::Ip(dst.ip()));
-            (Addr::SocketAddr(dst), action)
+            let decision = self.routing.decide(Target::Ip(dst.ip()));
+            (Addr::SocketAddr(dst), decision)
         }
     }
 }
@@ -92,16 +92,12 @@ pub fn bind(port: u16) -> io::Result<TcpListener> {
 }
 
 /// Serve accepted transparent connections until the listener errors out.
-pub async fn serve<C, IO>(
+pub async fn serve(
     listener: TcpListener,
-    connector: C,
+    pool: crate::tunnel::ProxyPool,
     router: TproxyRouter,
     bandwidth: usize,
-)
-where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
@@ -123,11 +119,11 @@ where
                         continue;
                     }
                 };
-                let connector = connector.clone();
+                let pool = pool.clone();
                 let router = router.clone();
                 log::info!("tproxy accepted conn, original dst {dst}");
                 spawn(async move {
-                    match relay(stream, dst, connector, router, bandwidth).await {
+                    match relay(stream, dst, pool, router, bandwidth).await {
                         Ok(()) => log::info!("tproxy relay {dst} done"),
                         Err(err) => log::warn!("tproxy relay {dst} error: {err}"),
                     }
@@ -198,23 +194,22 @@ where
     }
 }
 
-async fn relay<C, IO>(
+async fn relay(
     client: tokio::net::TcpStream,
     dst: SocketAddr,
-    mut connector: C,
+    pool: crate::tunnel::ProxyPool,
     router: TproxyRouter,
     bandwidth: usize,
-) -> io::Result<()>
-where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (addr, action) = router.route(dst);
-    let proxy = match action {
+) -> io::Result<()> {
+    let (addr, decision) = router.route(dst);
+    let proxy = match decision.action {
         Action::Proxy => {
-            log::info!("tproxy relay {dst}: tunnel via {addr:?}");
-            let tunnel = connector
-                .connect(addr)
+            log::info!(
+                "tproxy relay {dst}: tunnel via {addr:?} ({})",
+                decision.server.as_deref().unwrap_or("default")
+            );
+            let tunnel = pool
+                .connect(decision.server.as_deref(), addr, None)
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))?;
             Proxy::new(client, Remote::Tunnel(tunnel), bandwidth)
@@ -273,11 +268,12 @@ pub fn bind6(port: u16) -> io::Result<TcpListener> {
 
 /// Serve v6 transparent connections (REDIRECT path: recover the
 /// original destination via IP6T_SO_ORIGINAL_DST).
-pub async fn serve6<C, IO>(listener: TcpListener, connector: C, router: TproxyRouter, bandwidth: usize)
-where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+pub async fn serve6(
+    listener: TcpListener,
+    pool: crate::tunnel::ProxyPool,
+    router: TproxyRouter,
+    bandwidth: usize,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
@@ -289,11 +285,11 @@ where
                         continue;
                     }
                 };
-                let connector = connector.clone();
+                let pool = pool.clone();
                 let router = router.clone();
                 log::info!("tproxy6 accepted conn, original dst {dst}");
                 spawn(async move {
-                    match relay(stream, dst, connector, router, bandwidth).await {
+                    match relay(stream, dst, pool, router, bandwidth).await {
                         Ok(()) => log::info!("tproxy6 relay {dst} done"),
                         Err(err) => log::warn!("tproxy6 relay {dst} error: {err}"),
                     }

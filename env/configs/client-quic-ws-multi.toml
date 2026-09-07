@@ -1,0 +1,7 @@
+# Multi-server client: primary QUIC (the usual server) + "alt" = server2
+# over KCP — a MIXED-TRANSPORT pool. testsvc is pinned to "alt"; groups
+# exercise fallback/url-test/load-balance over both servers.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "quic" }, server = [ { name = "alt", host = "magicalane-server2", port = 4534, protocol = "kcp", ca_path = "/etc/magicalane/certs/ca.pem" } ], group = [ { name = "fb", gtype = "fallback", servers = ["alt", "default"], url = "http://magicalane-origin/", interval = 2, tolerance = 0 }, { name = "ut", gtype = "url-test", servers = ["alt", "default"], url = "http://magicalane-origin/", interval = 2, tolerance = 0 }, { name = "lb", gtype = "load-balance", servers = ["default", "alt"], strategy = "round-robin" } ], socks5_port = 1086, tproxy = { mode = "tproxy", tcp_port = 7903, udp_port = 7904, dns_port = 15357, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", rule = [ { domain_suffix = ["fb.testsvc"], action = "fb" }, { domain_suffix = ["ut.testsvc"], action = "ut" }, { domain_suffix = ["lb.testsvc"], action = "lb" }, { domain_suffix = ["testsvc", "*.testsvc"], action = "alt" } ] } } }

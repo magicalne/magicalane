@@ -3,21 +3,28 @@
 //! Every intercepted connection (TCP via tproxy, UDP via the relay)
 //! asks the engine where to go:
 //!
-//!   `Proxy`  → through the tunnel connector (server-side resolution)
+//!   `Proxy`  → through the tunnel pool (server-side resolution);
+//!              a named rule target (`action = "work"`) pins the
+//!              connection to that server or proxy group
 //!   `Direct` → DirectConnector (local resolution + direct connect)
 //!
 //! Rules are evaluated top to bottom; first match wins; `default`
-//! catches the rest. Rule types: `domain_suffix` (label-aligned),
-//! `domain` (exact), `ip_cidr` (v4+v6), `list_file` (suffix list
-//! loaded at startup, Loyalsoldier/v2ray format: one domain per line,
-//! `#` comments, optional `domain:` prefix treated as suffix).
+//! catches the rest (also nameable: `default = "auto"` selects a
+//! group for unmatched traffic). Rule types: `domain_suffix`
+//! (label-aligned wildcard; a leading `*.` is accepted and stripped),
+//! `domain` (exact), `domain_keyword` (substring), `ip_cidr` (v4+v6),
+//! `list_file` (suffix list loaded at startup, Loyalsoldier/v2ray
+//! format: one domain per line, `#` comments, optional `domain:`
+//! prefix treated as suffix).
 
 use std::{
     collections::HashSet,
     net::IpAddr,
 };
 
-use crate::config::{RouteAction as CfgAction, RoutingSpec};
+use std::sync::Arc;
+
+use crate::config::RoutingSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -25,12 +32,33 @@ pub enum Action {
     Direct,
 }
 
-impl From<CfgAction> for Action {
-    fn from(a: CfgAction) -> Self {
-        match a {
-            CfgAction::Proxy => Action::Proxy,
-            CfgAction::Direct => Action::Direct,
-        }
+/// Full routing outcome: where AND through which tunnel target.
+/// `server` names a server or proxy group (None = pool default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    pub action: Action,
+    pub server: Option<Arc<str>>,
+}
+
+impl Decision {
+    pub fn direct() -> Self {
+        Self { action: Action::Direct, server: None }
+    }
+    pub fn proxy() -> Self {
+        Self { action: Action::Proxy, server: None }
+    }
+}
+
+/// Parse an action string: "direct", "proxy", or a server/group name
+/// (any other word — treated as a named tunnel target).
+fn parse_action(name: &str) -> Decision {
+    match name {
+        "direct" | "" => Decision::direct(),
+        "proxy" => Decision::proxy(),
+        other => Decision {
+            action: Action::Proxy,
+            server: Some(Arc::from(other)),
+        },
     }
 }
 
@@ -47,6 +75,8 @@ enum Matcher {
     DomainSuffix(HashSet<String>),
     /// Exact match (case-insensitive).
     DomainExact(HashSet<String>),
+    /// Substring match (case-insensitive).
+    DomainKeyword(HashSet<String>),
     /// CIDR ranges for real-IP connections.
     IpCidr(IpRanges),
     /// Country-code CIDR set (`<geoip_dir>/<cc>.txt`).
@@ -153,13 +183,13 @@ fn family_mask(addr: IpAddr, len: u8) -> u128 {
 #[derive(Debug)]
 struct Rule {
     matcher: Matcher,
-    action: Action,
+    outcome: std::sync::Arc<Decision>,
 }
 
 #[derive(Debug)]
 pub struct RoutingEngine {
     inner: std::sync::Arc<std::sync::RwLock<Vec<Rule>>>,
-    default: std::sync::Arc<std::sync::RwLock<Action>>,
+    default: std::sync::Arc<std::sync::RwLock<Decision>>,
     /// Live provider sets (name -> swappable content).
     providers: std::sync::Arc<
         std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::RwLock<LoadedList>>>>,
@@ -172,7 +202,7 @@ impl RoutingEngine {
     pub fn from_config(cfg: &RoutingSpec) -> std::io::Result<Self> {
         let engine = Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            default: std::sync::Arc::new(std::sync::RwLock::new(Action::Proxy)),
+            default: std::sync::Arc::new(std::sync::RwLock::new(Decision::proxy())),
             providers: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -186,17 +216,23 @@ impl RoutingEngine {
     pub fn reload(&self, cfg: &RoutingSpec) -> std::io::Result<()> {
         let mut rules = Vec::new();
         for r in &cfg.rule {
-            let action = r.action_or_direct().into();
+            let outcome = std::sync::Arc::new(parse_action(r.action.as_deref().unwrap_or("direct")));
             if let Some(suffixes) = &r.domain_suffix {
                 rules.push(Rule {
                     matcher: Matcher::DomainSuffix(suffixes.iter().map(|s| normalize(s)).collect()),
-                    action,
+                    outcome: outcome.clone(),
                 });
             }
             if let Some(exact) = &r.domain {
                 rules.push(Rule {
                     matcher: Matcher::DomainExact(exact.iter().map(|s| normalize(s)).collect()),
-                    action,
+                    outcome: outcome.clone(),
+                });
+            }
+            if let Some(keywords) = &r.domain_keyword {
+                rules.push(Rule {
+                    matcher: Matcher::DomainKeyword(keywords.iter().map(|s| normalize(s)).collect()),
+                    outcome: outcome.clone(),
                 });
             }
             if let Some(cidrs) = &r.ip_cidr {
@@ -204,7 +240,7 @@ impl RoutingEngine {
                 for c in cidrs {
                     parsed.push(parse_cidr(c)?);
                 }
-                rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&parsed)), action });
+                rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&parsed)), outcome: outcome.clone() });
             }
             if let Some(cc) = &r.geoip {
                 let dir = cfg
@@ -220,16 +256,16 @@ impl RoutingEngine {
                 }
                 rules.push(Rule {
                     matcher: Matcher::GeoIp(IpRanges::from_cidrs(&loaded.cidrs)),
-                    action,
+                    outcome: outcome.clone(),
                 });
             }
             if let Some(path) = &r.list_file {
                 let loaded = load_list_file(path)?;
                 if !loaded.domains.is_empty() {
-                    rules.push(Rule { matcher: Matcher::DomainSuffix(loaded.domains), action });
+                    rules.push(Rule { matcher: Matcher::DomainSuffix(loaded.domains), outcome: outcome.clone() });
                 }
                 if !loaded.cidrs.is_empty() {
-                    rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&loaded.cidrs)), action });
+                    rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&loaded.cidrs)), outcome: outcome.clone() });
                 }
             }
         }
@@ -244,11 +280,12 @@ impl RoutingEngine {
             };
             rules.push(Rule {
                 matcher: Matcher::Provider { name: p.name.clone(), set },
-                action: p.action.unwrap_or(crate::config::RouteAction::Direct).into(),
+                outcome: std::sync::Arc::new(parse_action(p.action.as_deref().unwrap_or("direct"))),
             });
         }
         *self.inner.write().unwrap() = rules;
-        *self.default.write().unwrap() = cfg.default_action().into();
+        *self.default.write().unwrap() =
+            parse_action(cfg.default.as_deref().unwrap_or("proxy"));
         Ok(())
     }
 
@@ -270,55 +307,66 @@ impl RoutingEngine {
     /// A pass-through engine: everything → default (used when no
     /// `[routing]` section exists).
     pub fn all(action: Action) -> Self {
+        let decision = match action {
+            Action::Proxy => Decision::proxy(),
+            Action::Direct => Decision::direct(),
+        };
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            default: std::sync::Arc::new(std::sync::RwLock::new(action)),
+            default: std::sync::Arc::new(std::sync::RwLock::new(decision)),
             providers: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
         }
     }
 
-    pub fn decide(&self, target: Target<'_>) -> Action {
+    pub fn decide(&self, target: Target<'_>) -> Decision {
         match target {
             Target::Domain(d) => self.decide_domain(d),
             Target::Ip(ip) => self.decide_ip(ip),
         }
     }
 
-    fn decide_domain(&self, domain: &str) -> Action {
+    fn decide_domain(&self, domain: &str) -> Decision {
         let d = normalize(domain);
         let rules = self.inner.read().unwrap();
         for rule in rules.iter() {
             match &rule.matcher {
                 Matcher::DomainSuffix(set) => {
                     if suffix_match(&d, set) {
-                        return rule.action;
+                        return (*rule.outcome).clone();
                     }
                 }
                 Matcher::DomainExact(set) => {
                     if set.contains(&d) {
-                        return rule.action;
+                        return (*rule.outcome).clone();
+                    }
+                }
+                Matcher::DomainKeyword(set) => {
+                    if set.iter().any(|k| d.contains(k.as_str())) {
+                        return (*rule.outcome).clone();
                     }
                 }
                 Matcher::Provider { name, set } => {
                     let guard = set.read().unwrap();
                     if !guard.domains.is_empty() && suffix_match(&d, &guard.domains) {
                         log::debug!("routing: matched provider {name} for {d}");
-                        return rule.action;
+                        return (*rule.outcome).clone();
                     }
                 }
                 Matcher::IpCidr(_) | Matcher::GeoIp(_) => {} // IP-only matchers
             }
         }
-        *self.default.read().unwrap()
+        self.default.read().unwrap().clone()
     }
 
-    fn decide_ip(&self, ip: IpAddr) -> Action {
+    fn decide_ip(&self, ip: IpAddr) -> Decision {
         let rules = self.inner.read().unwrap();
         for rule in rules.iter() {
             match &rule.matcher {
-                Matcher::IpCidr(r) | Matcher::GeoIp(r) if r.contains(ip) => return rule.action,
+                Matcher::IpCidr(r) | Matcher::GeoIp(r) if r.contains(ip) => {
+                            return (*rule.outcome).clone();
+                        }
                 Matcher::Provider { name, set } => {
                     let guard = set.read().unwrap();
                     if !guard.cidrs.is_empty() {
@@ -327,19 +375,23 @@ impl RoutingEngine {
                         let ranges = IpRanges::from_cidrs(&guard.cidrs);
                         if ranges.contains(ip) {
                             log::debug!("routing: matched provider {name} for {ip}");
-                            return rule.action;
+                            return (*rule.outcome).clone();
                         }
                     }
                 }
                 _ => {}
             }
         }
-        *self.default.read().unwrap()
+        self.default.read().unwrap().clone()
     }
 }
 
+/// Normalize a domain-ish config token: lowercase, strip a leading
+/// dot, and accept wildcard syntax (`*.example.com` == `example.com`
+/// suffix semantics; a bare `*` is dropped by callers who need it).
 fn normalize(s: &str) -> String {
-    s.trim_start_matches('.').to_ascii_lowercase()
+    let s = s.trim_start_matches('.').to_ascii_lowercase();
+    s.strip_prefix("*.").unwrap_or(&s).to_string()
 }
 
 /// Label-aligned suffix match against a set.
@@ -428,7 +480,7 @@ pub fn parse_list_content(text: &str) -> LoadedList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{RouteAction, RoutingRule, RoutingSpec};
+    use crate::config::{RoutingRule, RoutingSpec};
 
     fn spec(rules: Vec<RoutingRule>, default: Option<&str>) -> RoutingSpec {
         RoutingSpec {
@@ -442,6 +494,13 @@ mod tests {
             rule: rules,
             provider: Vec::new(),
         }
+    }
+
+    fn proxy() -> Decision {
+        Decision::proxy()
+    }
+    fn direct() -> Decision {
+        Decision::direct()
     }
 
     #[test]
@@ -554,33 +613,63 @@ mod tests {
     fn first_match_wins_with_default() {
         let r1 = RoutingRule {
             domain_suffix: Some(vec!["cn".into(), "baidu.com".into()]),
-            action: Some(RouteAction::Direct),
+            action: Some("direct".into()),
             ..Default::default()
         };
         let r2 = RoutingRule {
             domain: Some(vec!["baidu.com".into()]),
-            action: Some(RouteAction::Proxy),
+            action: Some("proxy".into()),
             ..Default::default()
         };
         let engine = RoutingEngine::from_config(&spec(vec![r1, r2], Some("proxy"))).unwrap();
-        assert_eq!(engine.decide(Target::Domain("weixin.qq.com")), Action::Proxy); // default
-        assert_eq!(engine.decide(Target::Domain("map.baidu.com")), Action::Direct); // rule 1
+        assert_eq!(engine.decide(Target::Domain("weixin.qq.com")), proxy()); // default
+        assert_eq!(engine.decide(Target::Domain("map.baidu.com")), direct()); // rule 1
         // rule 1 already matched suffix baidu.com -> Direct (first match)
-        assert_eq!(engine.decide(Target::Domain("baidu.com")), Action::Direct);
-        assert_eq!(engine.decide(Target::Domain("twitter.com")), Action::Proxy);
-        assert_eq!(engine.decide(Target::Ip("8.8.8.8".parse().unwrap())), Action::Proxy);
+        assert_eq!(engine.decide(Target::Domain("baidu.com")), direct());
+        assert_eq!(engine.decide(Target::Domain("twitter.com")), proxy());
+        assert_eq!(engine.decide(Target::Ip("8.8.8.8".parse().unwrap())), proxy());
+    }
+
+    #[test]
+    fn named_target_and_wildcard_syntax() {
+        let r1 = RoutingRule {
+            // wildcard syntax accepted: "*.corp.example.com" behaves as
+            // suffix "corp.example.com" (matches subdomains AND apex)
+            domain_suffix: Some(vec!["*.corp.example.com".into()]),
+            action: Some("work".into()),
+            ..Default::default()
+        };
+        let r2 = RoutingRule {
+            domain_keyword: Some(vec!["mirror".into()]),
+            action: Some("mirror-pool".into()),
+            ..Default::default()
+        };
+        let engine = RoutingEngine::from_config(&spec(vec![r1, r2], Some("auto-pool"))).unwrap();
+        let d = engine.decide(Target::Domain("git.corp.example.com"));
+        assert_eq!(d.action, Action::Proxy);
+        assert_eq!(d.server.as_deref(), Some("work"));
+        assert_eq!(
+            engine.decide(Target::Domain("corp.example.com")).server.as_deref(),
+            Some("work")
+        );
+        let d = engine.decide(Target::Domain("fedora-mirror.example.net"));
+        assert_eq!(d.server.as_deref(), Some("mirror-pool"));
+        // named default
+        let d = engine.decide(Target::Domain("plain.example.org"));
+        assert_eq!(d.action, Action::Proxy);
+        assert_eq!(d.server.as_deref(), Some("auto-pool"));
     }
 
     #[test]
     fn ip_cidr_rule_directs_lan() {
         let r = RoutingRule {
             ip_cidr: Some(vec!["192.168.0.0/16".into(), "10.0.0.0/8".into()]),
-            action: Some(RouteAction::Direct),
+            action: Some("direct".into()),
             ..Default::default()
         };
         let engine = RoutingEngine::from_config(&spec(vec![r], Some("proxy"))).unwrap();
-        assert_eq!(engine.decide(Target::Ip("192.168.5.5".parse().unwrap())), Action::Direct);
-        assert_eq!(engine.decide(Target::Domain("internal.corp")), Action::Proxy);
+        assert_eq!(engine.decide(Target::Ip("192.168.5.5".parse().unwrap())), direct());
+        assert_eq!(engine.decide(Target::Domain("internal.corp")), proxy());
     }
 
     #[test]

@@ -144,35 +144,53 @@ impl Connector for KcpConnector {
         let tuning = self.tuning.clone();
         let pool = self.pool.clone();
         Box::pin(async move {
-            // Try a pre-authenticated session from the pool first
+            // Try a pre-authenticated session from the pool first. A
+            // hard 5s bound: pooled sessions can be stale (server
+            // reaped them at the idle timeout) and KCP retransmits
+            // forever without one — a dead server would hang relays.
+            const HANDSHAKE_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(5);
             let pooled = pool.lock().await.pop();
-            match pooled {
-                Some(mut stream) => {
-                    // Session is authenticated; just send the address
+            if let Some(mut stream) = pooled {
+                let ok = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut addr_buf = bytes::BytesMut::new();
                     a.encode(&mut addr_buf);
-                    stream.write_all(&addr_buf).await
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    stream.flush().await
-                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    stream.write_all(&addr_buf).await?;
+                    stream.flush().await?;
                     let mut flag = [0u8; 1];
-                    stream.read_exact(&mut flag).await
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    if flag[0] != 0 {
+                    stream.read_exact(&mut flag).await?;
+                    io::Result::Ok(flag[0])
+                })
+                .await;
+                match ok {
+                    Ok(Ok(0)) => return Ok(stream),
+                    Ok(Ok(_)) => {
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
                             "remote refused",
-                        ));
+                        ))
                     }
-                    Ok(stream)
+                    Ok(Err(e)) => return Err(io::Error::other(e.to_string())),
+                    Err(_) => {
+                        log::debug!("kcp: pooled session stale (timeout); full handshake");
+                        // fall through to a fresh session
+                    }
                 }
-                None => {
-                    // Pool empty; full handshake
-                    connect_kcp(remote, server_name, tls, &passwd, &a, &tuning)
-                        .await
-                        .map_err(|e| io::Error::other(e.to_string()))
-                }
+            }
+            // Full handshake, bounded the same way.
+            match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT * 2,
+                connect_kcp(remote, server_name, tls, &passwd, &a, &tuning),
+            )
+            .await
+            {
+                Ok(Ok(s)) => Ok(s),
+                Ok(Err(e)) => Err(io::Error::other(e.to_string())),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "kcp connect timeout",
+                )),
             }
         })
     }

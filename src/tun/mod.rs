@@ -261,19 +261,15 @@ struct UdpFlow {
 
 // ---------------------------------------------------------------- serve
 
-pub async fn serve<C, IO>(
-    connector: C,
+pub async fn serve(
+    pool: crate::tunnel::ProxyPool,
     router: TproxyRouter,
     bandwidth: usize,
-    server_ip: Ipv4Addr,
-) -> anyhow::Result<()>
-where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    server_ips: Vec<Ipv4Addr>,
+) -> anyhow::Result<()> {
     let _file = open_tun(TUN_NAME)?;
     let fd = _file.as_raw_fd();
-    routes::tun_apply(TUN_NAME, TUN_ADDR, TUN_ADDR6, server_ip)?;
+    routes::tun_apply(TUN_NAME, TUN_ADDR, TUN_ADDR6, &server_ips)?;
     info!("tun: {TUN_NAME} up ({TUN_ADDR}/{TUN_ADDR6}); default route via {TUN_NAME}");
 
     let async_fd = tokio::io::unix::AsyncFd::new(unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) })?;
@@ -331,7 +327,7 @@ where
                     &mut udp_flows,
                     &fake_map,
                     &router,
-                    &connector,
+                    &pool,
                     bandwidth,
                 );
             }
@@ -479,7 +475,7 @@ fn to_smoltcp_ep(a: SocketAddr) -> IpEndpoint {
 
 /// Snoop one inbound packet: feed smoltcp + create flows / spawn relays.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_ingress<C, IO>(
+fn dispatch_ingress(
     pkt: &[u8],
     phy: &mut TunPhy,
     sockets: &mut SocketSet,
@@ -487,12 +483,9 @@ fn dispatch_ingress<C, IO>(
     udp_flows: &mut HashMap<FlowKey, UdpFlow>,
     fake_map: &Arc<dns::FakeIpMap>,
     router: &TproxyRouter,
-    connector: &C,
+    pool: &crate::tunnel::ProxyPool,
     bandwidth: usize,
-) where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) {
     let Some((src_ip, dst_ip, proto, off)) = parse_ip(pkt) else {
         return;
     };
@@ -528,7 +521,7 @@ fn dispatch_ingress<C, IO>(
                         write_space: write_space.clone(),
                     },
                     router.clone(),
-                    connector.clone(),
+                    pool.clone(),
                     bandwidth,
                 );
                 tcp_flows.insert(
@@ -579,7 +572,7 @@ fn dispatch_ingress<C, IO>(
                 let (to_relay_tx, to_relay_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                 let (from_relay_tx, from_relay_rx) =
                     tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
-                spawn_udp_relay(key, to_relay_rx, from_relay_tx, router.clone(), connector.clone());
+                spawn_udp_relay(key, to_relay_rx, from_relay_tx, router.clone(), pool.clone());
                 ensure_udp_flow(
                     sockets,
                     udp_flows,
@@ -644,28 +637,30 @@ fn ensure_udp_flow(
     let _ = udp_flows.get(key);
 }
 
-fn spawn_tcp_relay<C, IO>(
+fn spawn_tcp_relay(
     key: FlowKey,
     stream: TunStream,
     mut router: TproxyRouter,
-    mut connector: C,
+    pool: crate::tunnel::ProxyPool,
     bandwidth: usize,
-) where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) {
     tokio::spawn(async move {
         let dst = key.1;
-        let (addr, action) = route_dst(&router, dst);
-        match action {
-            Action::Proxy => match connector.connect(addr).await {
-                Ok(remote) => {
-                    debug!("tun: relay {dst} tunneled");
-                    let proxy = Proxy::new(stream, remote, bandwidth);
-                    let _ = std::pin::pin!(proxy).await;
+        let (addr, decision) = route_dst(&router, dst);
+        match decision.action {
+            Action::Proxy => {
+                match pool
+                    .connect(decision.server.as_deref(), addr, None)
+                    .await
+                {
+                    Ok(remote) => {
+                        debug!("tun: relay {dst} tunneled");
+                        let proxy = Proxy::new(stream, remote, bandwidth);
+                        let _ = std::pin::pin!(proxy).await;
+                    }
+                    Err(e) => debug!("tun: relay {dst} tunnel failed: {e}"),
                 }
-                Err(e) => debug!("tun: relay {dst} tunnel failed: {e}"),
-            },
+            }
             Action::Direct => match router.direct.connect(addr).await {
                 Ok(remote) => {
                     debug!("tun: relay {dst} direct");
@@ -678,21 +673,18 @@ fn spawn_tcp_relay<C, IO>(
     });
 }
 
-fn spawn_udp_relay<C, IO>(
+fn spawn_udp_relay(
     key: FlowKey,
     mut to_relay: tokio::sync::mpsc::Receiver<Vec<u8>>,
     from_relay: tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>,
     router: TproxyRouter,
-    mut connector: C,
-) where
-    C: Connector<Connection = IO> + Send + 'static + Clone,
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+    pool: crate::tunnel::ProxyPool,
+) {
     use bytes::BufMut;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::spawn(async move {
         let dst = key.1;
-        let (addr, action) = route_dst(&router, dst);
+        let (addr, decision) = route_dst(&router, dst);
         let target_text = match &addr {
             crate::socks5::proto::Addr::SocketAddr(a) => format!("{a}"),
             crate::socks5::proto::Addr::DomainName(h, p) => {
@@ -701,14 +693,17 @@ fn spawn_udp_relay<C, IO>(
         };
         // UDP relays use the TUNNEL only (direct UDP flows over TCP make
         // no sense; direct UDP is future work via a marked UDP socket).
-        let mut stream = match connector.connect(crate::udp::magic_addr()).await {
+        let mut stream = match pool
+            .connect(decision.server.as_deref(), crate::udp::magic_addr(), None)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 debug!("tun udp {dst}: tunnel connect failed: {e}");
                 return;
             }
         };
-        let _ = action;
+        let action = decision.action;
         // hello: destination (domain for fake tokens, ip otherwise)
         if action == Action::Proxy {
             let mut hello = Vec::with_capacity(2 + target_text.len());
@@ -761,16 +756,19 @@ fn spawn_udp_relay<C, IO>(
 }
 
 /// Fake-token lookup + routing decision for an original destination.
-fn route_dst(router: &TproxyRouter, dst: SocketAddr) -> (crate::socks5::proto::Addr, Action) {
+fn route_dst(
+    router: &TproxyRouter,
+    dst: SocketAddr,
+) -> (crate::socks5::proto::Addr, crate::routing::Decision) {
     if let Some(domain) = router.fake_map.lookup(dst.ip()) {
-        let action = router.routing.decide(Target::Domain(&domain));
+        let decision = router.routing.decide(Target::Domain(&domain));
         (
             crate::socks5::proto::Addr::DomainName(domain.into_bytes(), dst.port()),
-            action,
+            decision,
         )
     } else {
-        let action = router.routing.decide(Target::Ip(dst.ip()));
-        (crate::socks5::proto::Addr::SocketAddr(dst), action)
+        let decision = router.routing.decide(Target::Ip(dst.ip()));
+        (crate::socks5::proto::Addr::SocketAddr(dst), decision)
     }
 }
 
@@ -825,6 +823,6 @@ fn answer_dns_locally(fake_map: &Arc<dns::FakeIpMap>, query: &[u8]) -> Option<Ve
 }
 
 /// Remove routes (the device dies with the fd / process).
-pub fn stop(server_ip: Ipv4Addr) {
-    routes::tun_teardown(TUN_NAME, server_ip);
+pub fn stop(server_ips: &[Ipv4Addr]) {
+    routes::tun_teardown(TUN_NAME, server_ips);
 }

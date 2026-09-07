@@ -262,7 +262,13 @@ async fn serve(http: u16, tcp: u16, udp: u16) -> anyhow::Result<()> {
 ///   GET  /id    -> instance identity (egress assertions)
 ///   ANY  /echo  -> echoes the request body (dup/corruption detection)
 ///   GET  /hello -> fixed string
+///   GET  /peer  -> the CONNECTED PEER's ip (multi-server tests: the
+///                  relaying server's address identifies the tunnel used)
 async fn handle_http(mut s: TcpStream) -> io::Result<()> {
+    let peer_ip = s
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "unknown".into());
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
     // read until end of headers
@@ -308,6 +314,7 @@ async fn handle_http(mut s: TcpStream) -> io::Result<()> {
     let path_only = path.split('?').next().unwrap_or(&path).to_string();
     let (status, ctype, out) = match path_only.as_str() {
         "/id" => ("200 OK", "text/plain", format!("{id} http\n").into_bytes()),
+        "/peer" => ("200 OK", "text/plain", format!("{peer_ip}\n").into_bytes()),
         "/echo" => ("200 OK", "application/octet-stream", body),
         "/hello" => ("200 OK", "text/plain", b"magicalane-test-service\n".to_vec()),
         _ => ("404 Not Found", "text/plain", b"not found\n".to_vec()),

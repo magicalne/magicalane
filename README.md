@@ -97,3 +97,72 @@ domains applied) → system resolver. Answers order getaddrinfo-style
 
 Measured (local lab): fake-IP answers p50 ≈ 0.11 ms; full connect via
 token p50 ≈ 1.4 ms.
+
+## Multiple servers: automatic proxy groups
+
+One client can pool several tunnel servers — **mixed transports in one
+pool** (QUIC and KCP side by side) — and route each connection to a
+server or group by domain rule. All selection is automatic: the
+strategy decides, backed by active health probes (an HTTP GET through
+each server's own tunnel; dead after 3 consecutive failures, alive
+again after one success).
+
+```toml
+[kind.Client.proxy]            # primary server, name "default"
+host = "a.example.com"
+port = 4433
+
+[[kind.Client.server]]         # additional servers
+name = "work"                  # referenced by rules/groups
+host = "b.example.com"
+port = 4433
+protocol = "kcp"               # quic | kcp, freely mixed
+ip = "203.0.113.9"             # optional pin (skip DNS for this server)
+
+[[kind.Client.group]]
+name = "auto"
+type = "url-test"              # url-test | fallback | load-balance
+servers = ["default", "work"]  # servers or other groups (no cycles)
+url = "http://www.gstatic.com/generate_204"   # probe (default)
+interval = 300                 # seconds
+tolerance = 50                 # ms: url-test switch hysteresis
+
+[[kind.Client.group]]
+name = "lb"
+type = "load-balance"
+strategy = "round-robin"       # round-robin (default) | sticky
+servers = ["default", "work"]
+```
+
+Group semantics:
+
+- **`url-test`** — probes every member through its own tunnel, serves
+  the fastest; switches only when a challenger beats the incumbent by
+  more than `tolerance` ms (anti-flap)
+- **`fallback`** — strict `servers` priority: the first alive member
+  serves; the next takes over within one probe interval on death, and
+  priority is restored on recovery
+- **`load-balance`** — `round-robin` spreads connections evenly;
+  `sticky` hashes the destination so one site keeps one egress while
+  it lives. Dead members are skipped automatically.
+
+Rules (and `default`, and providers' `action`) accept any server or
+group name in addition to `proxy`/`direct`; suffix rules are
+wildcards (`qq.com` covers subdomains; `*.example.com` is accepted
+syntax). New matcher: `domain_keyword` (substring).
+
+```toml
+[kind.Client.routing]
+default = "auto"               # unmatched traffic → the url-test group
+
+[[kind.Client.routing.rule]]
+domain_suffix = ["*.corp.example.com", "corp.example.com"]
+action = "work"                # → that server
+
+[[kind.Client.routing.rule]]
+domain_keyword = ["mirror"]
+action = "lb"                  # → the load-balance group
+```
+
+Every server's address gets the loop-prevention exceptions (iptables
+RETURN rules + TUN routes) automatically, v4 and v6.

@@ -456,12 +456,12 @@ async fn run_client(
     }
 
     let dns_sock = match (mode, tproxy.dns_port()) {
-        (TproxyMode::Tproxy, p) if p != 0 => Some(lib::dns::bind_client(p)?),
+        (TproxyMode::Tproxy, p) if p != 0 => Some(lib::dns::bind_client(p, tproxy.gateway())?),
         _ => None,
     };
     let dns6_sock = match (mode, tproxy.dns_port()) {
         (TproxyMode::Tproxy, p) if p != 0 && lib::tproxy::rules::v6_plane_wanted() => {
-            lib::dns::bind_client_v6(p).ok()
+            lib::dns::bind_client_v6(p, tproxy.gateway()).ok()
         }
         _ => None,
     };
@@ -504,8 +504,7 @@ async fn run_client(
                 extra_server_ips: server_ips.get(1..).map(|s| s.to_vec()).unwrap_or_default(),
                 server_ip6: server_ip6s.first().copied(),
                 extra_server_ip6s: server_ip6s.get(1..).map(|s| s.to_vec()).unwrap_or_default(),
-                gateway: false, // workstation mode; gateway rules capture
-                                 // server return traffic (see rules.rs)
+                gateway: tproxy.gateway(),
                 tcp_port: tproxy.tcp_port,
                 udp_port: tproxy.udp_port,
                 dns_port: tproxy.dns_port(),

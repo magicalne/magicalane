@@ -246,6 +246,13 @@ pub struct TransparentProxyConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub dns_port: Option<u16>,
+    /// Gateway mode (default `false`): intercept FORWARDED traffic too
+    /// (iptables PREROUTING), turning the client into a transparent
+    /// router for LAN devices. Workstation mode intercepts only local
+    /// traffic. Tunnel-server traffic is exempted by address (v4+v6);
+    /// single-NIC gateways rely on the source-address exemption since
+    /// server responses share the LAN interface.
+    pub gateway: Option<bool>,
     /// `"tunnel"` (default) — queries relayed through the tunnel;
     /// `"fakeip"` — answered locally with fake tokens (see src/dns/fakeip.rs);
     /// `"off"` — dns_port is ignored.
@@ -255,6 +262,9 @@ pub struct TransparentProxyConfig {
 impl TransparentProxyConfig {
     pub fn mode(&self) -> TproxyMode {
         self.mode.unwrap_or(TproxyMode::Off)
+    }
+    pub fn gateway(&self) -> bool {
+        self.gateway.unwrap_or(false)
     }
     pub fn dns_port(&self) -> u16 {
         self.dns_port.unwrap_or(0)

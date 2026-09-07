@@ -1,0 +1,18 @@
+[Unit]
+Description=magicalane gateway client (transparent proxy router)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/magicalane --config /etc/magicalane/client.toml
+Environment=RUST_LOG=info
+Restart=always
+RestartSec=2
+# The clean-exit contract reverts every firewall/route mutation on any
+# exit path; systemd just needs to restart the process.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

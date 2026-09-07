@@ -11,6 +11,8 @@ breaks a config, that test fails. Keep them valid.
 | [`server-kcp.toml`](server-kcp.toml) | KCP+TLS server variant |
 | [`client-full.toml`](client-full.toml) | Feature tour: transparent mode + fake-IP + split routing + geoip + multi-server groups + providers + inbound auth |
 | [`client-tun.toml`](client-tun.toml) | TUN mode (userspace TCP/IP stack, no iptables; needs the `tun-mode` build) |
+| [`client-gateway.toml`](client-gateway.toml) | LAN gateway router (`gateway = true`, intercepts forwarded traffic) — deployed by `scripts/gateway.sh`, see `docs/deploy-gateway.md` |
+| [`magicalane-gateway.service`](magicalane-gateway.service) | systemd unit used inside the gateway container |
 
 ## Quick start
 

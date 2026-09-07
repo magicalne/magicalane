@@ -1,0 +1,17 @@
+# Magicalane gateway client — transparent gateway for the LAN.
+# Deployed by scripts/gateway.sh into an LXC container (see
+# docs/deploy-gateway.md). This file is the TEMPLATE the script copies
+# into /etc/magicalane/client.toml inside the container — edit the
+# proxy block (and rules) for your real server, then
+# `scripts/gateway.sh restart`.
+#
+# gateway = true is what makes this a ROUTER proxy instead of a
+# workstation proxy: in addition to local traffic it intercepts
+# FORWARDED traffic (iptables PREROUTING), i.e. packets from LAN
+# devices whose default gateway points at this container.
+#
+# NOTE: the `kind` value must stay a single-line inline table.
+password = "change-me"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "REPLACE-WITH-YOUR-SERVER", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" }, socks5_port = 1080, socks5_users = ["lan:change-me-too"], allow_lan = true, tproxy = { mode = "tproxy", gateway = true, tcp_port = 7895, udp_port = 7896, dns_port = 15353, dns_mode = "fakeip" }, routing = { default = "proxy", direct_dns = ["192.168.2.1:53"], fakeip_cache = "/var/lib/magicalane/fakeip.map", rule = [ { domain_suffix = ["lan", "local", "home.arpa"], action = "direct" }, { ip_cidr = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fe80::/10"], action = "direct" } ] } } }

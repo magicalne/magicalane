@@ -74,8 +74,11 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound concurrent in-flight queries.
 static INFLIGHT: Semaphore = Semaphore::const_new(256);
 
-/// Bind the transparent DNS listener.
-pub fn bind_client(port: u16) -> io::Result<std::sync::Arc<UdpSocket>> {
+/// Bind the transparent DNS listener. `gateway` picks a wildcard bind:
+/// in gateway mode the nat PREROUTING REDIRECT (forwarded DNS)
+/// rewrites the destination to the incoming interface's address, not
+/// 127.0.0.1 — the socket must cover it.
+pub fn bind_client(port: u16, gateway: bool) -> io::Result<std::sync::Arc<UdpSocket>> {
     const IP_TRANSPARENT: libc::c_int = 19;
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -98,10 +101,20 @@ pub fn bind_client(port: u16) -> io::Result<std::sync::Arc<UdpSocket>> {
     if rc != 0 {
         warn!("dns: IP_TRANSPARENT failed: {}", io::Error::last_os_error());
     }
-    // Bind to loopback: nat REDIRECT changes the destination to
-    // 127.0.0.1:port, and the response must originate from 127.0.0.1
-    // for conntrack to reverse-NAT it back to the original nameserver.
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    // Workstation mode: bind loopback (nat OUTPUT REDIRECT changes the
+    // destination to 127.0.0.1:port, and the response must originate
+    // from 127.0.0.1 for conntrack to reverse-NAT it back to the
+    // original nameserver). Gateway mode: wildcard, because the nat
+    // PREROUTING REDIRECT for FORWARDED DNS targets the interface
+    // address instead.
+    let addr = SocketAddr::new(
+        if gateway {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        },
+        port,
+    );
     socket.bind(&addr.into())?;
     let sock = std::sync::Arc::new(UdpSocket::from_std(socket.into())?);
     info!("dns interceptor listening on {addr}");
@@ -110,8 +123,9 @@ pub fn bind_client(port: u16) -> io::Result<std::sync::Arc<UdpSocket>> {
 
 /// v6 sibling: binds [::1] (ip6tables nat REDIRECT rewrites udp/53 dst
 /// to ::1; the response must originate from ::1 for conntrack to
-/// reverse-NAT it back to the original nameserver).
-pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpSocket>> {
+/// reverse-NAT it back to the original nameserver). Gateway mode binds
+/// wildcard for the same reason as the v4 sibling.
+pub fn bind_client_v6(port: u16, gateway: bool) -> io::Result<Arc<UdpSocket>> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
@@ -119,7 +133,14 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpSocket>> {
     )?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
-    let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port);
+    let addr = SocketAddr::new(
+        if gateway {
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        },
+        port,
+    );
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("dns6 interceptor listening on {addr}");

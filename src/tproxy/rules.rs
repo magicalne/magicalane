@@ -24,9 +24,11 @@ pub const TABLE: u32 = 141;
 const CHAIN_OUT: &str = "MGL-OUT";
 const CHAIN_PRE: &str = "MGL-PRE";
 const CHAIN_NAT: &str = "MGL-NAT";
+const CHAIN_PRE_NAT: &str = "MGL-PRENAT";
 const CHAIN6_OUT: &str = "MGL6-OUT";
 const CHAIN6_PRE: &str = "MGL6-PRE";
 const CHAIN6_NAT: &str = "MGL6-NAT";
+const CHAIN6_PRE_NAT: &str = "MGL6-PRENAT";
 
 #[derive(Debug, Clone)]
 pub struct RuleSpec {
@@ -234,6 +236,26 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             "-A {CHAIN_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
         ));
     }
+    // Gateway mode: the same destination-agnostic DNS capture for
+    // FORWARDED traffic. PREROUTING REDIRECT rewrites dst to the
+    // incoming interface's address, so the dns interceptor binds
+    // wildcard in gateway mode (see dns/mod.rs). Server destinations
+    // stay exempt. udp/53 is also RETURNed in MGL-PRE so the nat path
+    // (not TPROXY) handles forwarded DNS — matching workstation mode.
+    if spec.gateway && spec.dns_port != 0 {
+        nat.push_str(&format!(":{CHAIN_PRE_NAT} - [0:0]\n"));
+        nat.push_str(&format!(
+            "-A {CHAIN_PRE_NAT} -d {}/32 -j RETURN\n", spec.server_ip
+        ));
+        for ip in &spec.extra_server_ips {
+            nat.push_str(&format!("-A {CHAIN_PRE_NAT} -d {ip}/32 -j RETURN\n"));
+        }
+        nat.push_str(&format!(
+            "-A {CHAIN_PRE_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
+        ));
+        nat.push_str(&format!("-A PREROUTING -j {CHAIN_PRE_NAT}\n"));
+    }
     nat.push_str(&format!("-A OUTPUT -j {CHAIN_NAT}\n"));
     nat.push_str("COMMIT\n");
 
@@ -284,11 +306,34 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         ));
     }
     // Gateway mode: mark + TPROXY FORWARDED traffic (PREROUTING on
-    // real interfaces). NOT installed in workstation mode: these rules
-    // would capture the server's return traffic on eth0, breaking the
-    // tunnel itself (the QUIC/KCP responses would be TPROXY'd to our
-    // own UDP interceptor instead of the QUIC socket).
+    // real interfaces). NOT installed in workstation mode. Tunnel
+    // traffic is exempted BY SOURCE: on a single-NIC gateway the
+    // server's responses share eth0 with LAN traffic, and without the
+    // exemption they would be TPROXY'd to our own interceptor instead
+    // of the QUIC/KCP socket (breaking the tunnel). Multi-homed
+    // gateways could scope rules to the LAN interface instead, but the
+    // source exemption works for both topologies.
     if spec.gateway {
+        blob.push_str(&format!(
+            "-A {CHAIN_PRE} -s {}/32 -j RETURN\n", spec.server_ip
+        ));
+        for ip in &spec.extra_server_ips {
+            blob.push_str(&format!("-A {CHAIN_PRE} -s {ip}/32 -j RETURN\n"));
+        }
+        blob.push_str(&format!(
+            "-A {CHAIN_PRE} -d {}/32 -j RETURN\n", spec.server_ip
+        ));
+        for ip in &spec.extra_server_ips {
+            blob.push_str(&format!("-A {CHAIN_PRE} -d {ip}/32 -j RETURN\n"));
+        }
+        if spec.dns_port != 0 {
+            // Forwarded DNS takes the nat PREROUTING REDIRECT path
+            // (MGL-PRENAT), not TPROXY — mirror of the MGL-OUT skip.
+            blob.push_str("-A MGL-PRE -p udp --dport 53 -j RETURN\n");
+        }
+        // Asymmetric transparent paths prefer loose reverse-path
+        // filtering; best-effort (rootless may deny).
+        let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"0");
         blob.push_str(&format!(
             "-A {CHAIN_PRE} ! -i lo -p tcp -j MARK --set-mark {MARK}\n"
         ));
@@ -348,6 +393,11 @@ pub fn teardown(_spec: &RuleSpec) {
     if jump_exists("PREROUTING", CHAIN_PRE) {
         run_ok("iptables", &["-t", "mangle", "-D", "PREROUTING", "-j", CHAIN_PRE]);
     }
+    if jump_exists("PREROUTING", CHAIN_PRE_NAT) {
+        run_ok("iptables", &["-t", "nat", "-D", "PREROUTING", "-j", CHAIN_PRE_NAT]);
+    }
+    run_ok("iptables", &["-t", "nat", "-F", CHAIN_PRE_NAT]);
+    run_ok("iptables", &["-t", "nat", "-X", CHAIN_PRE_NAT]);
     run_ok("iptables", &["-t", "mangle", "-F", CHAIN_OUT]);
     run_ok("iptables", &["-t", "mangle", "-X", CHAIN_OUT]);
     run_ok("iptables", &["-t", "mangle", "-F", CHAIN_PRE]);
@@ -441,6 +491,22 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             "-A {CHAIN6_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
         ));
     }
+    // Gateway v6 mirror: forwarded DNS via PREROUTING REDIRECT (see
+    // the v4 MGL-PRENAT rationale).
+    if spec.gateway && spec.dns_port != 0 {
+        nat.push_str(&format!(":{CHAIN6_PRE_NAT} - [0:0]\n"));
+        if let Some(s6) = spec.server_ip6 {
+            nat.push_str(&format!("-A {CHAIN6_PRE_NAT} -d {s6}/128 -j RETURN\n"));
+        }
+        for ip in &spec.extra_server_ip6s {
+            nat.push_str(&format!("-A {CHAIN6_PRE_NAT} -d {ip}/128 -j RETURN\n"));
+        }
+        nat.push_str(&format!(
+            "-A {CHAIN6_PRE_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
+        ));
+        nat.push_str(&format!("-A PREROUTING -j {CHAIN6_PRE_NAT}\n"));
+    }
     nat.push_str(&format!("-A OUTPUT -j {CHAIN6_NAT}\n"));
     nat.push_str("COMMIT\n");
 
@@ -477,6 +543,18 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         ));
     }
     if spec.gateway {
+        if let Some(s6) = spec.server_ip6 {
+            blob.push_str(&format!("-A {CHAIN6_PRE} -s {s6}/128 -j RETURN\n"));
+            blob.push_str(&format!("-A {CHAIN6_PRE} -d {s6}/128 -j RETURN\n"));
+        }
+        for ip in &spec.extra_server_ip6s {
+            blob.push_str(&format!("-A {CHAIN6_PRE} -s {ip}/128 -j RETURN\n"));
+            blob.push_str(&format!("-A {CHAIN6_PRE} -d {ip}/128 -j RETURN\n"));
+        }
+        if spec.dns_port != 0 {
+            blob.push_str("-A MGL6-PRE -p udp --dport 53 -j RETURN\n");
+        }
+        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/rp_filter", b"0");
         blob.push_str(&format!("-A {CHAIN6_PRE} ! -i lo -p tcp -j MARK --set-mark {MARK}\n"));
         blob.push_str(&format!(
             "-A {CHAIN6_PRE} ! -i lo -p tcp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
@@ -508,6 +586,9 @@ pub fn teardown_v6() {
     }
     run_ok("ip6tables", &["-t", "mangle", "-D", "OUTPUT", "-j", CHAIN6_OUT]);
     run_ok("ip6tables", &["-t", "mangle", "-D", "PREROUTING", "-j", CHAIN6_PRE]);
+    run_ok("ip6tables", &["-t", "nat", "-D", "PREROUTING", "-j", CHAIN6_PRE_NAT]);
+    run_ok("ip6tables", &["-t", "nat", "-F", CHAIN6_PRE_NAT]);
+    run_ok("ip6tables", &["-t", "nat", "-X", CHAIN6_PRE_NAT]);
     run_ok("ip6tables", &["-t", "mangle", "-F", CHAIN6_OUT]);
     run_ok("ip6tables", &["-t", "mangle", "-X", CHAIN6_OUT]);
     run_ok("ip6tables", &["-t", "mangle", "-F", CHAIN6_PRE]);

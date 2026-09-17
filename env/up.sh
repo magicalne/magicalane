@@ -212,21 +212,20 @@ if [ "$PROFILE" = "tproxy" ]; then
     if have_net "$LAN"; then say "network $LAN exists"; else $CE network create "$LAN" >/dev/null; fi
 
     # dual-homed client: magicalane-net (eth0, wan) + magicalane-lan (eth1, lan).
-    # bridge.py stands in for the future magicalane tproxy listener on tcp
-    # 7895: it accepts transparently-intercepted connections and relays them
-    # through the local socks5 server (i.e. through the chosen transport).
+    # Real in-process transparent gateway (gateway-mode tproxy client).
+    # Replaces the old bridge.py stand-in: the future it stood in for
+    # shipped. Intercepts the app's FORWARDED traffic + DNS by itself.
     ensure_run magicalane-tproxy-client \
         $CE run -d --name magicalane-tproxy-client --label "$LABEL" \
         --network "$NET" \
         --cap-add NET_ADMIN \
         --sysctl net.ipv4.ip_forward=1 \
         -e RUST_LOG=info \
-        -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
+        -v "$ENV_DIR/configs/client-$TRANSPORT-ws-gw.toml:/etc/magicalane/client-gw.toml:ro" \
         -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
-        -v "$ENV_DIR/bridge.py:/usr/local/bin/bridge.py:ro" \
-        "$IMAGE" sh -c 'python3 /usr/local/bin/bridge.py & exec magicalane --config /etc/magicalane/client.toml'
+        "$IMAGE" magicalane --config /etc/magicalane/client-gw.toml
 
-    $CE network connect "$LAN" magicalane-tproxy-client
+    $CE network connect "$LAN" magicalane-tproxy-client || true
 
     LAN_IP="$($CE inspect magicalane-tproxy-client --format '{{(index .NetworkSettings.Networks "'"$LAN"'").IPAddress}}')"
     ORIGIN_IP="$($CE inspect magicalane-origin --format '{{(index .NetworkSettings.Networks "'"$NET"'").IPAddress}}')"
@@ -244,6 +243,11 @@ if [ "$PROFILE" = "tproxy" ]; then
         "$IMAGE" sleep infinity
 
     $CE exec magicalane-app ip route replace default via "$LAN_IP" dev eth0
+    # DNS must TRANSIT the gateway to be intercepted: an on-link resolver
+    # (aardvark .1) answers directly over L2 and never passes the tproxy
+    # rules - domains would be lost. Point at a routed address; the udp/53
+    # capture answers it with fake-IP tokens instead.
+    $CE exec magicalane-app sh -c "printf 'nameserver 8.8.8.8\n' > /etc/resolv.conf"
     $CE exec magicalane-app ip route del default via 10.89.1.1 dev eth0 2>/dev/null || true
 
     # Return path for routed (non-intercepted) traffic from the wan side:
@@ -253,10 +257,35 @@ if [ "$PROFILE" = "tproxy" ]; then
     LAN_SUBNET="$($CE exec magicalane-tproxy-client ip -4 route show dev eth1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | head -1)"
     $CE exec magicalane-origin ip route replace "$LAN_SUBNET" via "$WAN_IP"
 
-    say "applying tproxy rules inside magicalane-tproxy-client"
-    $CE exec magicalane-tproxy-client /usr/local/bin/tproxy-rules.sh apply
-
+    # tproxy rules are installed by the client itself (rules.rs MGL chains)
     say "tproxy lab up: app -> [transparent] tproxy-client -> server -> origin"
 fi
 
 say "done. verify with: env/test.sh"
+
+# --- host pins: the lab must be hermetic ---
+# The HOST's resolv.conf may point at a smart-routing bypass (Clash on
+# .60): podman's aardvark forwards unknown container names upstream,
+# and Clash answers with fake-ips (192.18/15) that blackhole. Pin every
+# lab name in every lab container after all containers are up.
+LAB_CONTAINERS="magicalane-server magicalane-server2 magicalane-origin magicalane-testsvc magicalane-client magicalane-tproxy-client"
+# NOTE: magicalane-app is deliberately NOT pinned: its traffic must stay
+# domain-transparent (fake-IP tokens), /etc/hosts would bypass the design.
+LAB_NAMES="magicalane-server magicalane-server2 magicalane-origin magicalane-testsvc server server2 origin testsvc"
+for cname in $LAB_CONTAINERS; do
+    $CE inspect "$cname" >/dev/null 2>&1 || continue
+    pin_lines=""
+    for target in magicalane-server magicalane-server2 magicalane-origin magicalane-testsvc; do
+        tip="$($CE inspect "$target" --format '{{(index .NetworkSettings.Networks "'"$NET"'").IPAddress}}' 2>/dev/null || true)"
+        t6="$($CE inspect "$target" --format '{{(index .NetworkSettings.Networks "'"$NET"'").GlobalIPv6Address}}' 2>/dev/null || true)"
+        short="${target#magicalane-}"
+        [ -n "$tip" ] && pin_lines="$pin_lines$tip $target $short\n"
+        # v6 too: v4-only pins would force direct connections onto v4 and
+        # break the RFC-6724 v6-direct coverage (test 028).
+        [ -n "$t6" ] && pin_lines="$pin_lines$t6 $target $short\n"
+    done
+    [ -n "$pin_lines" ] || continue
+    $CE exec "$cname" sh -c "printf '$pin_lines' >> /etc/hosts" || true
+    echo "pinned lab hosts in $cname"
+done
+

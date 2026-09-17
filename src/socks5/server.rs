@@ -57,7 +57,18 @@ where
     C: Connector<Connection = IO> + Send + Clone + 'static,
 {
     pub async fn run(&mut self) -> Result<()> {
-        while let Ok((stream, addr)) = self.listener.accept().await {
+        loop {
+            // Transient accept errors (boot races, EMFILE, resource
+            // exhaustion) must NOT kill the whole client: exiting here
+            // takes down every inbound with it. Back off and retry.
+            let (stream, addr) = match self.listener.accept().await {
+                Ok(v) => v,
+                Err(err) => {
+                    log::warn!("socks accept error: {err}; retrying in 250ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
             trace!("Accept addr: {:?}", addr);
             let connector = self.connector.clone();
             let users = self.users.clone();
@@ -85,6 +96,5 @@ where
                 }
             });
         }
-        Ok(())
     }
 }

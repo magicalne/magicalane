@@ -503,7 +503,7 @@ async fn run_client(
         bandwidth,
     )
     .await?;
-    let socks_task = tokio::spawn(async move { socks.run().await });
+    let mut socks_task = tokio::spawn(async move { socks.run().await });
 
     if let Some(l) = tcp_listener {
         tokio::spawn(lib::tproxy::serve(l, pool.clone(), router.clone(), bandwidth));
@@ -647,8 +647,9 @@ async fn run_client(
                 }
             }
         },
-        _ = socks_task => {
+        res = &mut socks_task => {
             // socks server failed/exited without a signal
+            log::error!("socks/http server task ended unexpectedly: {res:?}");
             if mode == TproxyMode::Tproxy {
                 lib::tproxy::rules::teardown(&lib::tproxy::rules::RuleSpec {
                     server_ip: "0.0.0.0".parse().unwrap(),
@@ -662,7 +663,7 @@ async fn run_client(
                     server_ip6: None,
                 });
             }
-            anyhow::bail!("socks server exited: {r:?}");
+            anyhow::bail!("socks server exited: {res:?}");
         }
     }
     if let Some(path) = &routing_cfg.fakeip_cache {

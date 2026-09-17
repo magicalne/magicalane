@@ -10,6 +10,11 @@ export ENV_DIR CE SOCKS
 
 pass() { echo "  ok: $*" >&2; }
 
+skip() {
+    echo "SKIP: $*"
+    exit 0
+}
+
 fail() {
     echo "  FAIL: $*" >&2
     exit 1

@@ -114,9 +114,9 @@ if have_net "$BACKEND"; then say "network $BACKEND exists"; else $CE network cre
 ensure_run magicalane-origin \
     $CE run -d --name magicalane-origin --label "$LABEL" \
     --network "$NET" --network-alias origin \
-    --cap-add NET_ADMIN \
+    --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE --cap-add DAC_OVERRIDE \
     -v "$ENV_DIR/fixtures:/fixtures:ro" \
-    "$IMAGE" sh -c 'mkdir -p /srv/www/fixtures && cp -r /fixtures/. /srv/www/fixtures/ && cat /etc/hostname > /srv/www/fixtures/hostname && exec python3 -m http.server 80 --bind :: --directory /srv/www'
+    "$IMAGE" sh -c 'mkdir -p /tmp/www/fixtures && cp -r /fixtures/. /tmp/www/fixtures/ && cat /etc/hostname > /tmp/www/fixtures/hostname && exec python3 -m http.server 80 --bind :: --directory /tmp/www'
 
 ensure_run magicalane-testsvc \
     $CE run -d --name magicalane-testsvc --label "$LABEL" \
@@ -126,7 +126,7 @@ ensure_run magicalane-testsvc \
 ensure_run magicalane-server \
     $CE run -d --name magicalane-server --label "$LABEL" \
     --network "$NET" --network-alias magicalane-server \
-    --cap-add NET_ADMIN \
+    --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
     -e RUST_LOG=info \
     -v "$SERVER_CFG_PATH:/etc/magicalane/server.toml:ro" \
     -v "$ENV_DIR/configs/server-tcp.toml:/etc/magicalane/server-tcp.toml:ro" \
@@ -138,7 +138,7 @@ ensure_run magicalane-server \
 ensure_run magicalane-server2 \
     $CE run -d --name magicalane-server2 --label "$LABEL" \
     --network "$NET" --network-alias magicalane-server2 \
-    --cap-add NET_ADMIN \
+    --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
     -e RUST_LOG=info \
     -v "$ENV_DIR/configs/server2-quic.toml:/etc/magicalane/server2-quic.toml:ro" \
     -v "$ENV_DIR/configs/server2-kcp.toml:/etc/magicalane/server2-kcp.toml:ro" \
@@ -160,7 +160,7 @@ ensure_run magicalane-server2 \
 ensure_run magicalane-client \
     $CE run -d --name magicalane-client --label "$LABEL" \
     --network "$NET" \
-    --cap-add NET_ADMIN \
+    --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
     --device /dev/net/tun \
     -e RUST_LOG=info \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
@@ -218,7 +218,7 @@ if [ "$PROFILE" = "tproxy" ]; then
     ensure_run magicalane-tproxy-client \
         $CE run -d --name magicalane-tproxy-client --label "$LABEL" \
         --network "$NET" \
-        --cap-add NET_ADMIN \
+        --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
         --sysctl net.ipv4.ip_forward=1 \
         -e RUST_LOG=info \
         -v "$ENV_DIR/configs/client-$TRANSPORT-ws-gw.toml:/etc/magicalane/client-gw.toml:ro" \
@@ -237,7 +237,7 @@ if [ "$PROFILE" = "tproxy" ]; then
     ensure_run magicalane-app \
         $CE run -d --name magicalane-app --label "$LABEL" \
         --network "$LAN" \
-        --cap-add NET_ADMIN \
+        --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
         --add-host "origin:$ORIGIN_IP" \
         --add-host "testsvc:$TESTSVC_IP" \
         "$IMAGE" sleep infinity

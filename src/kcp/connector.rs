@@ -94,11 +94,21 @@ impl KcpConnector {
                     4usize.saturating_sub(pool.len())
                 };
                 for _ in 0..need {
-                    match this.create_authenticated_session().await {
-                        Ok(session) => {
+                    // Bounded like the request path: against a dead server
+                    // the raw handshake parks forever, which would both
+                    // stall the prewarm loop and pin a session socket (#16).
+                    const PREWARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                    match tokio::time::timeout(PREWARM_TIMEOUT, this.create_authenticated_session())
+                        .await
+                    {
+                        Ok(Ok(session)) => {
                             this.pool.lock().await.push(session);
                         }
+                        Ok(Err(_)) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
                         Err(_) => {
+                            // timeout: same backoff, keep the loop alive
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
@@ -148,8 +158,7 @@ impl Connector for KcpConnector {
             // hard 5s bound: pooled sessions can be stale (server
             // reaped them at the idle timeout) and KCP retransmits
             // forever without one — a dead server would hang relays.
-            const HANDSHAKE_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(5);
+            const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
             let pooled = pool.lock().await.pop();
             if let Some(mut stream) = pooled {
                 let ok = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -169,7 +178,7 @@ impl Connector for KcpConnector {
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
                             "remote refused",
-                        ))
+                        ));
                     }
                     Ok(Err(e)) => return Err(io::Error::other(e.to_string())),
                     Err(_) => {
@@ -246,6 +255,42 @@ impl AsyncWrite for EitherKcpStream {
     }
 }
 
+/// Spawn the per-session receiver: forwards server datagrams to the
+/// session driver. Returns a watch sender that MUST be fired (send
+/// `true`) when the session ends — the receiver otherwise parks on
+/// `recv_from` forever holding the last `Arc<UdpSocket>` and leaks the
+/// fd whenever a session ends without a trailing inbound datagram
+/// (timed-out handshake, idle reaping, clean close on a quiet peer).
+/// Regression: https://github.com/magicalne/magicalane/issues/16
+fn spawn_session_receiver(
+    socket: Arc<UdpSocket>,
+    remote: SocketAddr,
+    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+) -> tokio::sync::watch::Sender<bool> {
+    let (dead_tx, mut dead_rx) = tokio::sync::watch::channel(false);
+    spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            tokio::select! {
+                res = socket.recv_from(&mut buf) => {
+                    let Ok((n, from)) = res else { break };
+                    if from != remote {
+                        continue;
+                    }
+                    if tx.send((from, buf[..n].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                // Session over (driver exited): wake up and release the
+                // socket. `changed()` also resolves if all senders were
+                // dropped, covering a driver that dies without on_exit.
+                _ = dead_rx.changed() => break,
+            }
+        }
+    });
+    dead_tx
+}
+
 /// Establish one KCP+TLS session and perform the proxy handshake:
 /// `[len][password]` -> flag, `[Addr]` -> flag; then the caller owns the relay.
 async fn connect_kcp(
@@ -258,7 +303,7 @@ async fn connect_kcp(
 ) -> Result<EitherKcpStream> {
     let bind = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-            socket.bind(&bind.into())?;
+    socket.bind(&bind.into())?;
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);
@@ -267,22 +312,20 @@ async fn connect_kcp(
     let shared = Arc::new(session::Shared::new(conv, tuning));
     let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
 
-    // Receiver: only accept datagrams from the server.
-    let sock = socket.clone();
-    spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
-            if from != remote {
-                continue;
-            }
-            if tx.send((from, buf[..n].to_vec())).await.is_err() {
-                break;
-            }
-        }
-    });
+    // Receiver: only accept datagrams from the server; wakes when the
+    // session driver exits so the socket is always released (#16).
+    let dead_tx = spawn_session_receiver(socket.clone(), remote, tx);
 
     let stream = KcpStream::new(shared.clone());
-    spawn(session::drive_session(shared, socket, remote, rx, || {}));
+    spawn(session::drive_session(
+        shared,
+        socket,
+        remote,
+        rx,
+        move || {
+            let _ = dead_tx.send(true);
+        },
+    ));
 
     // The TLS ClientHello itself creates the session on the server.
     let mut io = match tls {
@@ -331,7 +374,7 @@ async fn connect_session_raw(
 ) -> Result<EitherKcpStream> {
     let bind = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-            socket.bind(&bind.into())?;
+    socket.bind(&bind.into())?;
     socket.set_nonblocking(true)?;
     let std_socket: std::net::UdpSocket = socket.into();
     let socket = Arc::new(UdpSocket::from_std(std_socket)?);
@@ -340,21 +383,20 @@ async fn connect_session_raw(
     let shared = Arc::new(session::Shared::new(conv, tuning));
     let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
 
-    let sock = socket.clone();
-    spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
-            if from != remote {
-                continue;
-            }
-            if tx.send((from, buf[..n].to_vec())).await.is_err() {
-                break;
-            }
-        }
-    });
+    // Receiver: only accept datagrams from the server; wakes when the
+    // session driver exits so the socket is always released (#16).
+    let dead_tx = spawn_session_receiver(socket.clone(), remote, tx);
 
     let stream = KcpStream::new(shared.clone());
-    spawn(session::drive_session(shared, socket, remote, rx, || {}));
+    spawn(session::drive_session(
+        shared,
+        socket,
+        remote,
+        rx,
+        move || {
+            let _ = dead_tx.send(true);
+        },
+    ));
 
     let io = match tls {
         Some(connector) => {

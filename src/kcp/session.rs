@@ -129,7 +129,14 @@ impl Shared {
                         }
                     };
                     if got == 0 {
+                        // EOF transition: a parked reader must observe it.
+                        // drive_session's rx arm only wakes on added data,
+                        // so without this wake the relay task parks forever
+                        // holding its origin connection after the peer's FIN
+                        // (#16).
                         inner.eof = true;
+                        drop(inner);
+                        self.read_waker.wake();
                         break;
                     }
                     inner.rbuf.extend_from_slice(&seg[..got]);

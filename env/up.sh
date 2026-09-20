@@ -26,7 +26,7 @@ while [ $# -gt 0 ]; do
         --profile) : ;;
         tproxy) PROFILE="tproxy" ;;
         --transport) TRANSPORT="$2"; shift ;;
-        quic|kcp|kcp-plain) TRANSPORT="$1" ;;
+        quic|kcp|kcp-plain|tcp) TRANSPORT="$1" ;;
         --server-config) SERVER_CONFIG="$2"; shift ;;
         --client-config) CLIENT_CONFIG="$2"; shift ;;
         *) echo "usage: env/up.sh [--transport quic|kcp|kcp-plain] [--ipv6] [--profile tproxy] [--server-config PATH] [--client-config PATH]" >&2; exit 2 ;;
@@ -35,7 +35,7 @@ while [ $# -gt 0 ]; do
 done
 SERVER_CFG_PATH="${SERVER_CONFIG:-$ENV_DIR/configs/server-$TRANSPORT.toml}"
 CLIENT_CFG_PATH="${CLIENT_CONFIG:-$ENV_DIR/configs/client-$TRANSPORT.toml}"
-case "$TRANSPORT" in quic|kcp|kcp-plain) ;; *) echo "invalid transport: $TRANSPORT" >&2; exit 2 ;; esac
+case "$TRANSPORT" in quic|kcp|kcp-plain|tcp) ;; *) echo "invalid transport: $TRANSPORT" >&2; exit 2 ;; esac
 
 say() { echo "[up] $*"; }
 say "transport: $TRANSPORT"

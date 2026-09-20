@@ -10,9 +10,7 @@ use tokio::{
 };
 
 use crate::{
-    connector::Connector,
-    error::Result,
-    load_private_cert, load_private_key,
+    connector::Connector, error::Result, load_private_cert, load_private_key,
     quic::server::stream::Stream,
 };
 
@@ -86,9 +84,7 @@ impl<C> Server<C> {
             let passwd = self.passwd.clone();
             let bandwidth = self.bandwidth;
             tokio::spawn(async move {
-                if let Err(err) =
-                    handle_conn(tcp, acceptor, connector, passwd, bandwidth).await
-                {
+                if let Err(err) = handle_conn(tcp, acceptor, connector, passwd, bandwidth).await {
                     trace!("tcp-transport {peer} error: {err}");
                 }
             });
@@ -107,19 +103,30 @@ where
     C: Connector + Clone + Send + 'static,
     C::Connection: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        if let Some(acceptor) = acceptor {
-            let tls = acceptor.accept(tcp).await?;
+    // Only the HANDSHAKE (TLS accept + password exchange) is bounded.
+    // The relay itself must run unbounded: wrapping it in the timeout
+    // hard-killed every connection at 10s — invisible on fast links,
+    // fatal on WAN-shaped ones (rtt/upload phases regularly exceed it)
+    // (#18).
+    match acceptor {
+        Some(acceptor) => {
+            let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timeout")
+                })??;
             auth_and_relay(tls, connector, passwd, bandwidth).await
-        } else {
-            auth_and_relay(tcp, connector, passwd, bandwidth).await
         }
-    })
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "handshake timeout"))?
+        None => auth_and_relay(tcp, connector, passwd, bandwidth).await,
+    }
 }
 
-async fn auth_and_relay<IO, C>(mut io: IO, connector: C, passwd: Vec<u8>, bandwidth: usize) -> std::io::Result<()>
+async fn auth_and_relay<IO, C>(
+    mut io: IO,
+    connector: C,
+    passwd: Vec<u8>,
+    bandwidth: usize,
+) -> std::io::Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
     C: Connector + Clone + Send + 'static,
@@ -144,5 +151,7 @@ where
     }
     // Reuse the generic relay machine: reads Addr, connects, replies flag.
     let stream = Stream::new(io, connector, bandwidth);
-    stream.await.map_err(|e| std::io::Error::other(e.to_string()))
+    stream
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }

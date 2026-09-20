@@ -101,6 +101,7 @@ run_one() { # transport -> prints "key=value" lines
 variant_toml() {
     case "$1" in
         quic)            : ;;
+        tcp)             : ;;
         quic-bbr)        printf '[tuning.quic]\ncongestion = "bbr"\n' ;;
         quic-newreno)    printf '[tuning.quic]\ncongestion = "new-reno"\n' ;;
         quic-win32m)     printf '[tuning.quic]\nsend_window = 33554432\nreceive_window = 33554432\nstream_receive_window = 16777216\n' ;;

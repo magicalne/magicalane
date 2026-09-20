@@ -127,7 +127,7 @@ ensure_run magicalane-server \
     $CE run -d --name magicalane-server --label "$LABEL" \
     --network "$NET" --network-alias magicalane-server \
     --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
-    -e RUST_LOG=info \
+    -e RUST_LOG=info,lib::kcp=debug \
     -v "$SERVER_CFG_PATH:/etc/magicalane/server.toml:ro" \
     -v "$ENV_DIR/configs/server-tcp.toml:/etc/magicalane/server-tcp.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
@@ -139,7 +139,7 @@ ensure_run magicalane-server2 \
     $CE run -d --name magicalane-server2 --label "$LABEL" \
     --network "$NET" --network-alias magicalane-server2 \
     --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
-    -e RUST_LOG=info \
+    -e RUST_LOG=info,lib::kcp=debug \
     -v "$ENV_DIR/configs/server2-quic.toml:/etc/magicalane/server2-quic.toml:ro" \
     -v "$ENV_DIR/configs/server2-kcp.toml:/etc/magicalane/server2-kcp.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
@@ -162,7 +162,7 @@ ensure_run magicalane-client \
     --network "$NET" \
     --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
     --device /dev/net/tun \
-    -e RUST_LOG=info \
+    -e RUST_LOG=info,lib::kcp=debug \
     -v "$CLIENT_CFG_PATH:/etc/magicalane/client.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws.toml:/etc/magicalane/client-ws.toml:ro" \
     -v "$ENV_DIR/configs/client-ws-tcptransport.toml:/etc/magicalane/client-ws-tcptransport.toml:ro" \
@@ -220,7 +220,7 @@ if [ "$PROFILE" = "tproxy" ]; then
         --network "$NET" \
         --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
         --sysctl net.ipv4.ip_forward=1 \
-        -e RUST_LOG=info \
+        -e RUST_LOG=info,lib::kcp=debug \
         -v "$ENV_DIR/configs/client-$TRANSPORT-ws-gw.toml:/etc/magicalane/client-gw.toml:ro" \
         -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
         "$IMAGE" magicalane --config /etc/magicalane/client-gw.toml

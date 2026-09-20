@@ -22,6 +22,18 @@ use tokio::{
 };
 
 use super::{KCP_IDLE_TIMEOUT_SECS, KCP_MAX_WRITE, KCP_TICK_MS};
+
+/// Session idle-reaping window. Overridable via
+/// `MAGICALANE_TEST_KCP_IDLE_SECS` so pool-lifecycle regressions
+/// (zombie sessions idle-reaped client-side but still pooled) are
+/// testable in seconds instead of the production 120s. Test hook only.
+fn idle_timeout() -> std::time::Duration {
+    let secs = std::env::var("MAGICALANE_TEST_KCP_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(KCP_IDLE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs.max(1))
+}
 use crate::config::KcpTuning;
 
 /// Collects datagrams produced by the kcp state machine; the driver task
@@ -348,7 +360,7 @@ pub async fn drive_session(
             break Ok(());
         }
 
-        if last_active.elapsed() > Duration::from_secs(KCP_IDLE_TIMEOUT_SECS) {
+        if last_active.elapsed() > idle_timeout() {
             debug!("kcp session idle timeout");
             shared.closed.store(true, Ordering::Release);
             shared.read_waker.wake();

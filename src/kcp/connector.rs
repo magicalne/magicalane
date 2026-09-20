@@ -180,7 +180,14 @@ impl Connector for KcpConnector {
                             "remote refused",
                         ));
                     }
-                    Ok(Err(e)) => return Err(io::Error::other(e.to_string())),
+                    Ok(Err(e)) => {
+                        // Zombie session (e.g. idle-reaped client-side at
+                        // KCP_IDLE_TIMEOUT_SECS but still pooled): fall
+                        // through to a fresh handshake instead of failing
+                        // the request. The pop already removed it, so
+                        // prewarm will backfill a live session (#18).
+                        log::debug!("kcp: pooled session dead ({e}); full handshake");
+                    }
                     Err(_) => {
                         log::debug!("kcp: pooled session stale (timeout); full handshake");
                         // fall through to a fresh session

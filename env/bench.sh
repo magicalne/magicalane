@@ -89,6 +89,11 @@ run_one() { # transport -> prints "key=value" lines
         --socks 127.0.0.1:1080 --target "bench:$ECHO_PORT" --pairs "${EXTRA[@]}"
     clear_netem
     [ -n "$BADNET" ] && "$ENV_DIR/badnet.sh" clear >/dev/null
+    # The BADNET guard above evaluates false (rc 1) when no badnet profile
+    # is active — as the final statement it made every plain run report
+    # FAILED despite green metrics. magabench failures still abort earlier
+    # via set -e (#18).
+    return 0
 }
 
 # ------------------------------------------------------------- matrix presets

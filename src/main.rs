@@ -53,6 +53,7 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                 socks_port: 0,
                 dns_port: tproxy.dns_port(),
                 server_ip6: None,
+                bypass_router: false,
             });
         }
     }
@@ -492,6 +493,19 @@ async fn run_client(
         }
         _ => None,
     };
+    // DNS-over-TCP listeners (RFC 7766 fallback; also part of the
+    // bypass-router story). Bound before the redirect rules exist, like
+    // every other listener.
+    let dns_tcp_listener = match (mode, tproxy.dns_port()) {
+        (TproxyMode::Tproxy, p) if p != 0 => Some(lib::dns::bind_client_tcp(p, tproxy.gateway())?),
+        _ => None,
+    };
+    let dns6_tcp_listener = match (mode, tproxy.dns_port()) {
+        (TproxyMode::Tproxy, p) if p != 0 && lib::tproxy::rules::v6_plane_wanted() => {
+            lib::dns::bind_client_tcp_v6(p, tproxy.gateway()).ok()
+        }
+        _ => None,
+    };
 
     // SOCKS5 stays available alongside transparent interception.
     let mut socks = lib::socks5::server::Server::new(
@@ -536,6 +550,7 @@ async fn run_client(
                 udp_port: tproxy.udp_port,
                 socks_port: socks5_port,
                 dns_port: tproxy.dns_port(),
+                bypass_router: tproxy.bypass_router(),
             };
             lib::tproxy::rules::apply(&spec)?;
             // DNS serve tasks start after the rules so the fake-AAAA
@@ -559,6 +574,28 @@ async fn run_client(
                     _ => {
                         log::info!("dns[{label}]: tunnel mode");
                         tokio::spawn(lib::dns::serve_client(d, pool.clone()));
+                    }
+                }
+            }
+            // DNS-over-TCP siblings (same modes, framed transport).
+            for (l, label) in [(dns_tcp_listener, "v4-tcp"), (dns6_tcp_listener, "v6-tcp")] {
+                let Some(l) = l else { continue };
+                match tproxy.dns_mode() {
+                    "fakeip" => {
+                        log::info!("dns[{label}]: fakeip mode (tcp)");
+                        tokio::spawn(lib::dns::serve_client_fakeip_tcp(
+                            l,
+                            fake_map.clone(),
+                            aaaa,
+                            v6_active,
+                            fakeip_filter.clone(),
+                            direct_resolver.clone(),
+                            pool.clone(),
+                        ));
+                    }
+                    _ => {
+                        log::info!("dns[{label}]: tunnel mode (tcp)");
+                        tokio::spawn(lib::dns::serve_client_tcp(l, pool.clone()));
                     }
                 }
             }
@@ -661,6 +698,7 @@ async fn run_client(
                     udp_port: tproxy.udp_port,
                     dns_port: tproxy.dns_port(),
                     server_ip6: None,
+                    bypass_router: false,
                 });
             }
             anyhow::bail!("socks server exited: {res:?}");
@@ -682,6 +720,7 @@ async fn run_client(
             udp_port: tproxy.udp_port,
             dns_port: tproxy.dns_port(),
             server_ip6: None,
+            bypass_router: false,
         });
     }
     std::process::exit(0);

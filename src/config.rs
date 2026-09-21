@@ -255,6 +255,14 @@ pub struct TransparentProxyConfig {
     /// single-NIC gateways rely on the source-address exemption since
     /// server responses share the LAN interface.
     pub gateway: Option<bool>,
+    /// Bypass-router mode (default `false`, implies `gateway = true`):
+    /// make the gateway usable as a LAN device's DEFAULT ROUTE and DNS
+    /// server ("one-box bypass router"): enables IPv4 forwarding, a
+    /// FORWARD accept rule and POSTROUTING MASQUERADE for traffic the
+    /// transparent plane does not intercept (ICMP, other IP protocols),
+    /// plus DNS-over-TCP on dns_port (udp/53 AND tcp/53 redirected).
+    /// IPv4 plane only; the v6 plane keeps its own behavior.
+    pub bypass_router: Option<bool>,
     /// `"tunnel"` (default) — queries relayed through the tunnel;
     /// `"fakeip"` — answered locally with fake tokens (see src/dns/fakeip.rs);
     /// `"off"` — dns_port is ignored.
@@ -267,6 +275,10 @@ impl TransparentProxyConfig {
     }
     pub fn gateway(&self) -> bool {
         self.gateway.unwrap_or(false)
+    }
+    /// Effective bypass-router flag: only meaningful in gateway mode.
+    pub fn bypass_router(&self) -> bool {
+        self.bypass_router.unwrap_or(false) && self.gateway()
     }
     pub fn dns_port(&self) -> u16 {
         self.dns_port.unwrap_or(0)

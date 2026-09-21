@@ -52,9 +52,20 @@ Defaults (env-overridable): instance `magicalane-gw` at `192.168.2.90`
 - Default gateway → `192.168.2.90` (DHCP option 3 / static route)
 - DNS → anything: hardcoded resolvers (8.8.8.8…) are intercepted and
   answered locally with fake IPs; pointing DNS at `192.168.2.90:53`
-  also works (the PREROUTING REDIRECT covers dst-any udp/53)
+  also works (the PREROUTING REDIRECT covers dst-any udp/53 **and
+  tcp/53** — DNS over TCP works, RFC 7766 fallback included)
 - Or per-app only: SOCKS5/HTTP proxy `192.168.2.90:1080` (auth per
   `socks5_users` in the config)
+
+With `bypass_router = true` in the `tproxy` section (the shipped
+template default) the "default gateway + DNS = the gateway" story is
+complete: the client itself enables IPv4 forwarding and installs a
+FORWARD accept + POSTROUTING MASQUERADE for everything the transparent
+plane does not intercept. That makes ICMP (ping) work through the
+gateway — previously a hard gap — and lets other IP protocols pass
+through NAT'd direct. IPv4 plane only: keep AAAA filtered (the default
+`aaaa = "auto"` does this when v6 interception is inactive) so devices
+with IPv6 from the LAN router stay on the intercepted v4 path.
 
 ## What `verify` proves (run before trusting it)
 

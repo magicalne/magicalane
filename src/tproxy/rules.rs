@@ -29,6 +29,14 @@ const CHAIN6_OUT: &str = "MGL6-OUT";
 const CHAIN6_PRE: &str = "MGL6-PRE";
 const CHAIN6_NAT: &str = "MGL6-NAT";
 const CHAIN6_PRE_NAT: &str = "MGL6-PRENAT";
+/// Bypass-router extras: filter-table FORWARD accept + nat POSTROUTING
+/// masquerade for traffic the transparent plane does not intercept.
+const CHAIN_FWD: &str = "MGL-FWD";
+const CHAIN_MASQ: &str = "MGL-MASQ";
+/// Where the pre-existing ip_forward value is persisted for teardown
+/// (the clean-exit contract); /run is tmpfs so a reboot forgets it and
+/// teardown then leaves the sysctl untouched rather than guessing.
+const IPFORWARD_PREV: &str = "/run/magicalane-ipforward-prev";
 
 #[derive(Debug, Clone)]
 pub struct RuleSpec {
@@ -55,6 +63,11 @@ pub struct RuleSpec {
     pub socks_port: u16,
     /// DNS module listener port (0 = DNS interception disabled).
     pub dns_port: u16,
+    /// Bypass-router mode (gateway only): enable IPv4 forwarding +
+    /// FORWARD accept + POSTROUTING MASQUERADE so LAN devices can use
+    /// this host as their default route (ICMP and other non-TCP/UDP
+    /// transit NATs direct instead of blackholing).
+    pub bypass_router: bool,
 }
 
 fn cstr(s: &str) -> std::ffi::CString {
@@ -94,10 +107,25 @@ fn run(cmd: &str, args: &[&str]) -> io::Result<String> {
     }
     if pid == 0 {
         unsafe {
+            // Fork hygiene — CRITICAL: tokio's signal driver blocks
+            // SIGTERM/SIGINT/SIGHUP in this thread; the mask survives
+            // execve, and iptables-nft with those signals blocked
+            // stalls ~40s per invocation (verified empirically: every
+            // teardown command wedged, systemd/podman eventually
+            // SIGKILLed the daemon mid-teardown — the origin of stacked
+            // duplicate jumps on long-running gateways). Reset to the
+            // default mask so children behave exactly like `podman exec`.
+            let empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
             libc::close(fds[0]);
             libc::dup2(fds[1], 1);
             libc::dup2(fds[1], 2);
             libc::close(fds[1]);
+            // Close stray inherited fds (listeners, sockets): children
+            // need exactly 0/1/2.
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
             libc::execve(cargs[0].as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
@@ -125,8 +153,66 @@ pub(crate) fn run_ok(cmd: &str, args: &[&str]) {
     let _ = run(cmd, args);
 }
 
-fn jump_exists(builtin: &str, chain: &str) -> bool {
-    run("iptables", &["-t", "mangle", "-C", builtin, "-j", chain]).is_ok()
+/// Remove EVERY `builtin -j chain` jump (loop): a SIGKILLed previous
+/// run can leave duplicated jumps (each re-apply without teardown adds
+/// one), and a single -D then leaves the chain referenced (unflushable,
+/// un-removable residue — observed as 9 stacked MGL-PRENAT jumps on a
+/// production gateway). Used by teardown for all our jumps.
+fn delete_all_jumps(table: &str, builtin: &str, chain: &str) {
+    while run("iptables", &["-t", table, "-C", builtin, "-j", chain]).is_ok() {
+        run_ok("iptables", &["-t", table, "-D", builtin, "-j", chain]);
+    }
+}
+
+fn delete_all_jumps6(table: &str, builtin: &str, chain: &str) {
+    while run("ip6tables", &["-t", table, "-C", builtin, "-j", chain]).is_ok() {
+        run_ok("ip6tables", &["-t", table, "-D", builtin, "-j", chain]);
+    }
+}
+
+/// Enable IPv4 forwarding for bypass-router mode. Persists the previous
+/// value for teardown; if the write fails (e.g. read-only /proc/sys in
+/// rootless userns) but forwarding is already on, that is fine — only
+/// warn when we cannot forward at all.
+fn enable_ip_forward() {
+    let cur = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    match cur {
+        Some(1) => {
+            // already forwarding; remember that so teardown is a no-op
+            let _ = std::fs::write(IPFORWARD_PREV, b"1");
+        }
+        Some(v) => {
+            if std::fs::write(IPFORWARD_PREV, format!("{v}")).is_err() {
+                warn!(
+                    "bypass: cannot persist ip_forward state ({IPFORWARD_PREV} unwritable); teardown will leave it as-is"
+                );
+            }
+            if std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").is_err() {
+                warn!(
+                    "bypass: could not enable net.ipv4.ip_forward (read-only /proc/sys?); start the container with sysctl net.ipv4.ip_forward=1"
+                );
+            } else {
+                info!("bypass: net.ipv4.ip_forward {v} -> 1");
+            }
+        }
+        None => warn!("bypass: cannot read net.ipv4.ip_forward"),
+    }
+}
+
+/// Restore the ip_forward value from before enable_ip_forward().
+/// Without the persistence file (missing /run, reboot) we leave the
+/// sysctl untouched rather than guessing.
+fn restore_ip_forward() {
+    if let Ok(prev) = std::fs::read_to_string(IPFORWARD_PREV) {
+        let prev = prev.trim().to_string();
+        if prev != "1" {
+            let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", &prev);
+            info!("bypass: net.ipv4.ip_forward restored to {prev}");
+        }
+        let _ = std::fs::remove_file(IPFORWARD_PREV);
+    }
 }
 
 /// Apply an iptables-restore/ip6tables-restore blob atomically (stdin).
@@ -152,10 +238,17 @@ fn restore_blob(restore_bin: &str, blob: &str) -> io::Result<()> {
     }
     if pid == 0 {
         unsafe {
+            // Same fork hygiene as run(): reset the signal mask.
+            let empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
             libc::close(in_fds[1]);
             libc::dup2(in_fds[0], 0);
             libc::dup2(devnull, 1);
             libc::dup2(devnull, 2);
+            // Close stray inherited fds (incl. in_fds and devnull).
+            for fd in 3..1024 {
+                libc::close(fd);
+            }
             libc::execve(cmd.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
@@ -194,6 +287,9 @@ fn restore_blob(restore_bin: &str, blob: &str) -> io::Result<()> {
 pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     teardown(spec);
     info!("tproxy rules: mark {MARK:#x} table {TABLE} chains {CHAIN_OUT}/{CHAIN_PRE}");
+    if spec.bypass_router {
+        enable_ip_forward();
+    }
 
     // 1. policy routing: marked packets are delivered locally
     run(
@@ -233,6 +329,14 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     nat.push_str("-A MGL-NAT -d 127.0.0.0/8 -j RETURN\n");
     nat.push_str("-A MGL-NAT -d 224.0.0.0/4 -j RETURN\n");
     nat.push_str("-A MGL-NAT -d 255.255.255.255/32 -j RETURN\n");
+    if spec.dns_port != 0 {
+        // DNS over TCP (truncated-answer fallback): must precede the
+        // generic TCP REDIRECT — first match wins. The DNS module's TCP
+        // listener answers instead of the TCP relay.
+        nat.push_str(&format!(
+            "-A {CHAIN_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+        ));
+    }
     nat.push_str(&format!(
         "-A {CHAIN_NAT} -p tcp -j REDIRECT --to-ports {}\n", spec.tcp_port
     ));
@@ -259,9 +363,24 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             "-A {CHAIN_PRE_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n",
             spec.dns_port
         ));
+        nat.push_str(&format!(
+            "-A {CHAIN_PRE_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
+        ));
         nat.push_str(&format!("-A PREROUTING -j {CHAIN_PRE_NAT}\n"));
     }
     nat.push_str(&format!("-A OUTPUT -j {CHAIN_NAT}\n"));
+    if spec.bypass_router {
+        // Bypass-router masquerade: TPROXY'd packets never reach
+        // POSTROUTING (local delivery) and locally-originated traffic
+        // already carries the interface address (MASQUERADE no-ops), so
+        // this only touches FORWARDED traffic the transparent plane
+        // skipped (ICMP, other IP protocols, exempted destinations) —
+        // NAT it out so replies find their way back through the gateway.
+        nat.push_str(&format!(":{CHAIN_MASQ} - [0:0]\n"));
+        nat.push_str(&format!("-A {CHAIN_MASQ} ! -o lo -j MASQUERADE\n"));
+        nat.push_str(&format!("-A POSTROUTING -j {CHAIN_MASQ}\n"));
+    }
     nat.push_str("COMMIT\n");
 
     // 3. mangle rules: TPROXY for FORWARDED traffic (gateway mode) and
@@ -335,6 +454,7 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             // Forwarded DNS takes the nat PREROUTING REDIRECT path
             // (MGL-PRENAT), not TPROXY — mirror of the MGL-OUT skip.
             blob.push_str("-A MGL-PRE -p udp --dport 53 -j RETURN\n");
+            blob.push_str("-A MGL-PRE -p tcp --dport 53 -j RETURN\n");
             // Clients may also query the DNS interceptor directly on
             // dns_port; don't capture that either.
             blob.push_str(&format!(
@@ -382,6 +502,20 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     restore_blob("/usr/sbin/iptables-restore", &blob).inspect_err(|_e| {
         teardown(spec);
     })?;
+    if spec.bypass_router {
+        // FORWARD accept (filter plane): anything the transparent plane
+        // intercepted never reaches FORWARD (TPROXY is local delivery);
+        // what lands here is exactly the bypass traffic we want to pass.
+        let mut fwd = String::new();
+        fwd.push_str("*filter\n");
+        fwd.push_str(&format!(":{CHAIN_FWD} - [0:0]\n"));
+        fwd.push_str(&format!("-A {CHAIN_FWD} -j ACCEPT\n"));
+        fwd.push_str(&format!("-A FORWARD -j {CHAIN_FWD}\n"));
+        fwd.push_str("COMMIT\n");
+        restore_blob("/usr/sbin/iptables-restore", &fwd).inspect_err(|_e| {
+            teardown(spec);
+        })?;
+    }
     // v6 mirror (best effort; fake tokens only need local interception,
     // so v4-only clients can also route v6 through the tunnel).
     if v6_plane_wanted() {
@@ -404,36 +538,42 @@ pub fn teardown(_spec: &RuleSpec) {
     // Nuclear fallback: if iptables-nft reports chain incompatibility
     // (stale state from a different iptables API version), flush the
     // entire ruleset. In containers/dedicated systems this is safe.
-    if run("iptables", &["-t", "mangle", "-L", "MGL-OUT"]).is_err() {
+    // NOTE: -n is REQUIRED — translated listings (-L without -n) do
+    // reverse-DNS per address, and on a gateway those PTR queries get
+    // intercepted by our own DNS redirect (20s+ per lookup through the
+    // tunnel; this single flag once made every teardown take 40s).
+    if run("iptables", &["-t", "mangle", "-n", "-L", "MGL-OUT"]).is_err() {
         run_ok("nft", &["flush", "ruleset"]);
     }
-    // Remove the jumps first so no new packets enter our chains
-    if jump_exists("OUTPUT", CHAIN_OUT) {
-        run_ok("iptables", &["-t", "mangle", "-D", "OUTPUT", "-j", CHAIN_OUT]);
-    }
-    if jump_exists("PREROUTING", CHAIN_PRE) {
-        run_ok("iptables", &["-t", "mangle", "-D", "PREROUTING", "-j", CHAIN_PRE]);
-    }
-    if jump_exists("PREROUTING", CHAIN_PRE_NAT) {
-        run_ok("iptables", &["-t", "nat", "-D", "PREROUTING", "-j", CHAIN_PRE_NAT]);
-    }
+    // Remove the jumps first so no new packets enter our chains.
+    // delete_all_jumps loops: a SIGKILLed previous run can leave
+    // duplicated jumps, and a single -D leaves the chain referenced
+    // (unflushable residue).
+    delete_all_jumps("mangle", "OUTPUT", CHAIN_OUT);
+    delete_all_jumps("mangle", "PREROUTING", CHAIN_PRE);
+    delete_all_jumps("nat", "OUTPUT", CHAIN_NAT);
+    delete_all_jumps("nat", "PREROUTING", CHAIN_PRE_NAT);
+    delete_all_jumps("nat", "POSTROUTING", CHAIN_MASQ);
+    delete_all_jumps("filter", "FORWARD", CHAIN_FWD);
     run_ok("iptables", &["-t", "nat", "-F", CHAIN_PRE_NAT]);
     run_ok("iptables", &["-t", "nat", "-X", CHAIN_PRE_NAT]);
     run_ok("iptables", &["-t", "mangle", "-F", CHAIN_OUT]);
     run_ok("iptables", &["-t", "mangle", "-X", CHAIN_OUT]);
     run_ok("iptables", &["-t", "mangle", "-F", CHAIN_PRE]);
     run_ok("iptables", &["-t", "mangle", "-X", CHAIN_PRE]);
-    // nat chain
-    if run("iptables", &["-t", "nat", "-C", "OUTPUT", "-j", CHAIN_NAT]).is_ok() {
-        run_ok("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", CHAIN_NAT]);
-    } else {
-        // try deleting anyway (the check might fail for nft compat reasons)
-        run_ok("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", CHAIN_NAT]);
-    }
     run_ok("iptables", &["-t", "nat", "-F", CHAIN_NAT]);
     // retry deletion: -X can fail transiently (nft backend timing)
     for _ in 0..3 {
         run_ok("iptables", &["-t", "nat", "-X", CHAIN_NAT]);
+    }
+    // bypass-router extras
+    run_ok("iptables", &["-t", "nat", "-F", CHAIN_MASQ]);
+    for _ in 0..3 {
+        run_ok("iptables", &["-t", "nat", "-X", CHAIN_MASQ]);
+    }
+    run_ok("iptables", &["-t", "filter", "-F", CHAIN_FWD]);
+    for _ in 0..3 {
+        run_ok("iptables", &["-t", "filter", "-X", CHAIN_FWD]);
     }
     for _ in 0..3 {
         run_ok(
@@ -445,6 +585,7 @@ pub fn teardown(_spec: &RuleSpec) {
         );
     }
     run_ok("ip", &["route", "flush", "table", &TABLE.to_string()]);
+    restore_ip_forward();
     info!("v4 teardown took {:?}", _t0.elapsed());
     let _t1 = std::time::Instant::now();
     teardown_v6();
@@ -504,6 +645,12 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     nat.push_str("-A MGL6-NAT -d ::1/128 -j RETURN\n");
     nat.push_str("-A MGL6-NAT -d fe80::/10 -j RETURN\n");
     nat.push_str("-A MGL6-NAT -d ff00::/8 -j RETURN\n");
+    if spec.dns_port != 0 {
+        // DNS over TCP before the generic TCP REDIRECT (see v4).
+        nat.push_str(&format!(
+            "-A {CHAIN6_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+        ));
+    }
     nat.push_str(&format!(
         "-A {CHAIN6_NAT} -p tcp -j REDIRECT --to-ports {}\n", spec.tcp_port
     ));
@@ -524,6 +671,10 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         }
         nat.push_str(&format!(
             "-A {CHAIN6_PRE_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
+        ));
+        nat.push_str(&format!(
+            "-A {CHAIN6_PRE_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n",
             spec.dns_port
         ));
         nat.push_str(&format!("-A PREROUTING -j {CHAIN6_PRE_NAT}\n"));
@@ -574,6 +725,7 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         }
         if spec.dns_port != 0 {
             blob.push_str("-A MGL6-PRE -p udp --dport 53 -j RETURN\n");
+            blob.push_str("-A MGL6-PRE -p tcp --dport 53 -j RETURN\n");
             blob.push_str(&format!(
                 "-A MGL6-PRE -p udp --dport {} -j RETURN\n", spec.dns_port
             ));
@@ -616,9 +768,10 @@ pub fn teardown_v6() {
     if !std::path::Path::new("/usr/sbin/ip6tables").exists() {
         return;
     }
-    run_ok("ip6tables", &["-t", "mangle", "-D", "OUTPUT", "-j", CHAIN6_OUT]);
-    run_ok("ip6tables", &["-t", "mangle", "-D", "PREROUTING", "-j", CHAIN6_PRE]);
-    run_ok("ip6tables", &["-t", "nat", "-D", "PREROUTING", "-j", CHAIN6_PRE_NAT]);
+    delete_all_jumps6("mangle", "OUTPUT", CHAIN6_OUT);
+    delete_all_jumps6("mangle", "PREROUTING", CHAIN6_PRE);
+    delete_all_jumps6("nat", "OUTPUT", CHAIN6_NAT);
+    delete_all_jumps6("nat", "PREROUTING", CHAIN6_PRE_NAT);
     run_ok("ip6tables", &["-t", "nat", "-F", CHAIN6_PRE_NAT]);
     run_ok("ip6tables", &["-t", "nat", "-X", CHAIN6_PRE_NAT]);
     run_ok("ip6tables", &["-t", "mangle", "-F", CHAIN6_OUT]);

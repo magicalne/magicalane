@@ -224,6 +224,10 @@ if [ "$PROFILE" = "tproxy" ]; then
         -v "$ENV_DIR/configs/client-$TRANSPORT-ws-gw.toml:/etc/magicalane/client-gw.toml:ro" \
         -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
         "$IMAGE" magicalane --config /etc/magicalane/client-gw.toml
+    # NOTE: --sysctl net.ipv4.ip_forward is required only because ROOTLESS
+    # podman mounts /proc/sys read-only (the client's own bypass_router
+    # write logs a warning and is skipped there). Privileged deployments
+    # (incus/systemd gateways) need no sysctl — the client sets it itself.
 
     $CE network connect "$LAN" magicalane-tproxy-client || true
 
@@ -237,7 +241,7 @@ if [ "$PROFILE" = "tproxy" ]; then
     ensure_run magicalane-app \
         $CE run -d --name magicalane-app --label "$LABEL" \
         --network "$LAN" \
-        --cap-add NET_ADMIN --cap-add DAC_OVERRIDE \
+        --cap-add NET_ADMIN --cap-add DAC_OVERRIDE --cap-add NET_RAW \
         --add-host "origin:$ORIGIN_IP" \
         --add-host "testsvc:$TESTSVC_IP" \
         "$IMAGE" sleep infinity

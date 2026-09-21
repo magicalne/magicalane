@@ -23,7 +23,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, info, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
-    net::UdpSocket,
+    net::{TcpListener, TcpStream, UdpSocket},
     spawn,
     sync::Semaphore,
 };
@@ -147,6 +147,91 @@ pub fn bind_client_v6(port: u16, gateway: bool) -> io::Result<Arc<UdpSocket>> {
     Ok(sock)
 }
 
+// ------------------------------------------------------------ TCP (RFC 7766)
+// DNS-over-TCP: resolvers retry truncated UDP answers over TCP, and
+// tcp-first stub resolvers exist; without a TCP listener these clients
+// get connection-reset on the redirected tcp/53. Same framing as the
+// tunnel wire: [u16 BE len][message]. Addressing mirrors the UDP
+// siblings (loopback workstation / wildcard gateway) because the same
+// nat REDIRECT rules deliver both.
+
+/// Bind the DNS module's TCP listener (see section above).
+pub fn bind_client_tcp(port: u16, gateway: bool) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = SocketAddr::new(
+        if gateway {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        },
+        port,
+    );
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    let listener = TcpListener::from_std(socket.into())?;
+    info!("dns TCP interceptor listening on {addr}");
+    Ok(listener)
+}
+
+/// v6 sibling of the TCP listener ([::] gateway / [::1] workstation;
+/// v6only so it cannot clash with the v4 wildcard bind).
+pub fn bind_client_tcp_v6(port: u16, gateway: bool) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_only_v6(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = SocketAddr::new(
+        if gateway {
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        },
+        port,
+    );
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    let listener = TcpListener::from_std(socket.into())?;
+    info!("dns6 TCP interceptor listening on {addr}");
+    Ok(listener)
+}
+
+/// Read one [u16 len][message] frame from a DNS-over-TCP connection.
+async fn read_dns_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut hdr = [0u8; 2];
+    tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut hdr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns tcp header timeout"))??;
+    let len = u16::from_be_bytes(hdr) as usize;
+    if len > MAX_DNS {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "dns tcp frame too large"));
+    }
+    let mut msg = vec![0u8; len];
+    tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut msg))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns tcp query timeout"))??;
+    Ok(msg)
+}
+
+/// Write one [u16 len][message] frame.
+async fn write_dns_frame(stream: &mut TcpStream, resp: &[u8]) -> io::Result<()> {
+    let mut out = Vec::with_capacity(2 + resp.len());
+    out.put_u16(resp.len() as u16);
+    out.extend_from_slice(resp);
+    tokio::time::timeout(QUERY_TIMEOUT, stream.write_all(&out)).await??;
+    tokio::time::timeout(QUERY_TIMEOUT, stream.flush()).await??;
+    Ok(())
+}
+
 /// Serve DNS queries through the tunnel.
 pub async fn serve_client<C, IO>(sock: std::sync::Arc<UdpSocket>, connector: C)
 where
@@ -210,6 +295,47 @@ where
     Ok(resp)
 }
 
+/// Serve DNS-over-TCP in tunnel mode: one frame per query, multiple
+/// queries per connection allowed (sequential), answered through the
+/// tunnel exactly like UDP queries.
+pub async fn serve_client_tcp<C, IO>(listener: TcpListener, connector: C)
+where
+    C: Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, peer)) => {
+                let connector = connector.clone();
+                spawn(async move {
+                    let _permit = INFLIGHT.acquire().await;
+                    loop {
+                        let query = match read_dns_frame(&mut stream).await {
+                            Ok(q) => q,
+                            Err(_) => break, // EOF / malformed / timeout
+                        };
+                        match query_once(connector.clone(), &query).await {
+                            Ok(resp) => {
+                                if write_dns_frame(&mut stream, &resp).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                debug!("dns tcp query from {peer} failed: {err}");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                warn!("dns tcp accept error: {err}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
 /// Label-aligned suffix match for fakeip_filter entries.
 fn suffix_matches(domain: &str, entry: &str) -> bool {
     let entry = entry.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
@@ -267,6 +393,66 @@ pub async fn serve_client_fakeip<C, IO>(
             }
             Err(err) => {
                 warn!("dns recv error: {err}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// DNS-over-TCP sibling of `serve_client_fakeip`: same local fake-token
+/// answers, framed per RFC 7766.
+pub async fn serve_client_fakeip_tcp<C, IO>(
+    listener: TcpListener,
+    map: Arc<FakeIpMap>,
+    aaaa: AaaaMode,
+    v6_intercept_active: bool,
+    filter: Arc<std::sync::RwLock<Vec<String>>>,
+    resolver: std::sync::Arc<resolve::Resolver>,
+    connector: C,
+) where
+    C: Connector<Connection = IO> + Send + 'static + Clone,
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, peer)) => {
+                let map = map.clone();
+                let filter = filter.clone();
+                let resolver = resolver.clone();
+                let connector = connector.clone();
+                spawn(async move {
+                    let _permit = INFLIGHT.acquire().await;
+                    loop {
+                        let query = match read_dns_frame(&mut stream).await {
+                            Ok(q) => q,
+                            Err(_) => break,
+                        };
+                        match answer_fakeip(
+                            map.clone(),
+                            aaaa,
+                            v6_intercept_active,
+                            filter.clone(),
+                            resolver.clone(),
+                            connector.clone(),
+                            query,
+                        )
+                        .await
+                        {
+                            Ok(resp) => {
+                                if write_dns_frame(&mut stream, &resp).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                debug!("fakeip tcp query from {peer} failed: {err}");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                warn!("dns tcp accept error: {err}");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }

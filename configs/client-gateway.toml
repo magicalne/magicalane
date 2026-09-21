@@ -10,8 +10,17 @@
 # FORWARDED traffic (iptables PREROUTING), i.e. packets from LAN
 # devices whose default gateway points at this container.
 #
+# bypass_router = true completes the "one-box bypass router" story:
+# LAN devices then simply set their DEFAULT ROUTE and DNS to this
+# container's IP. It enables IPv4 forwarding + NAT for traffic the
+# transparent plane does not intercept (ICMP/ping works, other IP
+# protocols pass through masqueraded) and DNS over TCP alongside UDP.
+# IPv4 plane only — for IPv6, keep AAAA filtered (routing.aaaa
+# defaults to "auto" which does exactly that when v6 interception is
+# inactive).
+#
 # NOTE: the `kind` value must stay a single-line inline table.
 password = "change-me"
 bandwidth = 65536
 verbose = true
-kind = { Client = { proxy = { host = "REPLACE-WITH-YOUR-SERVER", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" }, socks5_port = 1080, socks5_users = ["lan:change-me-too"], allow_lan = true, tproxy = { mode = "tproxy", gateway = true, tcp_port = 7895, udp_port = 7896, dns_port = 15353, dns_mode = "fakeip" }, routing = { default = "proxy", direct_dns = ["192.168.2.1:53"], fakeip_cache = "/var/lib/magicalane/fakeip.map", rule = [ { domain_suffix = ["lan", "local", "home.arpa"], action = "direct" }, { ip_cidr = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fe80::/10"], action = "direct" } ] } } }
+kind = { Client = { proxy = { host = "REPLACE-WITH-YOUR-SERVER", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem" }, socks5_port = 1080, socks5_users = ["lan:change-me-too"], allow_lan = true, tproxy = { mode = "tproxy", gateway = true, bypass_router = true, tcp_port = 7895, udp_port = 7896, dns_port = 15353, dns_mode = "fakeip" }, routing = { default = "proxy", direct_dns = ["192.168.2.1:53"], fakeip_cache = "/var/lib/magicalane/fakeip.map", rule = [ { domain_suffix = ["lan", "local", "home.arpa"], action = "direct" }, { ip_cidr = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fe80::/10"], action = "direct" } ] } } }

@@ -1,8 +1,12 @@
-# TUN mode: a userspace TCP/IP stack on device mgl0 intercepts
-# everything WITHOUT iptables — same routing engine, same fake-IP DNS.
+# TUN mode: a userspace TCP/IP stack intercepts everything WITHOUT
+# iptables — same routing engine, same fake-IP DNS.
 # Requires: cargo build --release --features tun-mode
-# Requires: /dev/net/tun (containers: --device /dev/net/tun) and
-# CAP_NET_ADMIN for route setup. The clean-exit contract applies.
+# Linux: creates /dev/net/tun device mgl0 (containers: --device
+#   /dev/net/tun); CAP_NET_ADMIN for route setup.
+# macOS: creates a utun device (kernel-assigned utunN) and captures
+#   traffic with 0.0.0.0/1 + 128.0.0.0/1 + 2000::/3 routes — the
+#   original default route is never modified. Run with sudo. The
+#   clean-exit contract applies on both platforms.
 password = "change-me"
 bandwidth = 65536
 verbose = true

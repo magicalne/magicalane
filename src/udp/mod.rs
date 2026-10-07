@@ -51,7 +51,10 @@ const MAX_DGRAM: usize = 65507;
 
 /// Receive one datagram with MSG_DONTWAIT, returning (n, src, orig_dst).
 /// The original destination comes from the IP_RECVORIGDSTADDR cmsg.
-fn recvmsg_origdst(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, SocketAddr)> {
+fn recvmsg_origdst(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, SocketAddr)> {
     let mut cmsg_space = [0u8; 128];
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
@@ -64,7 +67,7 @@ fn recvmsg_origdst(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<(
     hdr.msg_iov = &mut iov;
     hdr.msg_iovlen = 1;
     hdr.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
-    hdr.msg_controllen = cmsg_space.len();
+    hdr.msg_controllen = cmsg_space.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut hdr, libc::MSG_DONTWAIT) };
     if n < 0 {
         return Err(io::Error::last_os_error());
@@ -103,7 +106,7 @@ fn recvmsg_origdst(fd: std::os::unix::io::RawFd, buf: &mut [u8]) -> io::Result<(
                     u16::from_be(sin.sin_port),
                 ));
             }
-            if cmsg.cmsg_level == libc::SOL_IPV6 && cmsg.cmsg_type == IPV6_RECVORIGDSTADDR {
+            if cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == IPV6_RECVORIGDSTADDR {
                 let data = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
                 let sin6 = &*data;
                 dst = Some(SocketAddr::new(
@@ -150,7 +153,10 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if rc != 0 {
-                warn!("udp: setsockopt {opt} failed: {}", io::Error::last_os_error());
+                warn!(
+                    "udp: setsockopt {opt} failed: {}",
+                    io::Error::last_os_error()
+                );
             }
         }
     }
@@ -188,13 +194,16 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
         for opt in [IPV6_TRANSPARENT, IPV6_RECVORIGDSTADDR, libc::IPV6_V6ONLY] {
             let rc = libc::setsockopt(
                 fd,
-                libc::SOL_IPV6,
+                libc::IPPROTO_IPV6,
                 opt,
                 &on as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             if rc != 0 {
-                warn!("udp6: setsockopt {opt} failed: {}", io::Error::last_os_error());
+                warn!(
+                    "udp6: setsockopt {opt} failed: {}",
+                    io::Error::last_os_error()
+                );
             }
         }
     }
@@ -251,16 +260,17 @@ pub async fn serve_client(
             let Some(int) = reaper.upgrade() else { break };
             let now = Instant::now();
             int.flows.lock().unwrap().retain(|k, _| {
-                
-                int
-                    .last_used
+                int.last_used
                     .lock()
                     .unwrap()
                     .get(k)
                     .map(|t| now.duration_since(*t) < FLOW_IDLE)
                     .unwrap_or(false)
             });
-            int.last_used.lock().unwrap().retain(|_, t| now.duration_since(*t) < FLOW_IDLE * 2);
+            int.last_used
+                .lock()
+                .unwrap()
+                .retain(|_, t| now.duration_since(*t) < FLOW_IDLE * 2);
         }
     });
 
@@ -346,7 +356,10 @@ async fn udp_direct_flow(
         Addr::DomainName(host, port) => {
             let host = String::from_utf8_lossy(host).into_owned();
             match direct.resolve(&host, *port).await {
-                Ok(a) => a.into_iter().map(|a| SocketAddr::new(a.ip(), *port)).collect(),
+                Ok(a) => a
+                    .into_iter()
+                    .map(|a| SocketAddr::new(a.ip(), *port))
+                    .collect(),
                 Err(err) => {
                     debug!("udp direct {host} resolve failed: {err}");
                     return;
@@ -521,7 +534,9 @@ impl UdpFramedStream {
                                 .await
                                 .map_err(|e| io::Error::other(e.to_string()))?
                                 .next()
-                                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addr"))?;
+                                .ok_or_else(|| {
+                                    io::Error::new(io::ErrorKind::NotFound, "no addr")
+                                })?;
                             Ok(addr)
                         }));
                     }
@@ -564,7 +579,9 @@ impl UdpFramedStream {
     fn flush_outq(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         while let Some(dst) = self.dst {
             let Some(sock) = self.sock.clone() else { break };
-            let Some(dg) = self.outq.first().cloned() else { break };
+            let Some(dg) = self.outq.first().cloned() else {
+                break;
+            };
             match sock.try_send_to(&dg, dst) {
                 Ok(_) => {
                     self.outq.remove(0);
@@ -676,10 +693,7 @@ impl AsyncWrite for UdpFramedStream {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.drain_wbuf();
         this.poll_resolve(cx);

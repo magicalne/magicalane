@@ -58,7 +58,8 @@ type FlowKey = (SocketAddr, SocketAddr); // (app src, original dst)
 
 // ---------------------------------------------------------------- device
 
-fn open_tun(name: &str) -> io::Result<std::mem::ManuallyDrop<std::fs::File>> {
+#[cfg(target_os = "linux")]
+fn open_tun(name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, String)> {
     const TUNSETIFF: libc::c_ulong = 0x400454ca;
     const IFF_TUN: libc::c_short = 0x0001;
     const IFF_NO_PI: libc::c_short = 0x1000;
@@ -86,9 +87,177 @@ fn open_tun(name: &str) -> io::Result<std::mem::ManuallyDrop<std::fs::File>> {
         unsafe { libc::close(fd) };
         return Err(e);
     }
-    Ok(std::mem::ManuallyDrop::new(unsafe {
-        std::fs::File::from_raw_fd(fd)
-    }))
+    Ok((
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) }),
+        name.to_string(),
+    ))
+}
+
+/// Open a macOS utun device. Unlike Linux TUN, the interface name is
+/// kernel-assigned (`utunN`) — the requested name is only a naming
+/// hint for logs. Every packet read/written carries a 4-byte address
+/// family header (AF_INET / AF_INET6, network byte order) that must
+/// be stripped on RX and prepended on TX.
+#[cfg(target_os = "macos")]
+fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, String)> {
+    // socket(PF_SYSTEM, SOCK_DGRAM | SOCK_NONBLOCK, SYSPROTO_CONTROL)
+    let fd = unsafe {
+        libc::socket(
+            libc::PF_SYSTEM,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+            libc::SYSPROTO_CONTROL,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // CTLIOCGINFO: resolve the kernel control id by name.
+    #[repr(C)]
+    struct CtlInfo {
+        ctl_id: u32,
+        ctl_name: [u8; 96],
+    }
+    const CTLIOCGINFO: libc::c_ulong = 0xC0644E03; // _IOWR('N', 3, struct ctl_info)
+    let mut info = CtlInfo {
+        ctl_id: 0,
+        ctl_name: [0u8; 96],
+    };
+    let name_bytes = b"com.apple.net.utun_control";
+    info.ctl_name[..name_bytes.len()].copy_from_slice(name_bytes);
+    let rc = unsafe {
+        libc::ioctl(
+            fd,
+            CTLIOCGINFO,
+            &mut info as *mut CtlInfo as *mut libc::c_void,
+        )
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // sockaddr_ctl connect: sc_unit = 0 lets the kernel pick a free unit.
+    #[repr(C)]
+    struct SockaddrCtl {
+        sc_len: u8,
+        sc_family: u8,
+        ss_sysaddr: u16,
+        sc_id: u32,
+        sc_unit: u32,
+        spare: [u32; 5],
+    }
+    let sc = SockaddrCtl {
+        sc_len: std::mem::size_of::<SockaddrCtl>() as u8,
+        sc_family: libc::AF_SYSTEM as u8,
+        ss_sysaddr: libc::AF_SYS_CONTROL as u16,
+        sc_id: info.ctl_id,
+        sc_unit: 0,
+        spare: [0; 5],
+    };
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &sc as *const SockaddrCtl as *const libc::sockaddr,
+            std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // The assigned unit number arrives via getsockname: utunN (N = unit - 1).
+    let mut sc = SockaddrCtl {
+        sc_len: 0,
+        sc_family: 0,
+        ss_sysaddr: 0,
+        sc_id: 0,
+        sc_unit: 0,
+        spare: [0; 5],
+    };
+    let mut len = std::mem::size_of::<SockaddrCtl>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            &mut sc as *mut SockaddrCtl as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if rc != 0 || sc.sc_unit == 0 {
+        let e = if rc != 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::new(io::ErrorKind::Other, "utun: no unit assigned")
+        };
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let dev = format!("utun{}", sc.sc_unit - 1);
+    Ok((
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) }),
+        dev,
+    ))
+}
+
+/// Strip the macOS utun 4-byte address-family header from a received
+/// frame. Returns the IP packet, or None if the frame is not for us.
+#[cfg(target_os = "macos")]
+fn utun_strip(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 24 {
+        return None;
+    }
+    let af = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+    // Tolerate a little-endian kernel path (never observed, cheap to
+    // accept): both encodings put a small AF value in one end.
+    let af = if af == libc::AF_INET as u32 || af == libc::AF_INET6 as u32 {
+        af
+    } else {
+        u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]])
+    };
+    if af != libc::AF_INET as u32 && af != libc::AF_INET6 as u32 {
+        return None;
+    }
+    let pkt = &frame[4..];
+    // Sanity: first nibble must be an IP version.
+    matches!(pkt.first().map(|b| b >> 4), Some(4) | Some(6)).then_some(pkt)
+}
+
+/// Prepend the macOS utun 4-byte address-family header to an outgoing
+/// IP packet (AF_INET / AF_INET6 in network byte order).
+#[cfg(target_os = "macos")]
+fn utun_prepend(pkt: &[u8]) -> Vec<u8> {
+    let af: u32 = if pkt.first().map(|b| b >> 4) == Some(6) {
+        libc::AF_INET6 as u32
+    } else {
+        libc::AF_INET as u32
+    };
+    let mut frame = Vec::with_capacity(4 + pkt.len());
+    frame.extend_from_slice(&af.to_be_bytes());
+    frame.extend_from_slice(pkt);
+    frame
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mac_tests {
+    use super::*;
+
+    #[test]
+    fn utun_framing_roundtrip() {
+        let pkt = [0x45u8, 0x00, 0x00, 0x28]; // IPv4 header start
+        let frame = utun_prepend(&pkt);
+        assert_eq!(&frame[..4], &[0, 0, 0, libc::AF_INET as u8]);
+        assert_eq!(utun_strip(&frame), Some(&pkt[..]));
+        let pkt6 = [0x60u8, 0x00, 0x00, 0x00]; // IPv6 header start
+        let frame6 = utun_prepend(&pkt6);
+        assert_eq!(&frame6[..4], &[0, 0, 0, libc::AF_INET6 as u8]);
+        assert_eq!(utun_strip(&frame6), Some(&pkt6[..]));
+    }
+
+    #[test]
+    fn utun_strip_rejects_garbage() {
+        assert!(utun_strip(&[0u8; 32]).is_none()); // AF 0
+        assert!(utun_strip(&[0, 0, 0, 2, 0x45]).is_none()); // too short
+    }
 }
 
 struct TunPhy {
@@ -117,10 +286,16 @@ impl TxToken for PhyTx {
     {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
+        #[cfg(target_os = "macos")]
+        let buf = utun_prepend(&buf);
         let mut off = 0;
         while off < buf.len() {
             let n = unsafe {
-                libc::write(self.fd, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off)
+                libc::write(
+                    self.fd,
+                    buf[off..].as_ptr() as *const libc::c_void,
+                    buf.len() - off,
+                )
             };
             if n <= 0 {
                 break; // WouldBlock: drop (TCP retransmits)
@@ -135,11 +310,19 @@ impl Device for TunPhy {
     type RxToken<'a> = PhyRx;
     type TxToken<'a> = PhyTx;
 
-    fn receive(&mut self, _t: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _t: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.rx_queue.is_empty() {
             return None;
         }
-        Some((PhyRx { buf: self.rx_queue.remove(0) }, PhyTx { fd: self.fd }))
+        Some((
+            PhyRx {
+                buf: self.rx_queue.remove(0),
+            },
+            PhyTx { fd: self.fd },
+        ))
     }
     fn transmit(&mut self, _t: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(PhyTx { fd: self.fd })
@@ -183,8 +366,6 @@ pub struct TunStream {
     to_stack: tokio::sync::mpsc::Sender<Vec<u8>>,
     write_space: Arc<Notify>,
 }
-
-
 
 impl AsyncRead for TunStream {
     fn poll_read(
@@ -234,10 +415,16 @@ impl AsyncWrite for TunStream {
             ))),
         }
     }
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> TaskPoll<io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> TaskPoll<io::Result<()>> {
         TaskPoll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> TaskPoll<io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> TaskPoll<io::Result<()>> {
         TaskPoll::Ready(Ok(()))
     }
 }
@@ -267,18 +454,27 @@ pub async fn serve(
     bandwidth: usize,
     server_ips: Vec<Ipv4Addr>,
 ) -> anyhow::Result<()> {
-    let _file = open_tun(TUN_NAME)?;
+    let (_file, dev) = open_tun(TUN_NAME)?;
     let fd = _file.as_raw_fd();
-    routes::tun_apply(TUN_NAME, TUN_ADDR, TUN_ADDR6, &server_ips)?;
-    info!("tun: {TUN_NAME} up ({TUN_ADDR}/{TUN_ADDR6}); default route via {TUN_NAME}");
+    *TUN_DEV.lock().unwrap() = Some(dev.clone());
+    routes::tun_apply(&dev, TUN_ADDR, TUN_ADDR6, &server_ips)?;
+    info!("tun: {dev} up ({TUN_ADDR}/{TUN_ADDR6}); default route via {dev}");
 
-    let async_fd = tokio::io::unix::AsyncFd::new(unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) })?;
-    let mut phy = TunPhy { fd, rx_queue: Vec::new() };
+    let async_fd =
+        tokio::io::unix::AsyncFd::new(unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) })?;
+    let mut phy = TunPhy {
+        fd,
+        rx_queue: Vec::new(),
+    };
 
     let cfg = IfaceConfig::new(HardwareAddress::Ip);
     let mut iface = Interface::new(cfg, &mut phy, smoltcp::time::Instant::from_millis(0));
     iface.update_ip_addrs(|a| {
-        a.push(IpCidr::new(IpAddress::Ipv4(Ipv4Addr::new(198, 18, 255, 254)), 32)).ok();
+        a.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Addr::new(198, 18, 255, 254)),
+            32,
+        ))
+        .ok();
         a.push(IpCidr::new(
             IpAddress::Ipv6("fc00:ffff:ffff:fffe::1".parse::<Ipv6Addr>().unwrap()),
             128,
@@ -312,6 +508,10 @@ pub async fn serve(
                             break;
                         }
                         buf.truncate(n as usize);
+                        #[cfg(target_os = "macos")]
+                        let Some(buf) = utun_strip(&buf).map(|p| p.to_vec()) else {
+                            continue;
+                        };
                         pending.push(buf);
                     }
                     guard.clear_ready();
@@ -336,7 +536,9 @@ pub async fn serve(
         // ---- pump app->stack channel data into TCP sockets
         let keys: Vec<FlowKey> = tcp_flows.keys().cloned().collect();
         for k in keys {
-            let Some(flow) = tcp_flows.get_mut(&k) else { continue };
+            let Some(flow) = tcp_flows.get_mut(&k) else {
+                continue;
+            };
             let mut woke = false;
             while let Ok(data) = flow.to_stack.try_recv() {
                 let sock = sockets.get_mut::<TcpSocket>(flow.handle);
@@ -385,7 +587,9 @@ pub async fn serve(
         // ---- TCP sockets -> app channels; close detection
         let keys: Vec<FlowKey> = tcp_flows.keys().cloned().collect();
         for k in keys {
-            let Some(flow) = tcp_flows.get_mut(&k) else { continue };
+            let Some(flow) = tcp_flows.get_mut(&k) else {
+                continue;
+            };
             {
                 let sock = sockets.get_mut::<TcpSocket>(flow.handle);
                 let mut q = flow.from_stack.lock().unwrap();
@@ -412,7 +616,9 @@ pub async fn serve(
         // ---- UDP: relay channels both ways
         let keys: Vec<FlowKey> = udp_flows.keys().cloned().collect();
         for k in keys {
-            let Some(flow) = udp_flows.get_mut(&k) else { continue };
+            let Some(flow) = udp_flows.get_mut(&k) else {
+                continue;
+            };
             // relay -> stack
             while let Ok((back_src, data)) = flow.from_relay.try_recv() {
                 let sock = sockets.get_mut::<UdpSocket>(flow.handle);
@@ -498,7 +704,10 @@ fn dispatch_ingress(
             let sport = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
             let dport = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
             let flags = pkt[off + 13];
-            let key = (SocketAddr::new(src_ip, sport), SocketAddr::new(dst_ip, dport));
+            let key = (
+                SocketAddr::new(src_ip, sport),
+                SocketAddr::new(dst_ip, dport),
+            );
             if flags & 0x12 == 0x02 && !tcp_flows.contains_key(&key) {
                 // New connection: listening socket on the ORIGINAL dst.
                 let rx = TcpBuffer::new(vec![0u8; 128 * 1024]);
@@ -546,7 +755,9 @@ fn dispatch_ingress(
             let dst = SocketAddr::new(dst_ip, dport);
             let key = (src, dst);
             let ulen = u16::from_be_bytes([pkt[off + 4], pkt[off + 5]]) as usize;
-            let payload = pkt.get(off + 8..off + ulen.min(pkt.len() - off)).unwrap_or(&[]);
+            let payload = pkt
+                .get(off + 8..off + ulen.min(pkt.len() - off))
+                .unwrap_or(&[]);
 
             if dport == 53 {
                 // Local fake-IP DNS: answer immediately via a flow socket.
@@ -572,7 +783,13 @@ fn dispatch_ingress(
                 let (to_relay_tx, to_relay_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                 let (from_relay_tx, from_relay_rx) =
                     tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
-                spawn_udp_relay(key, to_relay_rx, from_relay_tx, router.clone(), pool.clone());
+                spawn_udp_relay(
+                    key,
+                    to_relay_rx,
+                    from_relay_tx,
+                    router.clone(),
+                    pool.clone(),
+                );
                 ensure_udp_flow(
                     sockets,
                     udp_flows,
@@ -612,14 +829,8 @@ fn ensure_udp_flow(
         return;
     }
     let mut sock = UdpSocket::new(
-        PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; 16],
-            vec![0u8; 65535 * 2],
-        ),
-        PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; 16],
-            vec![0u8; 65535 * 2],
-        ),
+        PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0u8; 65535 * 2]),
+        PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0u8; 65535 * 2]),
     );
     if sock.bind(to_smoltcp_ep(bind_dst)).is_err() {
         warn!("tun: udp bind {bind_dst} failed");
@@ -648,19 +859,14 @@ fn spawn_tcp_relay(
         let dst = key.1;
         let (addr, decision) = route_dst(&router, dst);
         match decision.action {
-            Action::Proxy => {
-                match pool
-                    .connect(decision.server.as_deref(), addr, None)
-                    .await
-                {
-                    Ok(remote) => {
-                        debug!("tun: relay {dst} tunneled");
-                        let proxy = Proxy::new(stream, remote, bandwidth);
-                        let _ = std::pin::pin!(proxy).await;
-                    }
-                    Err(e) => debug!("tun: relay {dst} tunnel failed: {e}"),
+            Action::Proxy => match pool.connect(decision.server.as_deref(), addr, None).await {
+                Ok(remote) => {
+                    debug!("tun: relay {dst} tunneled");
+                    let proxy = Proxy::new(stream, remote, bandwidth);
+                    let _ = std::pin::pin!(proxy).await;
                 }
-            }
+                Err(e) => debug!("tun: relay {dst} tunnel failed: {e}"),
+            },
             Action::Direct => match router.direct.connect(addr).await {
                 Ok(remote) => {
                     debug!("tun: relay {dst} direct");
@@ -795,12 +1001,8 @@ fn parse_ip(pkt: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
             if pkt.len() < 48 {
                 return None;
             }
-            let src = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&pkt[8..24]).ok()?,
-            ));
-            let dst = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&pkt[24..40]).ok()?,
-            ));
+            let src = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[8..24]).ok()?));
+            let dst = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[24..40]).ok()?));
             Some((src, dst, pkt[6], 40))
         }
         _ => None,
@@ -822,7 +1024,16 @@ fn answer_dns_locally(fake_map: &Arc<dns::FakeIpMap>, query: &[u8]) -> Option<Ve
     }
 }
 
+/// Device name assigned by the kernel (Linux: as requested; macOS:
+/// `utunN`), recorded so `stop()` can tear down routes by name.
+static TUN_DEV: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Remove routes (the device dies with the fd / process).
 pub fn stop(server_ips: &[Ipv4Addr]) {
-    routes::tun_teardown(TUN_NAME, server_ips);
+    let dev = TUN_DEV
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| TUN_NAME.to_string());
+    routes::tun_teardown(&dev, server_ips);
 }

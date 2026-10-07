@@ -1,6 +1,6 @@
 [package]
 name = "magicalane"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["magicalne"]
 edition = "2024"
 rust-version = "1.85"
@@ -54,3 +54,6 @@ webpki-roots = "0.26"
 [features]
 default = []
 tun-mode = ["dep:smoltcp"]
+
+[profile.release]
+strip = true

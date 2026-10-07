@@ -27,7 +27,9 @@ SERVER_PORT=14433
 SOCKS_PORT=11080
 
 SRV_PID="" ORIGIN_PID="" CLIENT_PID=""
+ORIGIN_VIP="203.0.113.7"   # TEST-NET-3 loopback alias: no on-link subnet route competes with the capture halves
 cleanup() {
+    ifconfig lo0 -alias "$ORIGIN_VIP" 2>/dev/null || true
     [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null || true
     sleep 0.5
     # Belt-and-braces route removal (clean-exit should have done it).
@@ -46,10 +48,12 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -subj "/CN=localhost" >/dev/null 2>&1
 echo ok > "$WORK/origin-file.txt"
 
-# --- 2. origin on the host's primary IP (dst routes via utun once captured)
-ORIGIN_IP=$(ipconfig getifaddr en0)
-[ -n "$ORIGIN_IP" ] || { echo "cannot determine en0 address"; exit 1; }
-echo "origin: http://$ORIGIN_IP:$ORIGIN_PORT (python3)"
+# --- 2. origin on a TEST-NET-3 loopback alias: the ONLY route to it is
+# through the capture halves (0/1+128/1), so a 200 PROVES the traffic
+# went utun -> smoltcp stack -> routing engine -> tunnel -> server.
+ifconfig lo0 alias "$ORIGIN_VIP" 255.255.255.255 up
+ORIGIN_IP="$ORIGIN_VIP"
+echo "origin: http://$ORIGIN_IP:$ORIGIN_PORT (python3, via lo0 alias)"
 python3 -m http.server "$ORIGIN_PORT" --bind "$ORIGIN_IP" --directory "$WORK" \
     >"$WORK/origin.log" 2>&1 &
 ORIGIN_PID=$!
@@ -90,6 +94,7 @@ done
     exit 1;
 }
 echo "capture routes up: $(route -n get 8.8.8.8 | grep interface)"
+echo "origin routes via: $(route -n get "$ORIGIN_IP" | grep interface)"
 ifconfig | grep -A4 "^utun" | grep -E "^utun|inet |mtu" || true
 
 dump_client() {

@@ -104,9 +104,7 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
     // Darwin has NO SOCK_NONBLOCK socket() flag (XNU socket.h does not
     // define one — passing 0x4000 yields EPROTOTYPE). Non-blocking is
     // set via fcntl AFTER connect (see below), matching wireguard-go.
-    eprintln!("TRACE utun: socket() enter");
     let fd = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
-    eprintln!("TRACE utun: socket() = {fd}");
     if fd < 0 {
         let e = io::Error::last_os_error();
         log::warn!("utun: socket(PF_SYSTEM) failed: {e}");
@@ -126,7 +124,6 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
     };
     let name_bytes = b"com.apple.net.utun_control";
     info.ctl_name[..name_bytes.len()].copy_from_slice(name_bytes);
-    eprintln!("TRACE utun: CTLIOCGINFO enter (id={} name_ok={})", info.ctl_id, !info.ctl_name.is_empty());
     let rc = unsafe {
         libc::ioctl(
             fd,
@@ -134,7 +131,6 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
             &mut info as *mut CtlInfo as *mut libc::c_void,
         )
     };
-    eprintln!("TRACE utun: CTLIOCGINFO rc={rc} id={}", info.ctl_id);
     if rc != 0 {
         let e = io::Error::last_os_error();
         log::warn!("utun: CTLIOCGINFO failed: {e}");
@@ -159,7 +155,6 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
         sc_unit: 0,
         spare: [0; 5],
     };
-    eprintln!("TRACE utun: connect enter (sc_len={} family={} sysaddr={} id={})", sc.sc_len, sc.sc_family, sc.ss_sysaddr, sc.sc_id);
     let rc = unsafe {
         libc::connect(
             fd,
@@ -167,41 +162,41 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
             std::mem::size_of::<SockaddrCtl>() as libc::socklen_t,
         )
     };
-    eprintln!("TRACE utun: connect rc={rc} errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
     if rc != 0 {
         let e = io::Error::last_os_error();
         log::warn!("utun: connect failed: {e}");
         unsafe { libc::close(fd) };
         return Err(e);
     }
-    // The assigned unit number arrives via getsockname: utunN (N = unit - 1).
-    let mut sc = SockaddrCtl {
-        sc_len: 0,
-        sc_family: 0,
-        ss_sysaddr: 0,
-        sc_id: 0,
-        sc_unit: 0,
-        spare: [0; 5],
-    };
-    eprintln!("TRACE utun: getsockname enter");
-    let mut len = std::mem::size_of::<SockaddrCtl>() as libc::socklen_t;
+    // Interface name via getsockopt(UTUN_OPT_IFNAME): getsockname on
+    // kernel-control sockets is EOPNOTSUPP on modern macOS (verified on
+    // an M-series runner). Same discovery wireguard-go uses.
+    const SYSPROTO_CONTROL: libc::c_int = 2; //sockopt level
+    const UTUN_OPT_IFNAME: libc::c_int = 2; // option: interface name
+    let mut namebuf = [0u8; libc::IFNAMSIZ];
+    let mut optlen = namebuf.len() as libc::socklen_t;
     let rc = unsafe {
-        libc::getsockname(
+        libc::getsockopt(
             fd,
-            &mut sc as *mut SockaddrCtl as *mut libc::sockaddr,
-            &mut len,
+            SYSPROTO_CONTROL,
+            UTUN_OPT_IFNAME,
+            namebuf.as_mut_ptr() as *mut libc::c_void,
+            &mut optlen,
         )
     };
-    if rc != 0 || sc.sc_unit == 0 {
-        let e = if rc != 0 {
-            io::Error::last_os_error()
-        } else {
-            io::Error::other("utun: no unit assigned")
-        };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        log::warn!("utun: UTUN_OPT_IFNAME failed: {e}");
         unsafe { libc::close(fd) };
         return Err(e);
     }
-    eprintln!("TRACE utun: unit={} fcntl enter", sc.sc_unit);
+    let nul = namebuf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(namebuf.len());
+    let dev = std::str::from_utf8(&namebuf[..nul])
+        .map_err(|_| io::Error::other("utun: non-utf8 interface name"))?
+        .to_string();
     // Non-blocking only now (post-connect): F_GETFL/F_SETFL are
     // rejected on kernel-control sockets that have not connected yet
     // (EOPNOTSUPP). Same order as wireguard-go's utun setup.
@@ -214,8 +209,7 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
             return Err(e);
         }
     }
-    log::info!("utun: device utun{} up (nonblocking)", sc.sc_unit - 1);
-    let dev = format!("utun{}", sc.sc_unit - 1);
+    log::info!("utun: device {dev} up (nonblocking)");
     Ok((
         std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) }),
         dev,

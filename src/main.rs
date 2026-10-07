@@ -438,7 +438,6 @@ async fn run_client(
         )
         .await?;
         tokio::spawn(async move { socks.run().await });
-        eprintln!("TRACE main: entering tun branch serve path");
         // Clean-exit contract: SIGTERM/SIGINT must remove the capture
         // routes (a SIGKILLed process leaves them behind — on macOS
         // that would take the machine's default routing with it).

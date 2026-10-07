@@ -428,4 +428,3 @@ pub struct ServerDns {
     /// Cache entry cap (default 4096; 0 disables caching).
     pub cache_size: Option<usize>,
 }
-

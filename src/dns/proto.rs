@@ -89,7 +89,13 @@ pub fn parse_query(buf: &[u8]) -> Option<DnsQuery<'_>> {
         return None; // root query: not ours to fake
     }
 
-    Some(DnsQuery { id, rd, question, domain, qtype })
+    Some(DnsQuery {
+        id,
+        rd,
+        question,
+        domain,
+        qtype,
+    })
 }
 
 /// Build the response header: QR=1, copied RD, RA=1, rcode.
@@ -250,7 +256,10 @@ mod tests {
         // question copied verbatim (case preserved)
         assert_eq!(&resp[12..12 + q.question.len()], q.question);
         // answer name pointer
-        assert_eq!(&resp[12 + q.question.len()..14 + q.question.len()], &[0xC0, 0x0C]);
+        assert_eq!(
+            &resp[12 + q.question.len()..14 + q.question.len()],
+            &[0xC0, 0x0C]
+        );
         let tail = &resp[resp.len() - 4..];
         assert_eq!(tail, &[198, 18, 0, 7], "rdata = fake ip");
     }
@@ -272,6 +281,10 @@ mod tests {
         let nodata = build_empty_response(&q);
         assert_eq!(u16::from_be_bytes([nodata[6], nodata[7]]), 0, "no answers");
         let nx = build_nxdomain(&q);
-        assert_eq!(u16::from_be_bytes([nx[2], nx[3]]) & 0x000F, 3, "rcode NXDOMAIN");
+        assert_eq!(
+            u16::from_be_bytes([nx[2], nx[3]]) & 0x000F,
+            3,
+            "rcode NXDOMAIN"
+        );
     }
 }

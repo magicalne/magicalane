@@ -117,7 +117,7 @@ impl<C> Server<C> {
         };
         let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-                info!("KCP server bind: {:?}", &addr);
+        info!("KCP server bind: {:?}", &addr);
         socket.bind(&addr.into())?;
         socket.set_nonblocking(true)?;
         let socket = Arc::new(UdpSocket::from_std(socket.into())?);

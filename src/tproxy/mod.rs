@@ -53,7 +53,6 @@ impl TproxyRouter {
     }
 }
 
-
 /// Bind the transparent TCP listener using raw libc syscalls (identical
 /// to the proven isolation test; avoids socket2 abstraction differences).
 /// The socket must exist before the firewall rules are installed.
@@ -65,18 +64,27 @@ pub fn bind(port: u16) -> io::Result<TcpListener> {
             return Err(io::Error::last_os_error());
         }
         let on: libc::c_int = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-            &on as *const _ as *const libc::c_void, 4);
-        if libc::setsockopt(fd, libc::IPPROTO_IP, IP_TRANSPARENT,
-            &on as *const _ as *const libc::c_void, 4) != 0 {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &on as *const _ as *const libc::c_void,
+            4,
+        );
+        if libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            IP_TRANSPARENT,
+            &on as *const _ as *const libc::c_void,
+            4,
+        ) != 0
+        {
             warn!("IP_TRANSPARENT failed: {}", io::Error::last_os_error());
         }
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as u16,
-            sin_port: port.to_be(),
-            sin_addr: libc::in_addr { s_addr: 0 }, // 0.0.0.0
-            sin_zero: [0; 8],
-        };
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as _;
+        addr.sin_port = port.to_be();
+        addr.sin_addr = libc::in_addr { s_addr: 0 }; // 0.0.0.0
         if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, 16) != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -241,16 +249,31 @@ pub fn bind6(port: u16) -> io::Result<TcpListener> {
             return Err(io::Error::last_os_error());
         }
         let on: libc::c_int = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR,
-            &on as *const _ as *const libc::c_void, 4);
-        libc::setsockopt(fd, libc::SOL_IPV6, IPV6_TRANSPARENT,
-            &on as *const _ as *const libc::c_void, 4);
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &on as *const _ as *const libc::c_void,
+            4,
+        );
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            IPV6_TRANSPARENT,
+            &on as *const _ as *const libc::c_void,
+            4,
+        );
         // v6only=0 would also accept v4-mapped conns (already handled by
         // the v4 listener) — keep it v6-only for clean separation.
-        libc::setsockopt(fd, libc::SOL_IPV6, libc::IPV6_V6ONLY,
-            &on as *const _ as *const libc::c_void, 4);
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &on as *const _ as *const libc::c_void,
+            4,
+        );
         let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
-        addr.sin6_family = libc::AF_INET6 as u16;
+        addr.sin6_family = libc::AF_INET6 as _;
         addr.sin6_port = port.to_be();
         if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, 28) != 0 {
             return Err(io::Error::last_os_error());
@@ -314,7 +337,7 @@ pub fn original_dst6(stream: &tokio::net::TcpStream, listen_port: u16) -> io::Re
     let rc = unsafe {
         libc::getsockopt(
             fd,
-            libc::SOL_IPV6,
+            libc::IPPROTO_IPV6,
             IP6T_SO_ORIGINAL_DST,
             &mut addr as *mut _ as *mut libc::c_void,
             &mut len,
@@ -332,18 +355,18 @@ pub fn original_dst6(stream: &tokio::net::TcpStream, listen_port: u16) -> io::Re
 
 /// Get the original destination of a REDIRECT'd connection via
 /// SO_ORIGINAL_DST (the conntrack entry created by nat REDIRECT).
-pub fn original_dst(
-    stream: &tokio::net::TcpStream,
-) -> io::Result<SocketAddr> {
+pub fn original_dst(stream: &tokio::net::TcpStream) -> io::Result<SocketAddr> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SO_ORIGINAL_DST is Linux-only in libc; the wire value is stable.
+    const SO_ORIGINAL_DST: libc::c_int = 80;
     let rc = unsafe {
         libc::getsockopt(
             fd,
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
+            libc::IPPROTO_IP,
+            SO_ORIGINAL_DST,
             &mut addr as *mut _ as *mut libc::c_void,
             &mut len,
         )

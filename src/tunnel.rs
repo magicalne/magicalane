@@ -139,7 +139,11 @@ pub struct Health {
 
 impl Default for Health {
     fn default() -> Self {
-        Self { alive: true, latency: None, consecutive_failures: 0 }
+        Self {
+            alive: true,
+            latency: None,
+            consecutive_failures: 0,
+        }
     }
 }
 
@@ -270,7 +274,10 @@ impl std::fmt::Display for PoolError {
         match self {
             PoolError::DuplicateName(n) => write!(f, "duplicate server/group name {n:?}"),
             PoolError::UnknownTarget(n) => {
-                write!(f, "unknown server/group {n:?} (referenced by a rule or group)")
+                write!(
+                    f,
+                    "unknown server/group {n:?} (referenced by a rule or group)"
+                )
             }
             PoolError::EmptyGroup(n) => write!(f, "group {n:?} has no members"),
             PoolError::GroupCycle(n) => write!(f, "group {n:?} is part of a reference cycle"),
@@ -295,7 +302,11 @@ impl ProxyPool {
             }),
         );
         Self {
-            inner: Arc::new(Inner { servers, groups: HashMap::new(), default: name }),
+            inner: Arc::new(Inner {
+                servers,
+                groups: HashMap::new(),
+                default: name,
+            }),
         }
     }
 
@@ -322,10 +333,7 @@ impl ProxyPool {
             if servers.contains_key(&name) {
                 return Err(PoolError::DuplicateName(name.to_string()));
             }
-            servers.insert(
-                name.clone(),
-                Self::entry(&name, connector),
-            );
+            servers.insert(name.clone(), Self::entry(&name, connector));
         }
         let primary: Arc<str> = Arc::from("default");
         if !servers.contains_key(&primary) {
@@ -394,9 +402,11 @@ impl ProxyPool {
 
         let default: Arc<str> = match default {
             None | Some("proxy") => primary,
-            Some("direct") => return Err(PoolError::UnknownTarget(
-                "routing default \"direct\" makes no sense for the tunnel pool".into(),
-            )),
+            Some("direct") => {
+                return Err(PoolError::UnknownTarget(
+                    "routing default \"direct\" makes no sense for the tunnel pool".into(),
+                ));
+            }
             Some(name) => {
                 let key: Arc<str> = Arc::from(name);
                 if !servers.contains_key(&key) && !group_map.contains_key(&key) {
@@ -407,7 +417,11 @@ impl ProxyPool {
         };
 
         Ok(Self {
-            inner: Arc::new(Inner { servers, groups: group_map, default }),
+            inner: Arc::new(Inner {
+                servers,
+                groups: group_map,
+                default,
+            }),
         })
     }
 
@@ -436,7 +450,9 @@ impl ProxyPool {
 
     fn resolve_name(&self, name: &str, depth: usize) -> io::Result<Arc<ServerEntry>> {
         if depth > 16 {
-            return Err(io::Error::other(format!("group nesting too deep at {name:?}")));
+            return Err(io::Error::other(format!(
+                "group nesting too deep at {name:?}"
+            )));
         }
         if let Some(s) = self.inner.servers.get(name) {
             return Ok(s.clone());
@@ -489,11 +505,7 @@ impl ProxyPool {
         }
     }
 
-    fn alive_members(
-        &self,
-        g: &Group,
-        depth: usize,
-    ) -> Vec<Arc<ServerEntry>> {
+    fn alive_members(&self, g: &Group, depth: usize) -> Vec<Arc<ServerEntry>> {
         g.members
             .iter()
             .filter_map(|m| self.resolve_name(m, depth + 1).ok())
@@ -615,7 +627,9 @@ fn group_servers(pool: &ProxyPool, gname: &str, out: &mut Vec<Arc<str>>, depth: 
     if depth > 16 {
         return;
     }
-    let Some(g) = pool.groups().get(gname) else { return };
+    let Some(g) = pool.groups().get(gname) else {
+        return;
+    };
     for m in &g.members {
         if let Some(s) = pool.servers().get(m.as_str()) {
             if !out.iter().any(|n| **n == *s.name) {
@@ -630,7 +644,9 @@ fn group_servers(pool: &ProxyPool, gname: &str, out: &mut Vec<Arc<str>>, depth: 
 /// One probe round for a group: measure every member, update health,
 /// re-elect url-test choices.
 async fn probe_cycle(pool: &ProxyPool, gname: &str, url: &str) {
-    let Some(group) = pool.groups().get(gname) else { return };
+    let Some(group) = pool.groups().get(gname) else {
+        return;
+    };
     let mut members = Vec::new();
     group_servers(pool, gname, &mut members, 0);
     let u = match crate::httpfetch::parse_url(url) {
@@ -644,11 +660,17 @@ async fn probe_cycle(pool: &ProxyPool, gname: &str, url: &str) {
 
     let mut results: Vec<(Arc<str>, Option<std::time::Duration>)> = Vec::new();
     for name in members {
-        let Some(entry) = pool.server(&name) else { continue };
+        let Some(entry) = pool.server(&name) else {
+            continue;
+        };
         let started = std::time::Instant::now();
         let ok = probe_one(&entry.connector, addr.clone(), &u).await;
         let elapsed = started.elapsed();
-        let r = if ok { ProbeResult::Ok(elapsed) } else { ProbeResult::Failed };
+        let r = if ok {
+            ProbeResult::Ok(elapsed)
+        } else {
+            ProbeResult::Failed
+        };
         let mut h = entry.state.write().unwrap();
         let was = h.clone();
         let changed = record_probe(&mut h, r);
@@ -680,9 +702,7 @@ async fn probe_cycle(pool: &ProxyPool, gname: &str, url: &str) {
                 .and_then(|(_, l)| *l);
             let switch = match incumbent_lat {
                 None => true,
-                Some(inc) => {
-                    inc.saturating_sub(best_lat).as_millis() as u64 > tolerance_ms
-                }
+                Some(inc) => inc.saturating_sub(best_lat).as_millis() as u64 > tolerance_ms,
             };
             if switch {
                 if group.chosen().as_deref() != Some(&**best_name) {
@@ -770,13 +790,8 @@ mod tests {
     fn build_validates_names_and_cycles() {
         let entries = vec![(Arc::from("default"), dummy())];
         // unknown rule target
-        let err = ProxyPool::build(
-            entries.clone(),
-            vec![],
-            None,
-            &["nope".to_string()],
-        )
-        .unwrap_err();
+        let err =
+            ProxyPool::build(entries.clone(), vec![], None, &["nope".to_string()]).unwrap_err();
         assert!(matches!(err, PoolError::UnknownTarget(_)), "{err}");
         // cycle: g1 -> g2 -> g1
         let err = ProxyPool::build(
@@ -792,7 +807,10 @@ mod tests {
         assert!(matches!(err, PoolError::GroupCycle(_)), "{err}");
         // duplicate name
         let err = ProxyPool::build(
-            vec![(Arc::from("default"), dummy()), (Arc::from("default"), dummy())],
+            vec![
+                (Arc::from("default"), dummy()),
+                (Arc::from("default"), dummy()),
+            ],
             vec![],
             None,
             &[],
@@ -884,7 +902,9 @@ mod tests {
         let first = p.resolve_sticky(Some("lb"), "example.com:443").unwrap();
         for _ in 0..5 {
             assert_eq!(
-                p.resolve_sticky(Some("lb"), "example.com:443").unwrap().name,
+                p.resolve_sticky(Some("lb"), "example.com:443")
+                    .unwrap()
+                    .name,
                 first.name
             );
         }
@@ -893,7 +913,9 @@ mod tests {
         let other = p.resolve_sticky(Some("lb"), "other.example:443").unwrap();
         for _ in 0..5 {
             assert_eq!(
-                p.resolve_sticky(Some("lb"), "other.example:443").unwrap().name,
+                p.resolve_sticky(Some("lb"), "other.example:443")
+                    .unwrap()
+                    .name,
                 other.name
             );
         }
@@ -911,8 +933,14 @@ mod tests {
         for _ in 0..(DEAD_THRESHOLD - 1) {
             assert!(!record_probe(&mut h, ProbeResult::Failed));
         }
-        assert!(record_probe(&mut h, ProbeResult::Failed), "dies at threshold");
-        assert!(record_probe(&mut h, ProbeResult::Ok(std::time::Duration::from_millis(5))));
+        assert!(
+            record_probe(&mut h, ProbeResult::Failed),
+            "dies at threshold"
+        );
+        assert!(record_probe(
+            &mut h,
+            ProbeResult::Ok(std::time::Duration::from_millis(5))
+        ));
         assert!(h.alive);
         assert_eq!(h.latency, Some(std::time::Duration::from_millis(5)));
     }

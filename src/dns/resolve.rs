@@ -68,7 +68,9 @@ pub fn collect_answers(resp: &[u8]) -> (Vec<AnswerRecord>, Option<u32>) {
     {
         let mut r = rest;
         loop {
-            let Some(&len) = r.first() else { return (out, min_ttl) };
+            let Some(&len) = r.first() else {
+                return (out, min_ttl);
+            };
             if len & 0xC0 == 0xC0 {
                 r = &r[2..];
                 break;
@@ -90,7 +92,9 @@ pub fn collect_answers(resp: &[u8]) -> (Vec<AnswerRecord>, Option<u32>) {
     for _ in 0..ancount {
         let mut r = rest;
         loop {
-            let Some(&len) = r.first() else { return (out, min_ttl) };
+            let Some(&len) = r.first() else {
+                return (out, min_ttl);
+            };
             if len & 0xC0 == 0xC0 {
                 r = &r[2..];
                 break;
@@ -112,11 +116,12 @@ pub fn collect_answers(resp: &[u8]) -> (Vec<AnswerRecord>, Option<u32>) {
         let rdlen = u16::from_be_bytes([r[8], r[9]]) as usize;
         let rdata = &r[10..10 + rdlen.min(r.len().saturating_sub(10))];
         let addr = match rtype {
-            1 if rdata.len() == 4 => {
-                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(
+            1 if rdata.len() == 4 => SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::new(
                     rdata[0], rdata[1], rdata[2], rdata[3],
-                )), 0)
-            }
+                )),
+                0,
+            ),
             28 if rdata.len() == 16 => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(rdata);
@@ -180,7 +185,10 @@ pub fn search_domains() -> Vec<String> {
     if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
         for line in text.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("search").or_else(|| line.strip_prefix("domain")) {
+            if let Some(rest) = line
+                .strip_prefix("search")
+                .or_else(|| line.strip_prefix("domain"))
+            {
                 for d in rest.split_whitespace() {
                     if !d.is_empty() {
                         out.push(d.trim_end_matches('.').to_string());
@@ -213,7 +221,9 @@ pub fn nameservers() -> Vec<SocketAddr> {
 /// /etc/hosts lookup: all addresses bound to `name` (case-insensitive).
 pub fn hosts_lookup(name: &str) -> Vec<IpAddr> {
     let mut out = Vec::new();
-    let Ok(text) = std::fs::read_to_string("/etc/hosts") else { return out };
+    let Ok(text) = std::fs::read_to_string("/etc/hosts") else {
+        return out;
+    };
     let name = name.to_ascii_lowercase();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -221,8 +231,12 @@ pub fn hosts_lookup(name: &str) -> Vec<IpAddr> {
             continue;
         }
         let mut fields = line.split_whitespace();
-        let (Some(ip), mut names) = (fields.next(), fields) else { continue };
-        let Ok(ip) = ip.parse::<IpAddr>() else { continue };
+        let (Some(ip), mut names) = (fields.next(), fields) else {
+            continue;
+        };
+        let Ok(ip) = ip.parse::<IpAddr>() else {
+            continue;
+        };
         if names.any(|n| n.eq_ignore_ascii_case(&name)) {
             out.push(ip);
         }
@@ -327,7 +341,11 @@ impl Resolver {
                         ips.len(),
                         clamped
                     );
-                    self.cache_put(host.clone(), ips.clone(), clamped.map(|s| Instant::now() + Duration::from_secs(s as u64)));
+                    self.cache_put(
+                        host.clone(),
+                        ips.clone(),
+                        clamped.map(|s| Instant::now() + Duration::from_secs(s as u64)),
+                    );
                     return Ok(order_addrs(
                         ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect(),
                         host_has_global_v6(),
@@ -364,19 +382,33 @@ impl Resolver {
             let (up, host) = (*up, host.to_string());
             tasks.push(tokio::spawn(async move { probe_upstream(up, &host).await }));
         }
-        let (result, _idx, rest) = futures::future::select_all(tasks).await;
-        // Abort the losers (best effort).
-        for t in rest {
-            t.abort();
-        }
-        match result {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => {
-                warn!("dns race: first upstream failed: {e}");
-                Err(e)
+        // First SUCCESS wins. A failed upstream must not kill the race:
+        // on hosts where a connected UDP send to a dead port errors
+        // immediately (macOS ECONNREFUSED), that failure completes
+        // before the live upstream answers — failover has to keep
+        // waiting on the rest (regression: failover_to_second_upstream).
+        let mut last_err: Option<io::Error> = None;
+        while !tasks.is_empty() {
+            let (result, _idx, rest) = futures::future::select_all(tasks).await;
+            tasks = rest;
+            match result {
+                Ok(Ok(v)) => {
+                    for t in tasks {
+                        t.abort();
+                    }
+                    return Ok(v);
+                }
+                Ok(Err(e)) => {
+                    warn!("dns race: upstream failed (continuing): {e}");
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    last_err = Some(io::Error::other(e.to_string()));
+                }
             }
-            Err(e) => Err(io::Error::other(e.to_string())),
         }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "all upstreams failed")))
     }
 
     fn cache_get(&self, host: &str) -> Option<Vec<IpAddr>> {
@@ -399,7 +431,8 @@ impl Resolver {
         if c.map.len() >= self.cap {
             // Evict expired first, then the least recently touched.
             let now = Instant::now();
-            c.map.retain(|_, e| e.expiry.map(|x| x > now).unwrap_or(true));
+            c.map
+                .retain(|_, e| e.expiry.map(|x| x > now).unwrap_or(true));
             while c.map.len() >= self.cap {
                 let victim = c
                     .map
@@ -414,6 +447,13 @@ impl Resolver {
                 }
             }
         }
-        c.map.insert(host, CacheEntry { addrs, expiry, touched: Instant::now() });
+        c.map.insert(
+            host,
+            CacheEntry {
+                addrs,
+                expiry,
+                touched: Instant::now(),
+            },
+        );
     }
 }

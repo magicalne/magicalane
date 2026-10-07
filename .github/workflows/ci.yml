@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: ${{ matrix.os }} (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          # macos-latest = Apple Silicon (M1)
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        run: cargo clippy --all-targets --features tun-mode -- -D warnings
+      - name: Tests
+        run: cargo test --verbose
+      - name: Build with tun-mode
+        run: cargo build --release --features tun-mode --target ${{ matrix.target }}
+      - name: macOS TUN end-to-end (utun + smoltcp stack + clean-exit)
+        if: matrix.os == 'macos-latest'
+        run: sudo -E ./scripts/macos-tun-test.sh target/aarch64-apple-darwin/release/magicalane

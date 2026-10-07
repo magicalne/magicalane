@@ -9,22 +9,22 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 pub mod config;
 pub mod connector;
-pub mod error;
-pub mod kcp;
-pub(crate) mod proxy;
+pub mod dispatch;
 pub mod dns;
+pub mod error;
 pub mod httpfetch;
 pub mod httpin;
-#[cfg(feature = "tun-mode")]
-pub mod tun;
+pub mod kcp;
+pub(crate) mod proxy;
+pub mod quic;
+pub mod routing;
+pub mod socks5;
 pub mod tcp;
 pub mod tproxy;
-pub mod routing;
+#[cfg(feature = "tun-mode")]
+pub mod tun;
 pub mod tunnel;
 pub mod udp;
-pub mod dispatch;
-pub mod quic;
-pub mod socks5;
 
 /// ALPN protocol identifier used by the QUIC transport.
 pub const ALPN_QUIC: &[&[u8]] = &[b"magicalane-1"];
@@ -34,15 +34,18 @@ pub const ALPN_QUIC: &[&[u8]] = &[b"magicalane-1"];
 pub fn transport_config(tuning: Option<&config::QuicTuning>) -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     if let Some(t) = tuning {
-        let factory: std::sync::Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> = match t.congestion_name() {
-            "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
-            "new-reno" | "newreno" | "reno" => Arc::new(quinn::congestion::NewRenoConfig::default()),
-            "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
-            other => {
-                log::warn!("unknown congestion controller {other:?}, falling back to cubic");
-                Arc::new(quinn::congestion::CubicConfig::default())
-            }
-        };
+        let factory: std::sync::Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+            match t.congestion_name() {
+                "bbr" => Arc::new(quinn::congestion::BbrConfig::default()),
+                "new-reno" | "newreno" | "reno" => {
+                    Arc::new(quinn::congestion::NewRenoConfig::default())
+                }
+                "cubic" => Arc::new(quinn::congestion::CubicConfig::default()),
+                other => {
+                    log::warn!("unknown congestion controller {other:?}, falling back to cubic");
+                    Arc::new(quinn::congestion::CubicConfig::default())
+                }
+            };
         tc.congestion_controller_factory(factory);
         if let Some(w) = t.send_window {
             tc.send_window(w);

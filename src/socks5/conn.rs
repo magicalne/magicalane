@@ -97,7 +97,10 @@ where
         // Pick the strongest method we support: with users configured
         // require username/password (RFC 1929); otherwise no-auth.
         let m = if self.users.is_empty() {
-            if methods.iter().any(|m| matches!(m, super::proto::Method::NoAuth)) {
+            if methods
+                .iter()
+                .any(|m| matches!(m, super::proto::Method::NoAuth))
+            {
                 &super::proto::Method::NoAuth
             } else {
                 &super::proto::Method::NoAcceptableMethod
@@ -145,10 +148,7 @@ where
         let (user, pass) = Decoder::parse_username_password(self.buf.chunk())?;
         let user = String::from_utf8_lossy(user);
         let pass = String::from_utf8_lossy(pass);
-        let ok = self
-            .users
-            .iter()
-            .any(|(u, p)| u == &user && p == &pass);
+        let ok = self.users.iter().any(|(u, p)| u == &user && p == &pass);
         self.buf.clear();
         Encoder::encode_auth_status(ok, &mut self.buf);
         let n = ready!(poll_write_buf(

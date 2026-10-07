@@ -96,7 +96,9 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cmd = Cmd::from_args();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         match cmd {
             Cmd::Echo { listen } => echo_server(&listen).await,
@@ -114,7 +116,13 @@ fn main() -> anyhow::Result<()> {
                 dl_par,
                 under_load,
                 load_chunk,
-            } => run_bench(&socks, &target, pairs, pings, connects, conc_conns, conc_pings, dl_bytes, ul_bytes, dl_par, under_load, load_chunk).await,
+            } => {
+                run_bench(
+                    &socks, &target, pairs, pings, connects, conc_conns, conc_pings, dl_bytes,
+                    ul_bytes, dl_par, under_load, load_chunk,
+                )
+                .await
+            }
         }
     })
 }
@@ -187,7 +195,9 @@ async fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 }
 
 async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
-    stream.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     stream.write_all(payload).await?;
     stream.flush().await
 }
@@ -211,7 +221,9 @@ async fn serve(http: u16, tcp: u16, udp: u16) -> anyhow::Result<()> {
         eprintln!("magabench serve: http on {}", listener.local_addr()?);
         tokio::spawn(async move {
             loop {
-                let Ok((s, _)) = listener.accept().await else { continue };
+                let Ok((s, _)) = listener.accept().await else {
+                    continue;
+                };
                 s.set_nodelay(true).ok();
                 tokio::spawn(async move {
                     if let Err(err) = handle_http(s).await {
@@ -223,10 +235,15 @@ async fn serve(http: u16, tcp: u16, udp: u16) -> anyhow::Result<()> {
     }
     if tcp != 0 {
         let listener = TcpListener::bind(("0.0.0.0", tcp)).await?;
-        eprintln!("magabench serve: framed tcp echo on {}", listener.local_addr()?);
+        eprintln!(
+            "magabench serve: framed tcp echo on {}",
+            listener.local_addr()?
+        );
         tokio::spawn(async move {
             loop {
-                let Ok((s, _)) = listener.accept().await else { continue };
+                let Ok((s, _)) = listener.accept().await else {
+                    continue;
+                };
                 s.set_nodelay(true).ok();
                 tokio::spawn(async move {
                     if let Err(err) = handle_echo(s).await {
@@ -243,7 +260,9 @@ async fn serve(http: u16, tcp: u16, udp: u16) -> anyhow::Result<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
-                let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    continue;
+                };
                 let reply: Vec<u8> = if &buf[..n] == b"MGL-ID?" {
                     format!("{id} udp").into_bytes()
                 } else {
@@ -275,14 +294,20 @@ async fn handle_http(mut s: TcpStream) -> io::Result<()> {
     let header_end = loop {
         let n = s.read(&mut chunk).await?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof in headers"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "eof in headers",
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
             break pos + 4;
         }
         if buf.len() > 16 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "headers too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "headers too large",
+            ));
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
@@ -316,7 +341,11 @@ async fn handle_http(mut s: TcpStream) -> io::Result<()> {
         "/id" => ("200 OK", "text/plain", format!("{id} http\n").into_bytes()),
         "/peer" => ("200 OK", "text/plain", format!("{peer_ip}\n").into_bytes()),
         "/echo" => ("200 OK", "application/octet-stream", body),
-        "/hello" => ("200 OK", "text/plain", b"magicalane-test-service\n".to_vec()),
+        "/hello" => (
+            "200 OK",
+            "text/plain",
+            b"magicalane-test-service\n".to_vec(),
+        ),
         _ => ("404 Not Found", "text/plain", b"not found\n".to_vec()),
     };
     let resp = format!(
@@ -345,8 +374,17 @@ async fn socks_connect(socks: &str, target: &str) -> io::Result<TcpStream> {
         return Err(io::Error::other("socks5 hello refused"));
     }
     let (host, port) = match target.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?),
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "target must be host:port")),
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?,
+        ),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target must be host:port",
+            ));
+        }
     };
     if host.is_empty() || host.len() > 255 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad host"));
@@ -359,7 +397,10 @@ async fn socks_connect(socks: &str, target: &str) -> io::Result<TcpStream> {
     let mut hdr = [0u8; 4];
     s.read_exact(&mut hdr).await?;
     if hdr[1] != 0 {
-        return Err(io::Error::other(format!("socks5 connect failed: {}", hdr[1])));
+        return Err(io::Error::other(format!(
+            "socks5 connect failed: {}",
+            hdr[1]
+        )));
     }
     let skip = match hdr[3] {
         0x01 => 4 + 2,
@@ -376,7 +417,11 @@ async fn socks_connect(socks: &str, target: &str) -> io::Result<TcpStream> {
     Ok(s)
 }
 
-async fn ping_rtt(stream: &mut TcpStream, size: usize, scratch: &mut Vec<u8>) -> io::Result<Duration> {
+async fn ping_rtt(
+    stream: &mut TcpStream,
+    size: usize,
+    scratch: &mut Vec<u8>,
+) -> io::Result<Duration> {
     scratch.resize(size, 0);
     rand::thread_rng().fill(scratch.as_mut_slice());
     scratch[0] = 0x01;
@@ -385,7 +430,10 @@ async fn ping_rtt(stream: &mut TcpStream, size: usize, scratch: &mut Vec<u8>) ->
     let echoed = read_frame(stream).await?;
     let dt = start.elapsed();
     if echoed.len() != size {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "echo size mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "echo size mismatch",
+        ));
     }
     Ok(dt)
 }
@@ -485,7 +533,10 @@ async fn run_bench(
             h.await??;
         }
         let dt = t.elapsed();
-        put(&format!("dl{dl_par}par_mbps"), dl_bytes as f64 / 1e6 / dt.as_secs_f64());
+        put(
+            &format!("dl{dl_par}par_mbps"),
+            dl_bytes as f64 / 1e6 / dt.as_secs_f64(),
+        );
     }
 
     // 4) upload throughput: SINK total + junk in one frame, wait for ACK

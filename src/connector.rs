@@ -1,7 +1,9 @@
 use std::io;
 
 use futures::future::BoxFuture;
-use log::{debug, warn};
+use log::debug;
+#[cfg(target_os = "linux")]
+use log::warn;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
@@ -32,7 +34,9 @@ pub struct LocalConnector {
 
 impl LocalConnector {
     pub fn new(resolver: std::sync::Arc<crate::dns::resolve::Resolver>) -> Self {
-        Self { resolver: Some(resolver) }
+        Self {
+            resolver: Some(resolver),
+        }
     }
 }
 
@@ -108,6 +112,8 @@ impl DirectConnector {
 }
 
 /// SO_MARK via raw setsockopt (avoids socket2's "all" feature).
+/// Linux-only: the mark exists to bypass our own iptables interception.
+#[cfg(target_os = "linux")]
 fn set_socket_mark(socket: &socket2::Socket, mark: libc::c_int) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let rc = unsafe {
@@ -176,6 +182,7 @@ async fn tcp_stream_marked(addr: std::net::SocketAddr) -> io::Result<TcpStream> 
         std::net::SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(target_os = "linux")]
     if let Err(e) = set_socket_mark(&socket, SO_MARK_DIRECT) {
         warn!("direct: SO_MARK failed (routing may loop): {e}");
     }
@@ -210,6 +217,7 @@ pub async fn udp_socket_marked(bind: std::net::SocketAddr) -> io::Result<tokio::
         std::net::SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    #[cfg(target_os = "linux")]
     let _ = set_socket_mark(&socket, SO_MARK_DIRECT);
     socket.set_nonblocking(true)?;
     socket.bind(&bind.into())?;

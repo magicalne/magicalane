@@ -104,13 +104,23 @@ ifconfig | grep -A4 "^utun" | grep -E "^utun|inet |mtu" || true
 
 dump_client() {
     echo "--- client alive?"; pgrep -fl "client.toml" || echo "(client process GONE)"
-    echo "--- client log (tail 80):"; tail -80 "$WORK/client.log"
+    echo "--- client log (socks/tunnel/errors):"
+    grep -vE "tun: (tcp flow|relay|udp)|rustls::|quinn_proto::" "$WORK/client.log" | tail -40
     echo "--- server log (tail 20):"; tail -20 "$WORK/server.log"
     echo "--- origin log (tail 5):"; tail -5 "$WORK/origin.log"
     echo "--- socks listener:"; netstat -an | grep "$SOCKS_PORT" || echo "(nothing on $SOCKS_PORT)"
 }
 
-# --- 6. utun data plane round trip: the tun plane answers DNS on ANY
+# --- 6. through the SOCKS5 listener (explicit proxy) — full
+# client -> tunnel -> server -> origin relay, same routing engine.
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+    -x "socks5h://127.0.0.1:$SOCKS_PORT" "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt") || code="curl-exit-$?"
+[ "$code" = 200 ] || {
+    echo "FAIL: socks5 curl got $code"; dump_client; exit 1;
+}
+echo "socks5:   HTTP $code (explicit proxy through the tunnel to the origin)"
+
+# --- 7. utun data plane round trip: the tun plane answers DNS on ANY
 # captured destination locally (fake-IP engine). A 198.18.x.x answer
 # to a query aimed at an unroutable TEST-NET address proves the packet
 # went utun -> smoltcp stack -> DNS engine -> back out the device.
@@ -122,15 +132,6 @@ case "$ans" in
         echo "FAIL: tun DNS probe got '${ans:-no answer}' — packets are not flowing through the utun data plane"
         dump_client; exit 1;;
 esac
-
-# --- 7. through the SOCKS5 listener (explicit proxy) — full
-# client -> tunnel -> server -> origin relay, same routing engine.
-code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    -x "socks5h://127.0.0.1:$SOCKS_PORT" "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt") || code="curl-exit-$?"
-[ "$code" = 200 ] || {
-    echo "FAIL: socks5 curl got $code"; dump_client; exit 1;
-}
-echo "socks5:   HTTP $code (explicit proxy through the tunnel to the origin)"
 
 # --- 8. clean-exit: SIGTERM must remove the capture routes
 kill -TERM "$CLIENT_PID"

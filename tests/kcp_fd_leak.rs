@@ -11,10 +11,14 @@
 //!
 //! regression: https://github.com/magicalne/magicalane/issues/16
 
+#[cfg(target_os = "linux")]
 use std::{net::SocketAddr, time::Duration};
 
+#[cfg(target_os = "linux")]
 use lib::connector::{Connector, LocalConnector};
+#[cfg(target_os = "linux")]
 use lib::kcp::{connector::KcpConnector, listener::Server as KcpServer};
+#[cfg(target_os = "linux")]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},

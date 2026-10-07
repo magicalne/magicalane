@@ -382,19 +382,33 @@ impl Resolver {
             let (up, host) = (*up, host.to_string());
             tasks.push(tokio::spawn(async move { probe_upstream(up, &host).await }));
         }
-        let (result, _idx, rest) = futures::future::select_all(tasks).await;
-        // Abort the losers (best effort).
-        for t in rest {
-            t.abort();
-        }
-        match result {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => {
-                warn!("dns race: first upstream failed: {e}");
-                Err(e)
+        // First SUCCESS wins. A failed upstream must not kill the race:
+        // on hosts where a connected UDP send to a dead port errors
+        // immediately (macOS ECONNREFUSED), that failure completes
+        // before the live upstream answers — failover has to keep
+        // waiting on the rest (regression: failover_to_second_upstream).
+        let mut last_err: Option<io::Error> = None;
+        while !tasks.is_empty() {
+            let (result, _idx, rest) = futures::future::select_all(tasks).await;
+            tasks = rest;
+            match result {
+                Ok(Ok(v)) => {
+                    for t in tasks {
+                        t.abort();
+                    }
+                    return Ok(v);
+                }
+                Ok(Err(e)) => {
+                    warn!("dns race: upstream failed (continuing): {e}");
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    last_err = Some(io::Error::other(e.to_string()));
+                }
             }
-            Err(e) => Err(io::Error::other(e.to_string())),
         }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "all upstreams failed")))
     }
 
     fn cache_get(&self, host: &str) -> Option<Vec<IpAddr>> {

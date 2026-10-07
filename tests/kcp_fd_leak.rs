@@ -54,9 +54,10 @@ async fn blackhole() -> anyhow::Result<SocketAddr> {
 
 /// How long to wait after a session/connect ended for the lingering
 /// machinery to finish (drive_session lingers up to 2s after handle
-/// drop) and any leaked fd to become observable.
+/// drop) and any leaked fd to become observable. Generous: shared CI
+/// runners starve tokio timers; a real leak never converges.
 #[cfg(target_os = "linux")]
-const SETTLE: Duration = Duration::from_secs(4);
+const SETTLE: Duration = Duration::from_secs(15);
 
 /// Two connects that time out inside the connector (10s bound each)
 /// must not leave session sockets behind.
@@ -94,9 +95,25 @@ async fn abandoned_kcp_handshake_leaks_no_socket() -> anyhow::Result<()> {
 
     // Give drive_session its 2s linger + slack, then re-count. The
     // blackhole socket itself is the only allowed resident (+1).
-    tokio::time::sleep(SETTLE).await;
-    let after = fd_count();
+    // Poll for the invariant: under CPU contention (shared CI runners)
+    // the tokio timers lag and the unwind can take well past a fixed
+    // SETTLE — a REAL leak never converges, so poll up to the deadline.
+    let mut after = fd_count();
+    let deadline = std::time::Instant::now() + SETTLE;
+    while after > baseline + 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        after = fd_count();
+    }
     eprintln!("fds: baseline={baseline} after={after}");
+    if after > baseline + 1 {
+        for e in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
+            let fd: i32 = e.file_name().to_string_lossy().parse().unwrap();
+            if fd as usize >= baseline {
+                let link = std::fs::read_link(e.path()).unwrap_or_default();
+                eprintln!("  leakfd {fd}: {link:?}");
+            }
+        }
+    }
     assert!(
         after <= baseline + 1,
         "timed-out KCP connects leaked {} fd(s): the receiver task parks on recv_from forever holding the session socket (baseline={baseline} after={after})",

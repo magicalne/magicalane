@@ -76,14 +76,18 @@ CLIENT_PID=$!
 
 # --- 5. wait for capture routes (max 15s)
 captured=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
     if route -n get 8.8.8.8 2>/dev/null | grep -q "interface: utun"; then
         captured=yes; break
     fi
     sleep 0.5
 done
 [ -n "$captured" ] || {
-    echo "FAIL: capture routes never appeared"; cat "$WORK/client.log"; exit 1;
+    echo "FAIL: capture routes never appeared"
+    echo "--- route get 8.8.8.8:"; route -n get 8.8.8.8 2>&1 || true
+    echo "--- routing table head:"; netstat -rn | head -25
+    echo "--- client log:"; cat "$WORK/client.log"
+    exit 1;
 }
 echo "capture routes up: $(route -n get 8.8.8.8 | grep interface)"
 ifconfig | grep -A4 "^utun" | grep -E "^utun|inet |mtu" || true

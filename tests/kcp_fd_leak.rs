@@ -10,25 +10,29 @@
 //!     relay task never unwound and pinned its origin TCP pair.
 //!
 //! regression: https://github.com/magicalne/magicalane/issues/16
+//!
+//! BOTH scenarios live in ONE test on purpose: fd accounting is
+//! process-global, and two #[tokio::test]s run on parallel threads
+//! with separate runtimes — the sibling test's setup/teardown churns
+//! fds (sockets, mio registrations) exactly while this one measures,
+//! which showed up as flaky "+4 leaked" on slow shared CI runners.
+//! One test = one runtime = deterministic accounting.
 
-#[cfg(target_os = "linux")]
-use std::{net::SocketAddr, time::Duration};
+use std::time::Duration;
 
-#[cfg(target_os = "linux")]
 use lib::connector::{Connector, LocalConnector};
-#[cfg(target_os = "linux")]
 use lib::kcp::{connector::KcpConnector, listener::Server as KcpServer};
-#[cfg(target_os = "linux")]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
 };
 
-/// fd accounting is process-global: libtest runs tests in parallel, so
-/// the two fd tests must serialize or their baselines race. Held across
-/// the whole test body (async mutex: the guard lives across awaits).
-#[cfg(target_os = "linux")]
-static FD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// How long to wait after a session/connect ended for the lingering
+/// machinery to finish (drive_session lingers up to 2s after handle
+/// drop) and any leaked fd to become observable. Generous: shared CI
+/// runners starve tokio timers; a real leak never converges, so we
+/// poll for the invariant up to this deadline instead of blind sleep.
+const SETTLE_MAX: Duration = Duration::from_secs(15);
 
 /// Count open fds of the test process. The read_dir's own directory
 /// handle shows up in the listing, but it is present in every call, so
@@ -40,32 +44,46 @@ fn fd_count() -> usize {
         .unwrap_or(0)
 }
 
-/// A "blackhole" peer: a bound UDP port that never responds (and never
-/// sends), so the client handshake parks until the connector's own
-/// timeout drops it. No ICMP noise, fully deterministic.
+/// Poll until `fd_count() <= baseline + slack` or the deadline passes.
+/// Returns the last count seen.
 #[cfg(target_os = "linux")]
-async fn blackhole() -> anyhow::Result<SocketAddr> {
-    let sock = UdpSocket::bind(("127.0.0.1", 0)).await?;
-    let addr = sock.local_addr()?;
-    // Intentionally never read or send: datagrams queue up, silence out.
-    std::mem::forget(sock);
-    Ok(addr)
+async fn settle_fds(baseline: usize, slack: usize) -> usize {
+    let mut after = fd_count();
+    let deadline = std::time::Instant::now() + SETTLE_MAX;
+    while after > baseline + slack && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        after = fd_count();
+    }
+    after
 }
 
-/// How long to wait after a session/connect ended for the lingering
-/// machinery to finish (drive_session lingers up to 2s after handle
-/// drop) and any leaked fd to become observable. Generous: shared CI
-/// runners starve tokio timers; a real leak never converges.
-#[cfg(target_os = "linux")]
-const SETTLE: Duration = Duration::from_secs(15);
+/// A "blackhole" peer: a bound UDP port that never responds (and never
+/// sends), so the client handshake parks until the connector's own
+/// bound gives up.
+async fn blackhole() -> std::io::Result<std::net::SocketAddr> {
+    let s = UdpSocket::bind(("127.0.0.1", 0)).await?;
+    let a = s.local_addr()?;
+    tokio::spawn(async move {
+        // Hold the port open, discard anything that arrives.
+        let mut buf = vec![0u8; 1500];
+        loop {
+            if s.recv_from(&mut buf).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(a)
+}
 
-/// Two connects that time out inside the connector (10s bound each)
-/// must not leave session sockets behind.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn abandoned_kcp_handshake_leaks_no_socket() -> anyhow::Result<()> {
+async fn kcp_session_fd_lifecycle() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let _guard = FD_TEST_LOCK.lock().await;
+
+    // ============================================================
+    // Phase A — two connects that time out inside the connector (10s
+    // bound each) must not leave session sockets behind.
+    // ============================================================
     let baseline = fd_count();
     let dead = blackhole().await?;
     let connector = KcpConnector::new(
@@ -93,43 +111,22 @@ async fn abandoned_kcp_handshake_leaks_no_socket() -> anyhow::Result<()> {
         );
     }
 
-    // Give drive_session its 2s linger + slack, then re-count. The
-    // blackhole socket itself is the only allowed resident (+1).
-    // Poll for the invariant: under CPU contention (shared CI runners)
-    // the tokio timers lag and the unwind can take well past a fixed
-    // SETTLE — a REAL leak never converges, so poll up to the deadline.
-    let mut after = fd_count();
-    let deadline = std::time::Instant::now() + SETTLE;
-    while after > baseline + 1 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        after = fd_count();
-    }
-    eprintln!("fds: baseline={baseline} after={after}");
-    if after > baseline + 1 {
-        for e in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
-            let fd: i32 = e.file_name().to_string_lossy().parse().unwrap();
-            if fd as usize >= baseline {
-                let link = std::fs::read_link(e.path()).unwrap_or_default();
-                eprintln!("  leakfd {fd}: {link:?}");
-            }
-        }
-    }
+    // Give drive_session its 2s linger + slack; the blackhole socket
+    // itself is the only allowed resident (+1).
+    let after = settle_fds(baseline, 1).await;
+    eprintln!("phase A fds: baseline={baseline} after={after}");
     assert!(
         after <= baseline + 1,
         "timed-out KCP connects leaked {} fd(s): the receiver task parks on recv_from forever holding the session socket (baseline={baseline} after={after})",
         after.saturating_sub(baseline + 1)
     );
-    Ok(())
-}
 
-/// A completed relay must release the client session socket AND let the
-/// server relay unwind (origin TCP pair closed). Resident fds allowed:
-/// the origin TCP listener and the KCP server UDP listener (+2).
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn successful_kcp_session_releases_socket() -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let _guard = FD_TEST_LOCK.lock().await;
+    // ============================================================
+    // Phase B — a completed relay must release the client session
+    // socket AND let the server relay unwind (origin TCP pair closed).
+    // Resident fds allowed: the origin TCP listener and the KCP server
+    // UDP listener (+2).
+    // ============================================================
     let baseline = fd_count();
 
     // --- origin echo server
@@ -212,15 +209,14 @@ async fn successful_kcp_session_releases_socket() -> anyhow::Result<()> {
     assert_eq!(got, payload, "echoed payload must match");
 
     drop(io); // relay done: client stream handle goes away
-    tokio::time::sleep(SETTLE).await;
-
-    let after = fd_count();
-    eprintln!("fds: baseline={baseline} after={after}");
+    let after = settle_fds(baseline, 2).await;
+    eprintln!("phase B fds: baseline={baseline} after={after}");
     assert!(
         after <= baseline + 2,
         "completed KCP session leaked {} fd(s) beyond the two resident listeners (baseline={baseline} after={after}): client session socket not released, or the server relay parked on an unwoken EOF holding the origin TCP pair",
         after.saturating_sub(baseline + 2)
     );
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 

@@ -80,7 +80,7 @@ bandwidth = 65536
 verbose = true
 kind = { Client = { proxy = { host = "127.0.0.1", port = $SERVER_PORT, ca_path = "$WORK/ca.pem" }, socks5_port = $SOCKS_PORT, tproxy = { mode = "tun", tcp_port = 0, udp_port = 0, dns_port = 0, dns_mode = "fakeip" }, routing = { default = "proxy" } } }
 EOF
-RUST_LOG=info "$BIN" --config "$WORK/client.toml" >"$WORK/client.log" 2>&1 &
+RUST_LOG=debug "$BIN" --config "$WORK/client.toml" >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
 
 # --- 5. wait for capture routes (max 15s)
@@ -104,7 +104,9 @@ ifconfig | grep -A4 "^utun" | grep -E "^utun|inet |mtu" || true
 
 dump_client() {
     echo "--- client alive?"; pgrep -fl "client.toml" || echo "(client process GONE)"
-    echo "--- client log (tail 60):"; tail -60 "$WORK/client.log"
+    echo "--- client log (tail 80):"; tail -80 "$WORK/client.log"
+    echo "--- server log (tail 20):"; tail -20 "$WORK/server.log"
+    echo "--- origin log (tail 5):"; tail -5 "$WORK/origin.log"
     echo "--- socks listener:"; netstat -an | grep "$SOCKS_PORT" || echo "(nothing on $SOCKS_PORT)"
 }
 

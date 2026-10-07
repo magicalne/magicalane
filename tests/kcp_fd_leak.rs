@@ -35,6 +35,7 @@ use tokio::{
 /// drop) and any leaked fd to become observable. Generous: shared CI
 /// runners starve tokio timers; a real leak never converges, so we
 /// poll for the invariant up to this deadline instead of blind sleep.
+#[cfg(target_os = "linux")]
 const SETTLE_MAX: Duration = Duration::from_secs(15);
 
 /// Count open fds of the test process. The read_dir's own directory

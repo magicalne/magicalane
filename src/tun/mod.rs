@@ -100,19 +100,20 @@ fn open_tun(name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, St
 /// be stripped on RX and prepended on TX.
 #[cfg(target_os = "macos")]
 fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, String)> {
-    // socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL); set non-blocking
-    // via fcntl — SOCK_NONBLOCK does not exist on Darwin.
-    let fd = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
+    // socket(PF_SYSTEM, SOCK_DGRAM | SOCK_NONBLOCK, SYSPROTO_CONTROL).
+    // Darwin's libc bindings lack SOCK_NONBLOCK, but the kernel accepts
+    // it as a socket() type flag (this is what Go does); fcntl(F_SETFL)
+    // is NOT supported on kernel-control sockets (EOPNOTSUPP).
+    const SOCK_NONBLOCK_DARWIN: libc::c_int = 0x4000;
+    let fd = unsafe {
+        libc::socket(
+            libc::PF_SYSTEM,
+            libc::SOCK_DGRAM | SOCK_NONBLOCK_DARWIN,
+            libc::SYSPROTO_CONTROL,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
-    }
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            let e = io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
-        }
     }
     // CTLIOCGINFO: resolve the kernel control id by name.
     #[repr(C)]

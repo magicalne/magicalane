@@ -190,7 +190,7 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
         let e = if rc != 0 {
             io::Error::last_os_error()
         } else {
-            io::Error::new(io::ErrorKind::Other, "utun: no unit assigned")
+            io::Error::other("utun: no unit assigned")
         };
         unsafe { libc::close(fd) };
         return Err(e);

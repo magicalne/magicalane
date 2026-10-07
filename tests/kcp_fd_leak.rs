@@ -18,6 +18,7 @@
 //! which showed up as flaky "+4 leaked" on slow shared CI runners.
 //! One test = one runtime = deterministic accounting.
 
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]

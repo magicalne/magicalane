@@ -14,7 +14,24 @@ use std::io;
 
 use log::info;
 
+#[cfg(target_os = "linux")]
 use crate::tproxy::rules::run_ok;
+
+/// run_ok, but log failures with the command's stderr — route setup
+/// problems must be visible (they otherwise manifest as "everything
+/// looks up but nothing is captured").
+#[cfg(target_os = "macos")]
+fn run_log(cmd: &str, args: &[&str]) {
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(out) if !out.status.success() => log::warn!(
+            "tun: {cmd} {args:?} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log::warn!("tun: {cmd} {args:?} exec failed: {e}"),
+        _ => {}
+    }
+}
 
 /// Apply device addressing + routes. Idempotent.
 #[cfg(target_os = "linux")]
@@ -110,28 +127,28 @@ pub fn tun_apply(
     let gw = default_gateway();
     // Addressing: v4 point-to-point (destination inside the fake
     // range), v6 /128 alias, big MTU for the userspace stack.
-    run_ok("ifconfig", &[dev, v4, "198.18.255.253", "up"]);
-    run_ok("ifconfig", &[dev, "inet6", &format!("{v6}/128"), "add"]);
-    run_ok("ifconfig", &[dev, "mtu", "65535"]);
+    run_log("ifconfig", &[dev, v4, "198.18.255.253", "up"]);
+    run_log("ifconfig", &[dev, "inet6", &format!("{v6}/128"), "add"]);
+    run_log("ifconfig", &[dev, "mtu", "65535"]);
     // Server exceptions via the original gateway (skip if we could
     // not determine it — loopback servers do not need an exception).
     for ip in server_ips {
         if let Some(gw) = gw.as_deref() {
-            run_ok("route", &["-n", "add", "-host", &ip.to_string(), gw]);
+            run_log("route", &["-n", "add", "-host", &ip.to_string(), gw]);
         }
     }
     // Capture: the two IPv4 halves + IPv6 global unicast. More
     // specific than the existing default route, so it is overridden
     // without being modified.
-    run_ok(
+    run_log(
         "route",
         &["-n", "add", "-inet", "0.0.0.0/1", "-interface", dev],
     );
-    run_ok(
+    run_log(
         "route",
         &["-n", "add", "-inet", "128.0.0.0/1", "-interface", dev],
     );
-    run_ok(
+    run_log(
         "route",
         &["-n", "add", "-inet6", "2000::/3", "-interface", dev],
     );
@@ -146,11 +163,11 @@ pub fn tun_apply(
 /// Remove what we added (macOS). Idempotent; safe when nothing exists.
 #[cfg(target_os = "macos")]
 pub fn tun_teardown(dev: &str, server_ips: &[std::net::Ipv4Addr]) {
-    run_ok("route", &["-n", "delete", "-inet", "0.0.0.0/1"]);
-    run_ok("route", &["-n", "delete", "-inet", "128.0.0.0/1"]);
-    run_ok("route", &["-n", "delete", "-inet6", "2000::/3"]);
+    run_log("route", &["-n", "delete", "-inet", "0.0.0.0/1"]);
+    run_log("route", &["-n", "delete", "-inet", "128.0.0.0/1"]);
+    run_log("route", &["-n", "delete", "-inet6", "2000::/3"]);
     for ip in server_ips {
-        run_ok("route", &["-n", "delete", "-host", &ip.to_string()]);
+        run_log("route", &["-n", "delete", "-host", &ip.to_string()]);
     }
     info!("tun routes removed ({dev})");
 }

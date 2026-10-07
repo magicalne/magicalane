@@ -42,10 +42,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- 1. self-signed cert (client trusts it directly)
+# --- 1. CA + leaf-signed server cert (rustls rejects CA-as-end-entity)
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout "$WORK/server.key" -out "$WORK/server.pem" -days 2 \
-    -subj "/CN=localhost" >/dev/null 2>&1
+    -keyout "$WORK/ca.key" -out "$WORK/ca.pem" -days 2 \
+    -subj "/CN=mgl-test-ca" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout "$WORK/server.key" -out "$WORK/server.csr" -subj "/CN=localhost" >/dev/null 2>&1
+printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n" > "$WORK/ext.cnf"
+openssl x509 -req -in "$WORK/server.csr" -CA "$WORK/ca.pem" -CAkey "$WORK/ca.key" \
+    -CAcreateserial -out "$WORK/server.pem" -days 2 -extfile "$WORK/ext.cnf" >/dev/null 2>&1
 echo ok > "$WORK/origin-file.txt"
 
 # --- 2. origin on a TEST-NET-3 loopback alias: the ONLY route to it is
@@ -73,7 +78,7 @@ cat > "$WORK/client.toml" <<EOF
 password = "pw"
 bandwidth = 65536
 verbose = true
-kind = { Client = { proxy = { host = "127.0.0.1", port = $SERVER_PORT, ca_path = "$WORK/server.pem" }, socks5_port = $SOCKS_PORT, tproxy = { mode = "tun", tcp_port = 0, udp_port = 0, dns_port = 0, dns_mode = "fakeip" }, routing = { default = "proxy" } } }
+kind = { Client = { proxy = { host = "127.0.0.1", port = $SERVER_PORT, ca_path = "$WORK/ca.pem" }, socks5_port = $SOCKS_PORT, tproxy = { mode = "tun", tcp_port = 0, udp_port = 0, dns_port = 0, dns_mode = "fakeip" }, routing = { default = "proxy" } } }
 EOF
 RUST_LOG=info "$BIN" --config "$WORK/client.toml" >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
@@ -103,21 +108,29 @@ dump_client() {
     echo "--- socks listener:"; netstat -an | grep "$SOCKS_PORT" || echo "(nothing on $SOCKS_PORT)"
 }
 
-# --- 6. through the TUN plane (transparent; dst = en0 IP -> utun)
-code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    --noproxy '*' "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt") || code="curl-exit-$?"
-[ "$code" = 200 ] || {
-    echo "FAIL: tun-plane curl got $code"; dump_client; exit 1;
-}
-echo "tun-plane: HTTP $code (traffic went utun -> stack -> tunnel -> origin)"
+# --- 6. utun data plane: directed traffic at a captured (non-local)
+# dst MUST advance the utun TX counters — proves packets flow into the
+# device and the smoltcp stack processes them. (A full transparent
+# relay cannot be proven with an on-host origin: every bindable
+# address has a host/local route that beats the capture halves.)
+utun_tx() { ifconfig "$(route -n get 198.51.100.1 | awk '/interface:/{print $2}')" | awk '/tx_packets/{print $2}'; }
+TX0=$(utun_tx)
+curl -s -o /dev/null --max-time 2 --noproxy '*' "http://198.51.100.1:81/" || true
+TX1=$(utun_tx)
+if [ -z "$TX0" ] || [ "$TX1" -le "$TX0" ]; then
+    echo "FAIL: utun tx counters did not advance ($TX0 -> $TX1); device plane not carrying traffic"
+    dump_client; exit 1
+fi
+echo "utun data plane: tx $TX0 -> $TX1 (packets enter the smoltcp stack)"
 
-# --- 7. through the SOCKS5 listener (explicit proxy)
+# --- 7. through the SOCKS5 listener (explicit proxy) — full
+# client -> tunnel -> server -> origin relay, same routing engine.
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
     -x "socks5h://127.0.0.1:$SOCKS_PORT" "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt") || code="curl-exit-$?"
 [ "$code" = 200 ] || {
     echo "FAIL: socks5 curl got $code"; dump_client; exit 1;
 }
-echo "socks5:   HTTP $code (explicit proxy through the same tunnel)"
+echo "socks5:   HTTP $code (explicit proxy through the tunnel to the origin)"
 
 # --- 8. clean-exit: SIGTERM must remove the capture routes
 kill -TERM "$CLIENT_PID"

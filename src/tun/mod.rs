@@ -137,6 +137,7 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
     };
     if rc != 0 {
         let e = io::Error::last_os_error();
+        log::warn!("utun: CTLIOCGINFO failed: {e}");
         unsafe { libc::close(fd) };
         return Err(e);
     }
@@ -167,6 +168,7 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
     };
     if rc != 0 {
         let e = io::Error::last_os_error();
+        log::warn!("utun: connect failed: {e}");
         unsafe { libc::close(fd) };
         return Err(e);
     }
@@ -203,10 +205,12 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
             let e = io::Error::last_os_error();
+            log::warn!("utun: fcntl nonblock failed: {e}");
             libc::close(fd);
             return Err(e);
         }
     }
+    log::info!("utun: device utun{} up (nonblocking)", sc.sc_unit - 1);
     let dev = format!("utun{}", sc.sc_unit - 1);
     Ok((
         std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) }),

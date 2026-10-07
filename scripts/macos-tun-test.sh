@@ -83,7 +83,7 @@ for _ in $(seq 1 30); do
     sleep 0.5
 done
 [ -n "$captured" ] || {
-    echo "FAIL: capture routes never appeared"; tail -20 "$WORK/client.log"; exit 1;
+    echo "FAIL: capture routes never appeared"; cat "$WORK/client.log"; exit 1;
 }
 echo "capture routes up: $(route -n get 8.8.8.8 | grep interface)"
 ifconfig | grep -A4 "^utun" | grep -E "^utun|inet |mtu" || true

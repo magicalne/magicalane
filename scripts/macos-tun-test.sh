@@ -108,21 +108,18 @@ dump_client() {
     echo "--- socks listener:"; netstat -an | grep "$SOCKS_PORT" || echo "(nothing on $SOCKS_PORT)"
 }
 
-# --- 6. utun data plane: directed traffic at a captured (non-local)
-# dst MUST advance the utun TX counters — proves packets flow into the
-# device and the smoltcp stack processes them. (A full transparent
-# relay cannot be proven with an on-host origin: every bindable
-# address has a host/local route that beats the capture halves.)
-utun_dev() { route -n get 198.51.100.1 | awk '/interface:/{print $2}'; }
-utun_tx() { netstat -I "$(utun_dev)" | awk 'NR==2{print $8}'; }
-TX0=$(utun_tx)
-curl -s -o /dev/null --max-time 2 --noproxy '*' "http://198.51.100.1:81/" || true
-TX1=$(utun_tx)
-if [ -z "$TX0" ] || [ "$TX1" -le "$TX0" ]; then
-    echo "FAIL: utun tx counters did not advance ($TX0 -> $TX1); device plane not carrying traffic"
-    dump_client; exit 1
-fi
-echo "utun data plane: tx $TX0 -> $TX1 (packets enter the smoltcp stack)"
+# --- 6. utun data plane round trip: the tun plane answers DNS on ANY
+# captured destination locally (fake-IP engine). A 198.18.x.x answer
+# to a query aimed at an unroutable TEST-NET address proves the packet
+# went utun -> smoltcp stack -> DNS engine -> back out the device.
+ans=$(dig +short +time=3 +tries=1 @198.51.100.1 e2e-probe.example A 2>/dev/null | head -1)
+case "$ans" in
+    198.18.*)
+        echo "utun data plane: DNS via 198.51.100.1 answered with fake-IP $ans (round trip through the stack)";;
+    *)
+        echo "FAIL: tun DNS probe got '${ans:-no answer}' — packets are not flowing through the utun data plane"
+        dump_client; exit 1;;
+esac
 
 # --- 7. through the SOCKS5 listener (explicit proxy) — full
 # client -> tunnel -> server -> origin relay, same routing engine.

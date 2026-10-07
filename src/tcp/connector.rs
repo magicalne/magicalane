@@ -17,12 +17,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::{
-    connector::Connector,
-    error::Result,
-    load_private_cert,
-    socks5::proto::Addr,
-};
+use crate::{connector::Connector, error::Result, load_private_cert, socks5::proto::Addr};
 
 use super::ALPN_TCP;
 
@@ -161,8 +156,8 @@ impl Connector for TcpConnector {
                 let tcp = TcpStream::connect(remote).await?;
                 tcp.set_nodelay(true).ok();
                 let mut io = if tls {
-                    let connector = tls_connector
-                        .ok_or_else(|| io::Error::other("missing tls config"))?;
+                    let connector =
+                        tls_connector.ok_or_else(|| io::Error::other("missing tls config"))?;
                     let dns_name = rustls::pki_types::ServerName::try_from(server_name.clone())
                         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad sni"))?;
                     TcpTunnelStream::Tls(Box::new(connector.connect(dns_name, tcp).await?))
@@ -202,7 +197,9 @@ impl Connector for TcpConnector {
                 Ok(io)
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tcp transport handshake timeout"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "tcp transport handshake timeout")
+            })?
         })
     }
 }

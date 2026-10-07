@@ -33,20 +33,29 @@ pub fn parse_url(url: &str) -> io::Result<Url<'_>> {
             return Err(io::Error::other("provider url: bad v6 authority"));
         };
         let port = match p.strip_prefix(':') {
-            Some(p) => p.parse().map_err(|_| io::Error::other("provider url: bad port"))?,
+            Some(p) => p
+                .parse()
+                .map_err(|_| io::Error::other("provider url: bad port"))?,
             None => default_port,
         };
         (h, port)
     } else {
         match authority.rsplit_once(':') {
             Some((h, p)) if !h.contains(':') => {
-                let port = p.parse().map_err(|_| io::Error::other("provider url: bad port"))?;
+                let port = p
+                    .parse()
+                    .map_err(|_| io::Error::other("provider url: bad port"))?;
                 (h, port)
             }
             _ => (authority, default_port),
         }
     };
-    Ok(Url { tls, host, port, path })
+    Ok(Url {
+        tls,
+        host,
+        port,
+        path,
+    })
 }
 
 pub fn url_addr(u: &Url<'_>) -> Addr {

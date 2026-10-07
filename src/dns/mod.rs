@@ -28,10 +28,7 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{
-    connector::Connector,
-    socks5::proto::Addr,
-};
+use crate::{connector::Connector, socks5::proto::Addr};
 
 pub mod fakeip;
 pub mod proto;
@@ -203,7 +200,10 @@ where
     tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut hdr)).await??;
     let len = u16::from_be_bytes(hdr) as usize;
     if len > MAX_DNS {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "dns response too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns response too large",
+        ));
     }
     let mut resp = vec![0u8; len];
     tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut resp)).await??;
@@ -212,7 +212,10 @@ where
 
 /// Label-aligned suffix match for fakeip_filter entries.
 fn suffix_matches(domain: &str, entry: &str) -> bool {
-    let entry = entry.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
+    let entry = entry
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
     if entry.is_empty() {
         return false;
     }
@@ -255,7 +258,13 @@ pub async fn serve_client_fakeip<C, IO>(
                 spawn(async move {
                     let _permit = INFLIGHT.acquire().await;
                     let resp = answer_fakeip(
-                        map, aaaa, v6_intercept_active, filter, resolver, connector, query,
+                        map,
+                        aaaa,
+                        v6_intercept_active,
+                        filter,
+                        resolver,
+                        connector,
+                        query,
                     )
                     .await;
                     if let Ok(resp) = resp {
@@ -288,7 +297,10 @@ where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let Some(q) = proto::parse_query(&query) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unparseable dns query"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unparseable dns query",
+        ));
     };
     // Filtered domains (STUN/NTP/games...) get REAL answers: tokens
     // would break endpoints that validate addresses.
@@ -391,7 +403,11 @@ impl DnsRelayStream {
             wbuf: BytesMut::new(),
             rbuf: BytesMut::new(),
             pending: None,
-            upstreams: if upstreams.is_empty() { vec![upstream()] } else { upstreams },
+            upstreams: if upstreams.is_empty() {
+                vec![upstream()]
+            } else {
+                upstreams
+            },
         }
     }
 
@@ -405,15 +421,31 @@ impl DnsRelayStream {
             for upstream in upstreams {
                 let sock = match UdpSocket::bind(("0.0.0.0", 0)).await {
                     Ok(s) => s,
-                    Err(e) => { last_err = e; continue; }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
                 };
-                if let Err(e) = sock.connect(upstream).await { last_err = e; continue; }
-                if let Err(e) = sock.send(&query).await { last_err = e; continue; }
+                if let Err(e) = sock.connect(upstream).await {
+                    last_err = e;
+                    continue;
+                }
+                if let Err(e) = sock.send(&query).await {
+                    last_err = e;
+                    continue;
+                }
                 let mut buf = vec![0u8; 65536];
                 match tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await {
-                    Ok(Ok(n)) => { buf.truncate(n); return Ok(buf); }
-                    Ok(Err(e)) => { last_err = e; }
-                    Err(_) => { last_err = io::Error::new(io::ErrorKind::TimedOut, "dns upstream timeout"); }
+                    Ok(Ok(n)) => {
+                        buf.truncate(n);
+                        return Ok(buf);
+                    }
+                    Ok(Err(e)) => {
+                        last_err = e;
+                    }
+                    Err(_) => {
+                        last_err = io::Error::new(io::ErrorKind::TimedOut, "dns upstream timeout");
+                    }
                 }
             }
             Err(last_err)
@@ -443,8 +475,7 @@ impl tokio::io::AsyncRead for DnsRelayStream {
             match self.pending.as_mut() {
                 Some(handle) => {
                     // JoinHandle is Unpin; poll in place so it stays stored.
-                    let ready =
-                        std::future::Future::poll(std::pin::Pin::new(handle), cx);
+                    let ready = std::future::Future::poll(std::pin::Pin::new(handle), cx);
                     match ready {
                         std::task::Poll::Ready(Ok(Ok(resp))) => {
                             self.pending = None;

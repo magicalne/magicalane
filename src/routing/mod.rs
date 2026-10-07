@@ -17,10 +17,7 @@
 //! format: one domain per line, `#` comments, optional `domain:`
 //! prefix treated as suffix).
 
-use std::{
-    collections::HashSet,
-    net::IpAddr,
-};
+use std::{collections::HashSet, net::IpAddr};
 
 use std::sync::Arc;
 
@@ -42,10 +39,16 @@ pub struct Decision {
 
 impl Decision {
     pub fn direct() -> Self {
-        Self { action: Action::Direct, server: None }
+        Self {
+            action: Action::Direct,
+            server: None,
+        }
     }
     pub fn proxy() -> Self {
-        Self { action: Action::Proxy, server: None }
+        Self {
+            action: Action::Proxy,
+            server: None,
+        }
     }
 }
 
@@ -192,7 +195,9 @@ pub struct RoutingEngine {
     default: std::sync::Arc<std::sync::RwLock<Decision>>,
     /// Live provider sets (name -> swappable content).
     providers: std::sync::Arc<
-        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<std::sync::RwLock<LoadedList>>>>,
+        std::sync::RwLock<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::RwLock<LoadedList>>>,
+        >,
     >,
 }
 
@@ -203,9 +208,9 @@ impl RoutingEngine {
         let engine = Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             default: std::sync::Arc::new(std::sync::RwLock::new(Decision::proxy())),
-            providers: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            providers: std::sync::Arc::new(
+                std::sync::RwLock::new(std::collections::HashMap::new()),
+            ),
         };
         engine.reload(cfg)?;
         Ok(engine)
@@ -216,7 +221,8 @@ impl RoutingEngine {
     pub fn reload(&self, cfg: &RoutingSpec) -> std::io::Result<()> {
         let mut rules = Vec::new();
         for r in &cfg.rule {
-            let outcome = std::sync::Arc::new(parse_action(r.action.as_deref().unwrap_or("direct")));
+            let outcome =
+                std::sync::Arc::new(parse_action(r.action.as_deref().unwrap_or("direct")));
             if let Some(suffixes) = &r.domain_suffix {
                 rules.push(Rule {
                     matcher: Matcher::DomainSuffix(suffixes.iter().map(|s| normalize(s)).collect()),
@@ -231,7 +237,9 @@ impl RoutingEngine {
             }
             if let Some(keywords) = &r.domain_keyword {
                 rules.push(Rule {
-                    matcher: Matcher::DomainKeyword(keywords.iter().map(|s| normalize(s)).collect()),
+                    matcher: Matcher::DomainKeyword(
+                        keywords.iter().map(|s| normalize(s)).collect(),
+                    ),
                     outcome: outcome.clone(),
                 });
             }
@@ -240,13 +248,13 @@ impl RoutingEngine {
                 for c in cidrs {
                     parsed.push(parse_cidr(c)?);
                 }
-                rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&parsed)), outcome: outcome.clone() });
+                rules.push(Rule {
+                    matcher: Matcher::IpCidr(IpRanges::from_cidrs(&parsed)),
+                    outcome: outcome.clone(),
+                });
             }
             if let Some(cc) = &r.geoip {
-                let dir = cfg
-                    .geoip_dir
-                    .as_deref()
-                    .unwrap_or("/etc/magicalane/geoip");
+                let dir = cfg.geoip_dir.as_deref().unwrap_or("/etc/magicalane/geoip");
                 let path = format!("{dir}/{}.txt", cc.to_ascii_lowercase());
                 let loaded = load_list_file(&path)?;
                 if loaded.cidrs.is_empty() {
@@ -262,10 +270,16 @@ impl RoutingEngine {
             if let Some(path) = &r.list_file {
                 let loaded = load_list_file(path)?;
                 if !loaded.domains.is_empty() {
-                    rules.push(Rule { matcher: Matcher::DomainSuffix(loaded.domains), outcome: outcome.clone() });
+                    rules.push(Rule {
+                        matcher: Matcher::DomainSuffix(loaded.domains),
+                        outcome: outcome.clone(),
+                    });
                 }
                 if !loaded.cidrs.is_empty() {
-                    rules.push(Rule { matcher: Matcher::IpCidr(IpRanges::from_cidrs(&loaded.cidrs)), outcome: outcome.clone() });
+                    rules.push(Rule {
+                        matcher: Matcher::IpCidr(IpRanges::from_cidrs(&loaded.cidrs)),
+                        outcome: outcome.clone(),
+                    });
                 }
             }
         }
@@ -274,18 +288,23 @@ impl RoutingEngine {
         for p in &cfg.provider {
             let set = {
                 let mut provs = self.providers.write().unwrap();
-                provs.entry(p.name.clone())
-                    .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(LoadedList::default())))
+                provs
+                    .entry(p.name.clone())
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(std::sync::RwLock::new(LoadedList::default()))
+                    })
                     .clone()
             };
             rules.push(Rule {
-                matcher: Matcher::Provider { name: p.name.clone(), set },
+                matcher: Matcher::Provider {
+                    name: p.name.clone(),
+                    set,
+                },
                 outcome: std::sync::Arc::new(parse_action(p.action.as_deref().unwrap_or("direct"))),
             });
         }
         *self.inner.write().unwrap() = rules;
-        *self.default.write().unwrap() =
-            parse_action(cfg.default.as_deref().unwrap_or("proxy"));
+        *self.default.write().unwrap() = parse_action(cfg.default.as_deref().unwrap_or("proxy"));
         Ok(())
     }
 
@@ -314,9 +333,9 @@ impl RoutingEngine {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             default: std::sync::Arc::new(std::sync::RwLock::new(decision)),
-            providers: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            providers: std::sync::Arc::new(
+                std::sync::RwLock::new(std::collections::HashMap::new()),
+            ),
         }
     }
 
@@ -365,8 +384,8 @@ impl RoutingEngine {
         for rule in rules.iter() {
             match &rule.matcher {
                 Matcher::IpCidr(r) | Matcher::GeoIp(r) if r.contains(ip) => {
-                            return (*rule.outcome).clone();
-                        }
+                    return (*rule.outcome).clone();
+                }
                 Matcher::Provider { name, set } => {
                     let guard = set.read().unwrap();
                     if !guard.cidrs.is_empty() {
@@ -566,15 +585,15 @@ mod tests {
 
         // Known China addresses (must classify as CN):
         for cn in [
-            "223.5.5.5",     // AliDNS
+            "223.5.5.5",       // AliDNS
             "114.114.114.114", // 114DNS (Jiangsu)
-            "39.156.69.79",  // baidu.com
-            "180.76.76.76",  // Baidu DNS
-            "119.29.29.29",  // DNSPod (Tencent)
-            "202.96.209.133", // Shanghai Telecom
-            "240e:1::1",     // China Telecom v6
-            "2408:8000::1",  // China Unicom v6
-            "2001:250::1",   // CERNET
+            "39.156.69.79",    // baidu.com
+            "180.76.76.76",    // Baidu DNS
+            "119.29.29.29",    // DNSPod (Tencent)
+            "202.96.209.133",  // Shanghai Telecom
+            "240e:1::1",       // China Telecom v6
+            "2408:8000::1",    // China Unicom v6
+            "2001:250::1",     // CERNET
         ] {
             assert!(
                 ranges.contains(cn.parse::<IpAddr>().unwrap()),
@@ -627,7 +646,10 @@ mod tests {
         // rule 1 already matched suffix baidu.com -> Direct (first match)
         assert_eq!(engine.decide(Target::Domain("baidu.com")), direct());
         assert_eq!(engine.decide(Target::Domain("twitter.com")), proxy());
-        assert_eq!(engine.decide(Target::Ip("8.8.8.8".parse().unwrap())), proxy());
+        assert_eq!(
+            engine.decide(Target::Ip("8.8.8.8".parse().unwrap())),
+            proxy()
+        );
     }
 
     #[test]
@@ -649,7 +671,10 @@ mod tests {
         assert_eq!(d.action, Action::Proxy);
         assert_eq!(d.server.as_deref(), Some("work"));
         assert_eq!(
-            engine.decide(Target::Domain("corp.example.com")).server.as_deref(),
+            engine
+                .decide(Target::Domain("corp.example.com"))
+                .server
+                .as_deref(),
             Some("work")
         );
         let d = engine.decide(Target::Domain("fedora-mirror.example.net"));
@@ -668,7 +693,10 @@ mod tests {
             ..Default::default()
         };
         let engine = RoutingEngine::from_config(&spec(vec![r], Some("proxy"))).unwrap();
-        assert_eq!(engine.decide(Target::Ip("192.168.5.5".parse().unwrap())), direct());
+        assert_eq!(
+            engine.decide(Target::Ip("192.168.5.5".parse().unwrap())),
+            direct()
+        );
         assert_eq!(engine.decide(Target::Domain("internal.corp")), proxy());
     }
 

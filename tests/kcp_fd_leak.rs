@@ -63,6 +63,7 @@ async fn settle_fds(baseline: usize, slack: usize) -> usize {
 /// A "blackhole" peer: a bound UDP port that never responds (and never
 /// sends), so the client handshake parks until the connector's own
 /// bound gives up.
+#[cfg(target_os = "linux")]
 async fn blackhole() -> std::io::Result<std::net::SocketAddr> {
     let s = UdpSocket::bind(("127.0.0.1", 0)).await?;
     let a = s.local_addr()?;

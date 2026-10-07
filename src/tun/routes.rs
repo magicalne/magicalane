@@ -130,9 +130,14 @@ pub fn tun_apply(
     run_log("ifconfig", &[dev, v4, "198.18.255.253", "up"]);
     run_log("ifconfig", &[dev, "inet6", &format!("{v6}/128"), "add"]);
     run_log("ifconfig", &[dev, "mtu", "65535"]);
-    // Server exceptions via the original gateway (skip if we could
-    // not determine it — loopback servers do not need an exception).
+    // Server exceptions via the original gateway. Loopback server IPs
+    // are skipped: a -host route for 127.0.0.1 via the real gateway
+    // would hijack ALL loopback traffic (observed as instant
+    // connection-refused for every 127.0.0.1 listener).
     for ip in server_ips {
+        if ip.is_loopback() {
+            continue;
+        }
         if let Some(gw) = gw.as_deref() {
             run_log("route", &["-n", "add", "-host", &ip.to_string(), gw]);
         }

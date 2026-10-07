@@ -92,19 +92,25 @@ done
 echo "capture routes up: $(route -n get 8.8.8.8 | grep interface)"
 ifconfig | grep -A4 "^utun" | grep -E "^utun|inet |mtu" || true
 
+dump_client() {
+    echo "--- client alive?"; pgrep -fl "client.toml" || echo "(client process GONE)"
+    echo "--- client log (tail 60):"; tail -60 "$WORK/client.log"
+    echo "--- socks listener:"; netstat -an | grep "$SOCKS_PORT" || echo "(nothing on $SOCKS_PORT)"
+}
+
 # --- 6. through the TUN plane (transparent; dst = en0 IP -> utun)
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    --noproxy '*' "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt")
+    --noproxy '*' "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt") || code="curl-exit-$?"
 [ "$code" = 200 ] || {
-    echo "FAIL: tun-plane curl got $code"; tail -30 "$WORK/client.log"; exit 1;
+    echo "FAIL: tun-plane curl got $code"; dump_client; exit 1;
 }
 echo "tun-plane: HTTP $code (traffic went utun -> stack -> tunnel -> origin)"
 
 # --- 7. through the SOCKS5 listener (explicit proxy)
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-    -x "socks5h://127.0.0.1:$SOCKS_PORT" "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt")
+    -x "socks5h://127.0.0.1:$SOCKS_PORT" "http://$ORIGIN_IP:$ORIGIN_PORT/origin-file.txt") || code="curl-exit-$?"
 [ "$code" = 200 ] || {
-    echo "FAIL: socks5 curl got $code"; tail -30 "$WORK/client.log"; exit 1;
+    echo "FAIL: socks5 curl got $code"; dump_client; exit 1;
 }
 echo "socks5:   HTTP $code (explicit proxy through the same tunnel)"
 

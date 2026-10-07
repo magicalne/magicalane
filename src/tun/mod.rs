@@ -196,6 +196,17 @@ fn open_tun(_name: &str) -> io::Result<(std::mem::ManuallyDrop<std::fs::File>, S
         unsafe { libc::close(fd) };
         return Err(e);
     }
+    // Non-blocking only now (post-connect): F_GETFL/F_SETFL are
+    // rejected on kernel-control sockets that have not connected yet
+    // (EOPNOTSUPP). Same order as wireguard-go's utun setup.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            let e = io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+    }
     let dev = format!("utun{}", sc.sc_unit - 1);
     Ok((
         std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) }),

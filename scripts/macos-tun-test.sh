@@ -113,7 +113,8 @@ dump_client() {
 # device and the smoltcp stack processes them. (A full transparent
 # relay cannot be proven with an on-host origin: every bindable
 # address has a host/local route that beats the capture halves.)
-utun_tx() { ifconfig "$(route -n get 198.51.100.1 | awk '/interface:/{print $2}')" | awk '/tx_packets/{print $2}'; }
+utun_dev() { route -n get 198.51.100.1 | awk '/interface:/{print $2}'; }
+utun_tx() { netstat -I "$(utun_dev)" | awk 'NR==2{print $8}'; }
 TX0=$(utun_tx)
 curl -s -o /dev/null --max-time 2 --noproxy '*' "http://198.51.100.1:81/" || true
 TX1=$(utun_tx)

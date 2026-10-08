@@ -190,8 +190,14 @@ pub fn search_domains() -> Vec<String> {
                 .or_else(|| line.strip_prefix("domain"))
             {
                 for d in rest.split_whitespace() {
-                    if !d.is_empty() {
-                        out.push(d.trim_end_matches('.').to_string());
+                    // Trim FIRST, then skip: resolv.conf's `search .`
+                    // (systemd-resolved's no-domain placeholder) must not
+                    // produce an empty suffix — it would generate
+                    // "host." candidates that always miss the cache
+                    // (every resolution pays the full probe penalty).
+                    let t = d.trim_end_matches('.');
+                    if !t.is_empty() {
+                        out.push(t.to_string());
                     }
                 }
             }

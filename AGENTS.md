@@ -53,6 +53,13 @@ Reminder: after rebuilding the binary, run `env/down.sh` before `env/up.sh` — 
 - `src/socks5/` — SOCKS5 local server (proto, conn, server, error)
 - `tests/test.rs` — integration tests (ignored by default)
 
+**Interception architecture**: `docs/interception-internals.md` maps the whole
+iptables/marks/DNS plane (chains, packet journeys, the invariants that broke
+production, field-tested debugging methods). Read it before touching
+`src/tproxy/`, `src/udp/`, `src/dns/`, or debugging a gateway deployment —
+symptom signature "tunneled sites work, direct dies" = interception eating
+replies (see the `--ctdir REPLY` invariant), not an upstream problem.
+
 ## CI / Release
 
 `.github/workflows/rust.yml` triggers on `v*` tags: builds release binaries for Linux and macOS, runs tests, and uploads `magicalane-linux` / `magicalane-macOS` to the GitHub release.

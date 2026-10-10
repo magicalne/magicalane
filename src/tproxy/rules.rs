@@ -330,6 +330,18 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     }
     // MGL-PRE: TPROXY on lo for marked UDP (local) and on any interface
     // for forwarded TCP/UDP (gateway mode, matched by mark).
+    //
+    // Conntrack-direction guard FIRST: packets traveling in the REPLY
+    // direction of a flow are answers to connections THIS host
+    // initiated (resolver probes, direct-connect SYN-ACKs, TCP
+    // fallback transports). They must reach their own sockets, not the
+    // interceptor — the catch-all below would otherwise eat every
+    // inbound answer except the explicitly-exempted tunnel server,
+    // strangling direct-path DNS and all direct connections
+    // (regression: production gateway, 2026-10).
+    blob.push_str(&format!(
+        "-A {CHAIN_PRE} -m conntrack --ctdir REPLY -j RETURN\n"
+    ));
     if spec.udp_port != 0 {
         blob.push_str(&format!(
             "-A {CHAIN_PRE} -i lo -p udp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
@@ -626,6 +638,10 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         ));
         blob.push_str(&format!(
             "-A {CHAIN6_OUT} -p udp -j MARK --set-mark {MARK}\n"
+        ));
+        // Reply-direction guard: see the MGL-PRE counterpart.
+        blob.push_str(&format!(
+            "-A {CHAIN6_PRE} -m conntrack --ctdir REPLY -j RETURN\n"
         ));
         blob.push_str(&format!(
             "-A {CHAIN6_PRE} -i lo -p udp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",

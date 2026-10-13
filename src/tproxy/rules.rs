@@ -292,33 +292,43 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         enable_ip_forward();
     }
 
-    // 1. policy routing: marked packets are delivered locally
-    run(
-        "ip",
-        &[
-            "rule",
-            "add",
-            "fwmark",
-            &MARK.to_string(),
-            "lookup",
-            &TABLE.to_string(),
-            "prio",
-            "100",
-        ],
-    )?;
-    run(
-        "ip",
-        &[
-            "route",
-            "add",
-            "local",
-            "0.0.0.0/0",
-            "dev",
-            "lo",
-            "table",
-            &TABLE.to_string(),
-        ],
-    )?;
+    // 1. policy routing: marked packets are delivered locally.
+    // These are the first fallible steps AFTER enable_ip_forward, so a
+    // failure must unwind (teardown restores ip_forward and removes
+    // partial rules) instead of leaving a half-configured system — the
+    // clean-exit contract (see env/tests/020, 021).
+    if let Err(err) = (|| -> io::Result<()> {
+        run(
+            "ip",
+            &[
+                "rule",
+                "add",
+                "fwmark",
+                &MARK.to_string(),
+                "lookup",
+                &TABLE.to_string(),
+                "prio",
+                "100",
+            ],
+        )?;
+        run(
+            "ip",
+            &[
+                "route",
+                "add",
+                "local",
+                "0.0.0.0/0",
+                "dev",
+                "lo",
+                "table",
+                &TABLE.to_string(),
+            ],
+        )?;
+        Ok(())
+    })() {
+        teardown(spec);
+        return Err(err);
+    }
     // Fake-token range must be locally routable even without a default
     // route (route lookup precedes the nat OUTPUT REDIRECT).
     run_ok(
@@ -363,7 +373,8 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         // generic TCP REDIRECT — first match wins. The DNS module's TCP
         // listener answers instead of the TCP relay.
         nat.push_str(&format!(
-            "-A {CHAIN_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+            "-A {CHAIN_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
         ));
     }
     nat.push_str(&format!(
@@ -588,10 +599,24 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         // FORWARD accept (filter plane): anything the transparent plane
         // intercepted never reaches FORWARD (TPROXY is local delivery);
         // what lands here is exactly the bypass traffic we want to pass.
+        // Scoped by conntrack state, not blanket-ACCEPT: replies to
+        // connections LAN clients opened (ESTABLISHED,RELATED) always
+        // pass, new flows pass as NEW, and INVALID packets fall through
+        // to the host's FORWARD policy instead of being accepted.
+        // Single-NIC scope note: the one-box bypass router targets a
+        // single-NIC LAN gateway (LAN and WAN share eth0), where any
+        // NEW forwarded flow is by definition LAN-originated. On a
+        // multi-homed gateway, scope MGL-FWD's NEW rule to the LAN
+        // ingress / WAN egress interfaces before relying on it.
         let mut fwd = String::new();
         fwd.push_str("*filter\n");
         fwd.push_str(&format!(":{CHAIN_FWD} - [0:0]\n"));
-        fwd.push_str(&format!("-A {CHAIN_FWD} -j ACCEPT\n"));
+        fwd.push_str(&format!(
+            "-A {CHAIN_FWD} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n"
+        ));
+        fwd.push_str(&format!(
+            "-A {CHAIN_FWD} -m conntrack --ctstate NEW -j ACCEPT\n"
+        ));
         fwd.push_str(&format!("-A FORWARD -j {CHAIN_FWD}\n"));
         fwd.push_str("COMMIT\n");
         restore_blob("/usr/sbin/iptables-restore", &fwd).inspect_err(|_e| {
@@ -755,7 +780,8 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     if spec.dns_port != 0 {
         // DNS over TCP before the generic TCP REDIRECT (see v4).
         nat.push_str(&format!(
-            "-A {CHAIN6_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+            "-A {CHAIN6_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
         ));
     }
     nat.push_str(&format!(

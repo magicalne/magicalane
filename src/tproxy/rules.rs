@@ -143,7 +143,9 @@ fn run(cmd: &str, args: &[&str]) -> io::Result<String> {
         if status == 0 {
             Ok(out)
         } else {
-            Err(io::Error::other(format!("{resolved} {args:?} failed ({status}): {out}")))
+            Err(io::Error::other(format!(
+                "{resolved} {args:?} failed ({status}): {out}"
+            )))
         }
     }
 }
@@ -225,8 +227,7 @@ fn restore_blob(restore_bin: &str, blob: &str) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    let devnull =
-        unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
     let cmd = cstr(restore_bin);
     let arg = cstr("--noflush");
     let argv: [*const libc::c_char; 3] = [cmd.as_ptr(), arg.as_ptr(), std::ptr::null()];
@@ -291,21 +292,49 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         enable_ip_forward();
     }
 
-    // 1. policy routing: marked packets are delivered locally
-    run(
-        "ip",
-        &[
-            "rule", "add", "fwmark", &MARK.to_string(), "lookup", &TABLE.to_string(),
-            "prio", "100",
-        ],
-    )?;
-    run(
-        "ip",
-        &["route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", &TABLE.to_string()],
-    )?;
+    // 1. policy routing: marked packets are delivered locally.
+    // These are the first fallible steps AFTER enable_ip_forward, so a
+    // failure must unwind (teardown restores ip_forward and removes
+    // partial rules) instead of leaving a half-configured system — the
+    // clean-exit contract (see env/tests/020, 021).
+    if let Err(err) = (|| -> io::Result<()> {
+        run(
+            "ip",
+            &[
+                "rule",
+                "add",
+                "fwmark",
+                &MARK.to_string(),
+                "lookup",
+                &TABLE.to_string(),
+                "prio",
+                "100",
+            ],
+        )?;
+        run(
+            "ip",
+            &[
+                "route",
+                "add",
+                "local",
+                "0.0.0.0/0",
+                "dev",
+                "lo",
+                "table",
+                &TABLE.to_string(),
+            ],
+        )?;
+        Ok(())
+    })() {
+        teardown(spec);
+        return Err(err);
+    }
     // Fake-token range must be locally routable even without a default
     // route (route lookup precedes the nat OUTPUT REDIRECT).
-    run_ok("ip", &["route", "replace", "local", "198.18.0.0/15", "dev", "lo"]);
+    run_ok(
+        "ip",
+        &["route", "replace", "local", "198.18.0.0/15", "dev", "lo"],
+    );
 
     // 2. nat rules: REDIRECT local TCP to the transparent listener.
     // REDIRECT (nat) is used for local traffic because TPROXY in
@@ -321,7 +350,8 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         crate::connector::SO_MARK_DIRECT
     ));
     nat.push_str(&format!(
-        "-A {CHAIN_NAT} -d {}/32 -j RETURN\n", spec.server_ip
+        "-A {CHAIN_NAT} -d {}/32 -j RETURN\n",
+        spec.server_ip
     ));
     for ip in &spec.extra_server_ips {
         nat.push_str(&format!("-A {CHAIN_NAT} -d {ip}/32 -j RETURN\n"));
@@ -334,15 +364,18 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         // generic TCP REDIRECT — first match wins. The DNS module's TCP
         // listener answers instead of the TCP relay.
         nat.push_str(&format!(
-            "-A {CHAIN_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+            "-A {CHAIN_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
         ));
     }
     nat.push_str(&format!(
-        "-A {CHAIN_NAT} -p tcp -j REDIRECT --to-ports {}\n", spec.tcp_port
+        "-A {CHAIN_NAT} -p tcp -j REDIRECT --to-ports {}\n",
+        spec.tcp_port
     ));
     if spec.dns_port != 0 {
         nat.push_str(&format!(
-            "-A {CHAIN_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+            "-A {CHAIN_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
         ));
     }
     // Gateway mode: the same destination-agnostic DNS capture for
@@ -354,7 +387,8 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     if spec.gateway && spec.dns_port != 0 {
         nat.push_str(&format!(":{CHAIN_PRE_NAT} - [0:0]\n"));
         nat.push_str(&format!(
-            "-A {CHAIN_PRE_NAT} -d {}/32 -j RETURN\n", spec.server_ip
+            "-A {CHAIN_PRE_NAT} -d {}/32 -j RETURN\n",
+            spec.server_ip
         ));
         for ip in &spec.extra_server_ips {
             nat.push_str(&format!("-A {CHAIN_PRE_NAT} -d {ip}/32 -j RETURN\n"));
@@ -397,25 +431,28 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             "-A {CHAIN_OUT} -m mark --mark {:#x} -j RETURN\n",
             crate::connector::SO_MARK_DIRECT
         ));
-        blob.push_str(&format!("-A {CHAIN_OUT} -d {}/32 -j RETURN\n", spec.server_ip));
+        blob.push_str(&format!(
+            "-A {CHAIN_OUT} -d {}/32 -j RETURN\n",
+            spec.server_ip
+        ));
         for ip in &spec.extra_server_ips {
             blob.push_str(&format!("-A {CHAIN_OUT} -d {ip}/32 -j RETURN\n"));
         }
         blob.push_str("-A MGL-OUT -d 127.0.0.0/8 -j RETURN\n");
         if spec.dns_port != 0 {
             // DNS handled by REDIRECT in nat; skip it here
-            blob.push_str(&format!(
-                "-A {CHAIN_OUT} -p udp --dport 53 -j RETURN\n"
-            ));
+            blob.push_str(&format!("-A {CHAIN_OUT} -p udp --dport 53 -j RETURN\n"));
             // Exclude our own DNS interceptor's responses (from dns_port):
             // they would be MARK'd and TPROXY'd to our own UDP interceptor.
             blob.push_str(&format!(
-                "-A {CHAIN_OUT} -p udp --sport {} -j RETURN\n", spec.dns_port
+                "-A {CHAIN_OUT} -p udp --sport {} -j RETURN\n",
+                spec.dns_port
             ));
         }
         // Exclude our own UDP interceptor's responses
         blob.push_str(&format!(
-            "-A {CHAIN_OUT} -p udp --sport {} -j RETURN\n", spec.udp_port
+            "-A {CHAIN_OUT} -p udp --sport {} -j RETURN\n",
+            spec.udp_port
         ));
         blob.push_str(&format!(
             "-A {CHAIN_OUT} -p udp -j MARK --set-mark {MARK}\n"
@@ -439,13 +476,15 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     // source exemption works for both topologies.
     if spec.gateway {
         blob.push_str(&format!(
-            "-A {CHAIN_PRE} -s {}/32 -j RETURN\n", spec.server_ip
+            "-A {CHAIN_PRE} -s {}/32 -j RETURN\n",
+            spec.server_ip
         ));
         for ip in &spec.extra_server_ips {
             blob.push_str(&format!("-A {CHAIN_PRE} -s {ip}/32 -j RETURN\n"));
         }
         blob.push_str(&format!(
-            "-A {CHAIN_PRE} -d {}/32 -j RETURN\n", spec.server_ip
+            "-A {CHAIN_PRE} -d {}/32 -j RETURN\n",
+            spec.server_ip
         ));
         for ip in &spec.extra_server_ips {
             blob.push_str(&format!("-A {CHAIN_PRE} -d {ip}/32 -j RETURN\n"));
@@ -458,10 +497,12 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             // Clients may also query the DNS interceptor directly on
             // dns_port; don't capture that either.
             blob.push_str(&format!(
-                "-A MGL-PRE -p udp --dport {} -j RETURN\n", spec.dns_port
+                "-A MGL-PRE -p udp --dport {} -j RETURN\n",
+                spec.dns_port
             ));
             blob.push_str(&format!(
-                "-A MGL-PRE -p tcp --dport {} -j RETURN\n", spec.dns_port
+                "-A MGL-PRE -p tcp --dport {} -j RETURN\n",
+                spec.dns_port
             ));
         }
         if spec.socks_port != 0 {
@@ -469,7 +510,8 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
             // directly; TPROXY-ing it swallows the connection (the
             // transparent relay would loop back into the port).
             blob.push_str(&format!(
-                "-A MGL-PRE -p tcp --dport {} -j RETURN\n", spec.socks_port
+                "-A MGL-PRE -p tcp --dport {} -j RETURN\n",
+                spec.socks_port
             ));
         }
         // Asymmetric transparent paths prefer loose reverse-path
@@ -506,10 +548,24 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         // FORWARD accept (filter plane): anything the transparent plane
         // intercepted never reaches FORWARD (TPROXY is local delivery);
         // what lands here is exactly the bypass traffic we want to pass.
+        // Scoped by conntrack state, not blanket-ACCEPT: replies to
+        // connections LAN clients opened (ESTABLISHED,RELATED) always
+        // pass, new flows pass as NEW, and INVALID packets fall through
+        // to the host's FORWARD policy instead of being accepted.
+        // Single-NIC scope note: the one-box bypass router targets a
+        // single-NIC LAN gateway (LAN and WAN share eth0), where any
+        // NEW forwarded flow is by definition LAN-originated. On a
+        // multi-homed gateway, scope MGL-FWD's NEW rule to the LAN
+        // ingress / WAN egress interfaces before relying on it.
         let mut fwd = String::new();
         fwd.push_str("*filter\n");
         fwd.push_str(&format!(":{CHAIN_FWD} - [0:0]\n"));
-        fwd.push_str(&format!("-A {CHAIN_FWD} -j ACCEPT\n"));
+        fwd.push_str(&format!(
+            "-A {CHAIN_FWD} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n"
+        ));
+        fwd.push_str(&format!(
+            "-A {CHAIN_FWD} -m conntrack --ctstate NEW -j ACCEPT\n"
+        ));
         fwd.push_str(&format!("-A FORWARD -j {CHAIN_FWD}\n"));
         fwd.push_str("COMMIT\n");
         restore_blob("/usr/sbin/iptables-restore", &fwd).inspect_err(|_e| {
@@ -579,8 +635,14 @@ pub fn teardown(_spec: &RuleSpec) {
         run_ok(
             "ip",
             &[
-                "rule", "del", "fwmark", &MARK.to_string(), "lookup", &TABLE.to_string(),
-                "prio", "100",
+                "rule",
+                "del",
+                "fwmark",
+                &MARK.to_string(),
+                "lookup",
+                &TABLE.to_string(),
+                "prio",
+                "100",
             ],
         );
     }
@@ -616,18 +678,35 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     run(
         "ip",
         &[
-            "-6", "rule", "add", "fwmark", &MARK.to_string(),
-            "lookup", &TABLE.to_string(), "prio", "100",
+            "-6",
+            "rule",
+            "add",
+            "fwmark",
+            &MARK.to_string(),
+            "lookup",
+            &TABLE.to_string(),
+            "prio",
+            "100",
         ],
     )?;
     run(
         "ip",
         &[
-            "-6", "route", "add", "local", "::/0", "dev", "lo",
-            "table", &TABLE.to_string(),
+            "-6",
+            "route",
+            "add",
+            "local",
+            "::/0",
+            "dev",
+            "lo",
+            "table",
+            &TABLE.to_string(),
         ],
     )?;
-    run_ok("ip", &["-6", "route", "replace", "local", "fc00::/18", "dev", "lo"]);
+    run_ok(
+        "ip",
+        &["-6", "route", "replace", "local", "fc00::/18", "dev", "lo"],
+    );
 
     let mut nat = String::new();
     nat.push_str("*nat\n");
@@ -648,15 +727,18 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     if spec.dns_port != 0 {
         // DNS over TCP before the generic TCP REDIRECT (see v4).
         nat.push_str(&format!(
-            "-A {CHAIN6_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+            "-A {CHAIN6_NAT} -p tcp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
         ));
     }
     nat.push_str(&format!(
-        "-A {CHAIN6_NAT} -p tcp -j REDIRECT --to-ports {}\n", spec.tcp_port
+        "-A {CHAIN6_NAT} -p tcp -j REDIRECT --to-ports {}\n",
+        spec.tcp_port
     ));
     if spec.dns_port != 0 {
         nat.push_str(&format!(
-            "-A {CHAIN6_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n", spec.dns_port
+            "-A {CHAIN6_NAT} -p udp --dport 53 -j REDIRECT --to-ports {}\n",
+            spec.dns_port
         ));
     }
     // Gateway v6 mirror: forwarded DNS via PREROUTING REDIRECT (see
@@ -702,13 +784,17 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         if spec.dns_port != 0 {
             blob.push_str(&format!("-A {CHAIN6_OUT} -p udp --dport 53 -j RETURN\n"));
             blob.push_str(&format!(
-                "-A {CHAIN6_OUT} -p udp --sport {} -j RETURN\n", spec.dns_port
+                "-A {CHAIN6_OUT} -p udp --sport {} -j RETURN\n",
+                spec.dns_port
             ));
         }
         blob.push_str(&format!(
-            "-A {CHAIN6_OUT} -p udp --sport {} -j RETURN\n", spec.udp_port + 1
+            "-A {CHAIN6_OUT} -p udp --sport {} -j RETURN\n",
+            spec.udp_port + 1
         ));
-        blob.push_str(&format!("-A {CHAIN6_OUT} -p udp -j MARK --set-mark {MARK}\n"));
+        blob.push_str(&format!(
+            "-A {CHAIN6_OUT} -p udp -j MARK --set-mark {MARK}\n"
+        ));
         blob.push_str(&format!(
             "-A {CHAIN6_PRE} -i lo -p udp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
             spec.udp_port + 1
@@ -727,25 +813,32 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             blob.push_str("-A MGL6-PRE -p udp --dport 53 -j RETURN\n");
             blob.push_str("-A MGL6-PRE -p tcp --dport 53 -j RETURN\n");
             blob.push_str(&format!(
-                "-A MGL6-PRE -p udp --dport {} -j RETURN\n", spec.dns_port
+                "-A MGL6-PRE -p udp --dport {} -j RETURN\n",
+                spec.dns_port
             ));
             blob.push_str(&format!(
-                "-A MGL6-PRE -p tcp --dport {} -j RETURN\n", spec.dns_port
+                "-A MGL6-PRE -p tcp --dport {} -j RETURN\n",
+                spec.dns_port
             ));
         }
         if spec.socks_port != 0 {
             blob.push_str(&format!(
-                "-A MGL6-PRE -p tcp --dport {} -j RETURN\n", spec.socks_port
+                "-A MGL6-PRE -p tcp --dport {} -j RETURN\n",
+                spec.socks_port
             ));
         }
         let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/rp_filter", b"0");
-        blob.push_str(&format!("-A {CHAIN6_PRE} ! -i lo -p tcp -j MARK --set-mark {MARK}\n"));
+        blob.push_str(&format!(
+            "-A {CHAIN6_PRE} ! -i lo -p tcp -j MARK --set-mark {MARK}\n"
+        ));
         blob.push_str(&format!(
             "-A {CHAIN6_PRE} ! -i lo -p tcp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
             spec.tcp_port
         ));
         if spec.udp_port != 0 {
-            blob.push_str(&format!("-A {CHAIN6_PRE} ! -i lo -p udp -j MARK --set-mark {MARK}\n"));
+            blob.push_str(&format!(
+                "-A {CHAIN6_PRE} ! -i lo -p udp -j MARK --set-mark {MARK}\n"
+            ));
             blob.push_str(&format!(
                 "-A {CHAIN6_PRE} ! -i lo -p udp -m mark --mark {MARK} -j TPROXY --on-port {} --tproxy-mark {MARK}\n",
                 spec.udp_port + 1
@@ -778,7 +871,10 @@ pub fn teardown_v6() {
     run_ok("ip6tables", &["-t", "mangle", "-X", CHAIN6_OUT]);
     run_ok("ip6tables", &["-t", "mangle", "-F", CHAIN6_PRE]);
     run_ok("ip6tables", &["-t", "mangle", "-X", CHAIN6_PRE]);
-    run_ok("ip6tables", &["-t", "nat", "-D", "OUTPUT", "-j", CHAIN6_NAT]);
+    run_ok(
+        "ip6tables",
+        &["-t", "nat", "-D", "OUTPUT", "-j", CHAIN6_NAT],
+    );
     run_ok("ip6tables", &["-t", "nat", "-F", CHAIN6_NAT]);
     for _ in 0..3 {
         run_ok("ip6tables", &["-t", "nat", "-X", CHAIN6_NAT]);
@@ -787,8 +883,15 @@ pub fn teardown_v6() {
         run_ok(
             "ip",
             &[
-                "-6", "rule", "del", "fwmark", &MARK.to_string(),
-                "lookup", &TABLE.to_string(), "prio", "100",
+                "-6",
+                "rule",
+                "del",
+                "fwmark",
+                &MARK.to_string(),
+                "lookup",
+                &TABLE.to_string(),
+                "prio",
+                "100",
             ],
         );
     }

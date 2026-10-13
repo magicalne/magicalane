@@ -3,13 +3,12 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use lib as lib;
 use lib::dns::{proto, resolve::Resolver};
 
 /// A minimal DNS stub: answers A with `ip4`, AAAA with `ip6`, after an
@@ -33,7 +32,9 @@ async fn spawn_stub(ip4: std::net::Ipv4Addr, ip6: std::net::Ipv6Addr, delay_ms: 
     tokio::spawn(async move {
         let mut buf = vec![0u8; 1500];
         loop {
-            let Ok((n, from)) = sock.recv_from(&mut buf).await else { break };
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
             let resp = match proto::parse_query(&buf[..n]) {
                 Some(q) => {
                     if q.qtype == proto::QTYPE_AAAA {
@@ -84,7 +85,10 @@ async fn failover_to_second_upstream() {
         .resolve("service-under-test.example", 443)
         .await
         .expect("must fail over to the live upstream");
-    assert!(addrs.iter().any(|a| a.ip().to_string() == "203.0.113.7"), "{addrs:?}");
+    assert!(
+        addrs.iter().any(|a| a.ip().to_string() == "203.0.113.7"),
+        "{addrs:?}"
+    );
     assert!(stub.count.load(Ordering::SeqCst) >= 1);
 }
 
@@ -103,7 +107,11 @@ async fn cache_dedupes_upstream_queries() {
     // give any in-flight duplicate a moment, then require exactly the
     // two family queries of ONE resolution round (AAAA + A = 2 answers)
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(stub.count.load(Ordering::SeqCst), 2, "one round of AAAA+A only");
+    assert_eq!(
+        stub.count.load(Ordering::SeqCst),
+        2,
+        "one round of AAAA+A only"
+    );
 }
 
 #[tokio::test]
@@ -119,7 +127,10 @@ async fn cache_expires_with_ttl() {
     r.resolve("ttl.example", 80).await.expect("first");
     tokio::time::sleep(Duration::from_millis(1200)).await; // expiry
     r.resolve("ttl.example", 80).await.expect("after expiry");
-    assert!(stub.count.load(Ordering::SeqCst) >= 4, "re-queried after TTL");
+    assert!(
+        stub.count.load(Ordering::SeqCst) >= 4,
+        "re-queried after TTL"
+    );
 }
 
 #[tokio::test]
@@ -144,7 +155,10 @@ async fn racing_first_answer_wins() {
         addrs.iter().any(|a| a.ip().to_string() == "203.0.113.2"),
         "fast upstream must win: {addrs:?}"
     );
-    assert!(elapsed < Duration::from_millis(350), "racing took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(350),
+        "racing took {elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -180,7 +194,13 @@ kind = { Client = { proxy = { host = "h", port = 1 }, socks5_port = 1, tproxy = 
     .unwrap();
     match &single.kind {
         lib::config::Kind::Client { routing, .. } => {
-            let v = routing.as_ref().unwrap().direct_dns.as_ref().unwrap().to_vec();
+            let v = routing
+                .as_ref()
+                .unwrap()
+                .direct_dns
+                .as_ref()
+                .unwrap()
+                .to_vec();
             assert_eq!(v, vec!["223.5.5.5:53".to_string()]);
         }
         _ => panic!(),
@@ -199,10 +219,26 @@ cache_size = 128
     )
     .unwrap();
     assert_eq!(many.dns.as_ref().unwrap().cache_size, Some(128));
-    assert_eq!(many.dns.as_ref().unwrap().upstream.as_ref().unwrap().to_vec().len(), 2);
+    assert_eq!(
+        many.dns
+            .as_ref()
+            .unwrap()
+            .upstream
+            .as_ref()
+            .unwrap()
+            .to_vec()
+            .len(),
+        2
+    );
     match &many.kind {
         lib::config::Kind::Client { routing, .. } => {
-            let v = routing.as_ref().unwrap().direct_dns.as_ref().unwrap().to_vec();
+            let v = routing
+                .as_ref()
+                .unwrap()
+                .direct_dns
+                .as_ref()
+                .unwrap()
+                .to_vec();
             assert_eq!(v.len(), 2);
         }
         _ => panic!(),

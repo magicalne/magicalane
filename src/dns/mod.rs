@@ -28,10 +28,7 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{
-    connector::Connector,
-    socks5::proto::Addr,
-};
+use crate::{connector::Connector, socks5::proto::Addr};
 
 pub mod fakeip;
 pub mod proto;
@@ -69,7 +66,12 @@ pub fn magic_addr() -> Addr {
     Addr::DomainName(DNS_MAGIC_HOST.to_vec(), DNS_MAGIC_PORT)
 }
 
-const MAX_DNS: usize = 4096;
+/// Max DNS message size on framed (TCP / tunnel) paths. RFC 7766: the
+/// u16 length prefix allows up to 65535 bytes — TCP fallback exists
+/// precisely to carry answers larger than UDP/EDNS0 can (512+). The
+/// old 4096 cap broke the fallback: a client retrying a truncated
+/// answer over TCP got an error instead of the full response.
+const MAX_DNS: usize = 65535;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound concurrent in-flight queries.
 static INFLIGHT: Semaphore = Semaphore::const_new(256);
@@ -213,7 +215,10 @@ async fn read_dns_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dns tcp header timeout"))??;
     let len = u16::from_be_bytes(hdr) as usize;
     if len > MAX_DNS {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "dns tcp frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns tcp frame too large",
+        ));
     }
     let mut msg = vec![0u8; len];
     tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut msg))
@@ -288,7 +293,10 @@ where
     tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut hdr)).await??;
     let len = u16::from_be_bytes(hdr) as usize;
     if len > MAX_DNS {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "dns response too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns response too large",
+        ));
     }
     let mut resp = vec![0u8; len];
     tokio::time::timeout(QUERY_TIMEOUT, stream.read_exact(&mut resp)).await??;
@@ -308,12 +316,19 @@ where
             Ok((mut stream, peer)) => {
                 let connector = connector.clone();
                 spawn(async move {
-                    let _permit = INFLIGHT.acquire().await;
                     loop {
                         let query = match read_dns_frame(&mut stream).await {
                             Ok(q) => q,
                             Err(_) => break, // EOF / malformed / timeout
                         };
+                        // Permit per decoded QUERY, not per connection:
+                        // RFC 7766 keep-alive connections may stay open
+                        // idle for a long time; holding the global
+                        // INFLIGHT semaphore for the connection lifetime
+                        // let 256 idle TCP sessions starve every DNS
+                        // path (UDP included) — acquire only while a
+                        // query is actually being served.
+                        let _permit = INFLIGHT.acquire().await;
                         match query_once(connector.clone(), &query).await {
                             Ok(resp) => {
                                 if write_dns_frame(&mut stream, &resp).await.is_err() {
@@ -338,7 +353,10 @@ where
 
 /// Label-aligned suffix match for fakeip_filter entries.
 fn suffix_matches(domain: &str, entry: &str) -> bool {
-    let entry = entry.trim_start_matches("*.").trim_start_matches('.').to_ascii_lowercase();
+    let entry = entry
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
     if entry.is_empty() {
         return false;
     }
@@ -381,7 +399,13 @@ pub async fn serve_client_fakeip<C, IO>(
                 spawn(async move {
                     let _permit = INFLIGHT.acquire().await;
                     let resp = answer_fakeip(
-                        map, aaaa, v6_intercept_active, filter, resolver, connector, query,
+                        map,
+                        aaaa,
+                        v6_intercept_active,
+                        filter,
+                        resolver,
+                        connector,
+                        query,
                     )
                     .await;
                     if let Ok(resp) = resp {
@@ -421,12 +445,14 @@ pub async fn serve_client_fakeip_tcp<C, IO>(
                 let resolver = resolver.clone();
                 let connector = connector.clone();
                 spawn(async move {
-                    let _permit = INFLIGHT.acquire().await;
                     loop {
                         let query = match read_dns_frame(&mut stream).await {
                             Ok(q) => q,
                             Err(_) => break,
                         };
+                        // Permit per decoded query, not per connection
+                        // (see serve_client_tcp for the rationale).
+                        let _permit = INFLIGHT.acquire().await;
                         match answer_fakeip(
                             map.clone(),
                             aaaa,
@@ -474,7 +500,10 @@ where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let Some(q) = proto::parse_query(&query) else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unparseable dns query"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unparseable dns query",
+        ));
     };
     // Filtered domains (STUN/NTP/games...) get REAL answers: tokens
     // would break endpoints that validate addresses.
@@ -539,6 +568,31 @@ where
 
 // ---------------------------------------------------------------- server side
 
+/// Whether a DNS response carries the truncation (TC) flag: the answer
+/// did not fit the UDP path and must be re-asked over TCP (RFC 7766).
+pub fn dns_truncated(resp: &[u8]) -> bool {
+    resp.len() >= 4 && resp[2] & 0x02 != 0
+}
+
+/// One framed query/response exchange with an upstream over TCP
+/// (DNS-over-TCP, [u16 len][message]). Answers up to 65535 bytes are
+/// legal — the reason the TCP path exists.
+async fn upstream_tcp_exchange(upstream: SocketAddr, query: &[u8]) -> io::Result<Vec<u8>> {
+    let mut sock = TcpStream::connect(upstream).await?;
+    sock.set_nodelay(true).ok();
+    let mut out = Vec::with_capacity(2 + query.len());
+    out.put_u16(query.len() as u16);
+    out.extend_from_slice(query);
+    tokio::time::timeout(Duration::from_secs(5), sock.write_all(&out)).await??;
+    tokio::time::timeout(Duration::from_secs(5), sock.flush()).await??;
+    let mut hdr = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut hdr)).await??;
+    let len = u16::from_be_bytes(hdr) as usize;
+    let mut resp = vec![0u8; len];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut resp)).await??;
+    Ok(resp)
+}
+
 /// First nameserver in /etc/resolv.conf (fallback: 127.0.0.1).
 fn upstream() -> SocketAddr {
     let default = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
@@ -577,7 +631,11 @@ impl DnsRelayStream {
             wbuf: BytesMut::new(),
             rbuf: BytesMut::new(),
             pending: None,
-            upstreams: if upstreams.is_empty() { vec![upstream()] } else { upstreams },
+            upstreams: if upstreams.is_empty() {
+                vec![upstream()]
+            } else {
+                upstreams
+            },
         }
     }
 
@@ -591,15 +649,56 @@ impl DnsRelayStream {
             for upstream in upstreams {
                 let sock = match UdpSocket::bind(("0.0.0.0", 0)).await {
                     Ok(s) => s,
-                    Err(e) => { last_err = e; continue; }
+                    Err(e) => {
+                        last_err = e;
+                        continue;
+                    }
                 };
-                if let Err(e) = sock.connect(upstream).await { last_err = e; continue; }
-                if let Err(e) = sock.send(&query).await { last_err = e; continue; }
+                if let Err(e) = sock.connect(upstream).await {
+                    last_err = e;
+                    continue;
+                }
+                if let Err(e) = sock.send(&query).await {
+                    last_err = e;
+                    continue;
+                }
                 let mut buf = vec![0u8; 65536];
                 match tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await {
-                    Ok(Ok(n)) => { buf.truncate(n); return Ok(buf); }
-                    Ok(Err(e)) => { last_err = e; }
-                    Err(_) => { last_err = io::Error::new(io::ErrorKind::TimedOut, "dns upstream timeout"); }
+                    Ok(Ok(n)) => {
+                        buf.truncate(n);
+                        // Truncated answer (TC bit): the upstream could
+                        // not fit the response into the UDP path. Retry
+                        // the exchange over TCP to the same upstream —
+                        // DNS-over-TCP exists exactly for this (RFC
+                        // 7766), and answers up to 65535 bytes are legal
+                        // there. Clients that saw the UDP truncation
+                        // re-ask over TCP; without the retry they would
+                        // receive the same truncated answer forever.
+                        if dns_truncated(&buf) {
+                            match tokio::time::timeout(
+                                Duration::from_secs(2),
+                                upstream_tcp_exchange(upstream, &query),
+                            )
+                            .await
+                            {
+                                Ok(Ok(full)) => return Ok(full),
+                                Ok(Err(e)) => {
+                                    debug!("dns upstream TCP retry failed: {e}");
+                                }
+                                Err(_) => {
+                                    debug!("dns upstream TCP retry timed out");
+                                }
+                            }
+                            // keep the truncated UDP answer as fallback
+                        }
+                        return Ok(buf);
+                    }
+                    Ok(Err(e)) => {
+                        last_err = e;
+                    }
+                    Err(_) => {
+                        last_err = io::Error::new(io::ErrorKind::TimedOut, "dns upstream timeout");
+                    }
                 }
             }
             Err(last_err)
@@ -629,8 +728,7 @@ impl tokio::io::AsyncRead for DnsRelayStream {
             match self.pending.as_mut() {
                 Some(handle) => {
                     // JoinHandle is Unpin; poll in place so it stays stored.
-                    let ready =
-                        std::future::Future::poll(std::pin::Pin::new(handle), cx);
+                    let ready = std::future::Future::poll(std::pin::Pin::new(handle), cx);
                     match ready {
                         std::task::Poll::Ready(Ok(Ok(resp))) => {
                             self.pending = None;

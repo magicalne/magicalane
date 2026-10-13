@@ -274,11 +274,15 @@ impl TransparentProxyConfig {
         self.mode.unwrap_or(TproxyMode::Off)
     }
     pub fn gateway(&self) -> bool {
-        self.gateway.unwrap_or(false)
+        // bypass_router implies gateway mode (field doc): a config with
+        // only `bypass_router = true` must get the full gateway story
+        // (PRINTEROUTING interception, wildcard DNS) plus the bypass
+        // extras — previously it silently installed neither.
+        self.gateway.unwrap_or(false) || self.bypass_router.unwrap_or(false)
     }
-    /// Effective bypass-router flag: only meaningful in gateway mode.
+    /// Raw bypass-router flag (`gateway()` already includes it).
     pub fn bypass_router(&self) -> bool {
-        self.bypass_router.unwrap_or(false) && self.gateway()
+        self.bypass_router.unwrap_or(false)
     }
     pub fn dns_port(&self) -> u16 {
         self.dns_port.unwrap_or(0)
@@ -441,3 +445,40 @@ pub struct ServerDns {
     pub cache_size: Option<usize>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tproxy(toml: &str) -> TransparentProxyConfig {
+        let text = format!(
+            "password = \"x\"\nbandwidth = 65536\nverbose = true\nkind = {{ Client = {{ proxy = {{ host = \"h\", port = 4433 }}, socks5_port = 1080, tproxy = {{ tcp_port = 7895, udp_port = 7896, {toml} }} }} }}"
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        match cfg.kind {
+            Kind::Client { tproxy, .. } => tproxy,
+            _ => panic!("expected client"),
+        }
+    }
+
+    /// PR #20 review: `bypass_router = true` is documented to imply
+    /// gateway mode. Previously `bypass_router()` ANDed in `gateway()`,
+    /// so a config with only `bypass_router = true` silently enabled
+    /// NEITHER (no PREROUTING interception, loopback DNS, no
+    /// forwarding/MASQ) — contradicting the field documentation.
+    #[test]
+    fn bypass_router_implies_gateway() {
+        let t = tproxy("mode = \"tproxy\", bypass_router = true");
+        assert!(t.bypass_router(), "raw bypass flag");
+        assert!(t.gateway(), "bypass_router alone must imply gateway mode");
+
+        let t = tproxy("mode = \"tproxy\", gateway = true");
+        assert!(t.gateway());
+        assert!(!t.bypass_router(), "gateway alone does not imply bypass");
+
+        let t = tproxy("mode = \"tproxy\", gateway = true, bypass_router = true");
+        assert!(t.gateway() && t.bypass_router());
+
+        let t = tproxy("mode = \"tproxy\"");
+        assert!(!t.gateway() && !t.bypass_router());
+    }
+}

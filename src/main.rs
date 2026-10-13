@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use std::net::ToSocketAddrs;
 use lib::config::{Config, Kind, Protocol};
 use lib::kcp::connector::KcpConnector;
 use lib::{connector, generate_key_and_cert_pem};
+use std::net::ToSocketAddrs;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -71,12 +71,7 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
             let upstreams: Vec<std::net::SocketAddr> = server_dns
                 .as_ref()
                 .and_then(|d| d.upstream.as_ref())
-                .map(|o| {
-                    o.to_vec()
-                        .iter()
-                        .filter_map(|s| s.parse().ok())
-                        .collect()
-                })
+                .map(|o| o.to_vec().iter().filter_map(|s| s.parse().ok()).collect())
                 .unwrap_or_default();
             if !upstreams.is_empty() {
                 log::info!("dns: server upstreams (racing): {upstreams:?}");
@@ -90,7 +85,8 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
             let tls = tls.unwrap_or(true);
             match protocol {
                 Protocol::Quic => {
-                    let connector = lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
+                    let connector =
+                        lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
                     let key_cert = match (key, ca) {
                         (Some(key), Some(cert)) => (key.into(), cert.into()),
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
@@ -106,7 +102,8 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                     server.run().await?;
                 }
                 Protocol::Kcp => {
-                    let connector = lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
+                    let connector =
+                        lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
                     let key_cert = match (key, ca) {
                         (Some(key), Some(cert)) => (key.into(), cert.into()),
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
@@ -123,18 +120,14 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                     server.run().await?;
                 }
                 Protocol::Tcp => {
-                    let connector = lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
+                    let connector =
+                        lib::dispatch::DispatchConnector::with_resolver(resolver.clone());
                     let key_cert = match (key, ca) {
                         (Some(key), Some(cert)) => (key.into(), cert.into()),
                         (_, _) => generate_key_and_cert_pem("tls", "org", "examples")?,
                     };
                     let server = lib::tcp::listener::Server::new(
-                        connector,
-                        key_cert,
-                        port,
-                        password,
-                        bandwidth,
-                        tls,
+                        connector, key_cert, port, password, bandwidth, tls,
                     )?;
                     server.run().await?;
                 }
@@ -178,9 +171,9 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                             quic_tuning.clone(),
                         )
                         .await?;
-                        Ok(lib::tunnel::TunnelConnector::Quic(connector::QuicConnector::new(
-                            quic_client,
-                        )))
+                        Ok(lib::tunnel::TunnelConnector::Quic(
+                            connector::QuicConnector::new(quic_client),
+                        ))
                     }
                     lib::config::Protocol::Kcp => {
                         let c = KcpConnector::new(
@@ -241,9 +234,7 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
                 Some("direct") | Some("proxy") | None => None,
                 Some(name) => Some(name),
             };
-            let known_targets = routing_ref
-                .map(|r| r.tunnel_targets())
-                .unwrap_or_default();
+            let known_targets = routing_ref.map(|r| r.tunnel_targets()).unwrap_or_default();
             let pool = lib::tunnel::ProxyPool::build(entries, groups, pool_default, &known_targets)
                 .map_err(|e| anyhow::anyhow!("server/group config: {}", e))?;
             pool.log_layout();
@@ -374,12 +365,7 @@ async fn run_client(
     let direct_dns: Vec<std::net::SocketAddr> = routing_cfg
         .direct_dns
         .as_ref()
-        .map(|o| {
-            o.to_vec()
-                .iter()
-                .filter_map(|s| s.parse().ok())
-                .collect()
-        })
+        .map(|o| o.to_vec().iter().filter_map(|s| s.parse().ok()).collect())
         .unwrap_or_default();
     if !direct_dns.is_empty() {
         log::info!("routing: direct resolvers (racing): {direct_dns:?}");
@@ -404,10 +390,9 @@ async fn run_client(
         .and_then(lib::dns::AaaaMode::parse)
         .unwrap_or(lib::dns::AaaaMode::Auto);
     // fake-ip exceptions: these domains get REAL answers (STUN/NTP/…)
-    let fakeip_filter: std::sync::Arc<std::sync::RwLock<Vec<String>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(
-            routing_cfg.fakeip_filter.clone().unwrap_or_default(),
-        ));
+    let fakeip_filter: std::sync::Arc<std::sync::RwLock<Vec<String>>> = std::sync::Arc::new(
+        std::sync::RwLock::new(routing_cfg.fakeip_filter.clone().unwrap_or_default()),
+    );
     {
         let f = fakeip_filter.read().unwrap();
         if !f.is_empty() {
@@ -426,8 +411,11 @@ async fn run_client(
             }
         });
     }
-    log::info!("routing: default={:?} rules={} aaaa={aaaa:?}",
-        routing_cfg.default, routing_cfg.rule.len());
+    log::info!(
+        "routing: default={:?} rules={} aaaa={aaaa:?}",
+        routing_cfg.default,
+        routing_cfg.rule.len()
+    );
 
     // TUN mode: full userspace stack, no iptables at all.
     #[cfg(feature = "tun-mode")]
@@ -452,7 +440,9 @@ async fn run_client(
         _ => None,
     };
     let tcp6_listener = match mode {
-        TproxyMode::Tproxy if lib::tproxy::rules::v6_plane_wanted() => lib::tproxy::bind6(tproxy.tcp_port).ok(),
+        TproxyMode::Tproxy if lib::tproxy::rules::v6_plane_wanted() => {
+            lib::tproxy::bind6(tproxy.tcp_port).ok()
+        }
         _ => None,
     };
     let udp_interceptor = match mode {
@@ -477,7 +467,11 @@ async fn run_client(
     if mode == TproxyMode::Tproxy && tproxy.dns_port() != 0 {
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            pool.connect(None, lib::socks5::proto::Addr::SocketAddr("127.0.0.1:1".parse().unwrap()), None),
+            pool.connect(
+                None,
+                lib::socks5::proto::Addr::SocketAddr("127.0.0.1:1".parse().unwrap()),
+                None,
+            ),
         )
         .await;
         log::info!("tunnel warmed up for DNS interceptor");
@@ -520,10 +514,20 @@ async fn run_client(
     let mut socks_task = tokio::spawn(async move { socks.run().await });
 
     if let Some(l) = tcp_listener {
-        tokio::spawn(lib::tproxy::serve(l, pool.clone(), router.clone(), bandwidth));
+        tokio::spawn(lib::tproxy::serve(
+            l,
+            pool.clone(),
+            router.clone(),
+            bandwidth,
+        ));
     }
     if let Some(l6) = tcp6_listener {
-        tokio::spawn(lib::tproxy::serve6(l6, pool.clone(), router.clone(), bandwidth));
+        tokio::spawn(lib::tproxy::serve6(
+            l6,
+            pool.clone(),
+            router.clone(),
+            bandwidth,
+        ));
     }
     let udp_router = lib::udp::UdpRouter {
         fake_map: fake_map.clone(),
@@ -560,7 +564,9 @@ async fn run_client(
                 let Some(d) = sock else { continue };
                 match tproxy.dns_mode() {
                     "fakeip" => {
-                        log::info!("dns[{label}]: fakeip mode (aaaa={aaaa:?}, v6_intercept={v6_active})");
+                        log::info!(
+                            "dns[{label}]: fakeip mode (aaaa={aaaa:?}, v6_intercept={v6_active})"
+                        );
                         tokio::spawn(lib::dns::serve_client_fakeip(
                             d,
                             fake_map.clone(),

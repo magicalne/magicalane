@@ -32,7 +32,9 @@ pub struct LocalConnector {
 
 impl LocalConnector {
     pub fn new(resolver: std::sync::Arc<crate::dns::resolve::Resolver>) -> Self {
-        Self { resolver: Some(resolver) }
+        Self {
+            resolver: Some(resolver),
+        }
     }
 }
 

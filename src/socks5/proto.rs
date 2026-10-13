@@ -233,7 +233,6 @@ impl Reply {
 pub struct Decoder;
 
 impl Decoder {
-
     /// RFC 1929 subnegotiation request: VER ULEN UNAME PLEN PASSWD.
     pub fn parse_username_password(buf: &[u8]) -> Result<(&[u8], &[u8])> {
         if buf.len() < 2 || buf[0] != 0x01 {

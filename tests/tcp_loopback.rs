@@ -18,14 +18,20 @@ use tokio::{
 };
 
 fn temp_files(name: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("magicalane-tcp-test-{name}-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("magicalane-tcp-test-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    (dir.join("server.pem"), dir.join("server.key"), dir.join("ca.pem"))
+    (
+        dir.join("server.pem"),
+        dir.join("server.key"),
+        dir.join("ca.pem"),
+    )
 }
 
 /// Self-signed cert for "localhost", written to the given paths.
 fn write_cert(cert_path: &PathBuf, key_path: &PathBuf) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
     std::fs::write(cert_path, cert.cert.pem()).unwrap();
     std::fs::write(key_path, cert.key_pair.serialize_pem()).unwrap();
 }
@@ -36,7 +42,9 @@ async fn echo_server() -> anyhow::Result<SocketAddr> {
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { continue };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                continue;
+            };
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -99,11 +107,7 @@ async fn tcp_transport_tls_loopback_echo() -> anyhow::Result<()> {
         b"sekret".to_vec(),
         true,
     )?;
-    let mut stream = Connector::connect(
-        &mut client,
-        Addr::SocketAddr(echo),
-    )
-    .await?;
+    let mut stream = Connector::connect(&mut client, Addr::SocketAddr(echo)).await?;
 
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     stream.write_all(&payload).await?;

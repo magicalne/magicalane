@@ -76,7 +76,9 @@ impl FakeIpMap {
     /// Whether `ip` is inside the fake v6 pool.
     pub fn is_fake_v6(ip: IpAddr) -> bool {
         match ip {
-            IpAddr::V6(v6) => (u128::from(v6) >> FAKE_V6_PREFIX) == (FAKE_V6_BASE >> FAKE_V6_PREFIX),
+            IpAddr::V6(v6) => {
+                (u128::from(v6) >> FAKE_V6_PREFIX) == (FAKE_V6_BASE >> FAKE_V6_PREFIX)
+            }
             IpAddr::V4(_) => false,
         }
     }
@@ -98,8 +100,15 @@ impl FakeIpMap {
         }
         let ip = loop {
             let n = inner.v4_next;
-            inner.v4_next = if n >= FAKE_V4_RANGE.1 { FAKE_V4_RANGE.0 + 1 } else { n + 1 };
-            if !inner.ip_to_domain.contains_key(&IpAddr::V4(Ipv4Addr::from(n))) {
+            inner.v4_next = if n >= FAKE_V4_RANGE.1 {
+                FAKE_V4_RANGE.0 + 1
+            } else {
+                n + 1
+            };
+            if !inner
+                .ip_to_domain
+                .contains_key(&IpAddr::V4(Ipv4Addr::from(n)))
+            {
                 break Ipv4Addr::from(n);
             }
         };
@@ -124,7 +133,10 @@ impl FakeIpMap {
             } else {
                 n + 1
             };
-            if !inner.ip_to_domain.contains_key(&IpAddr::V6(Ipv6Addr::from(n))) {
+            if !inner
+                .ip_to_domain
+                .contains_key(&IpAddr::V6(Ipv6Addr::from(n)))
+            {
                 break Ipv6Addr::from(n);
             }
         };
@@ -161,7 +173,9 @@ fn insert(inner: &mut Inner, domain: String, ip: IpAddr) {
     if inner.domain_to_ip.len() >= inner.capacity {
         // Evict oldest until below capacity.
         while inner.domain_to_ip.len() >= inner.capacity {
-            let Some(victim) = inner.lru.pop_front() else { break };
+            let Some(victim) = inner.lru.pop_front() else {
+                break;
+            };
             if let Some(vip) = inner.domain_to_ip.remove(&victim) {
                 inner.ip_to_domain.remove(&vip);
             }
@@ -171,7 +185,6 @@ fn insert(inner: &mut Inner, domain: String, ip: IpAddr) {
     inner.ip_to_domain.insert(ip, domain.clone());
     inner.lru.push_back(domain);
 }
-
 
 impl FakeIpMap {
     /// Persist the map: one "ip domain" line per entry (atomic tmp+rename).
@@ -191,13 +204,19 @@ impl FakeIpMap {
     /// Load a previously saved map; allocators resume after the highest
     /// token. Returns the number of restored entries.
     pub fn load(&self, path: &str) -> usize {
-        let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return 0;
+        };
         let mut inner = self.inner.lock().unwrap();
         let mut n = 0;
         for line in text.lines() {
             let mut it = line.splitn(2, ' ');
-            let (Some(ip), Some(domain)) = (it.next(), it.next()) else { continue };
-            let Ok(ip) = ip.parse::<IpAddr>() else { continue };
+            let (Some(ip), Some(domain)) = (it.next(), it.next()) else {
+                continue;
+            };
+            let Ok(ip) = ip.parse::<IpAddr>() else {
+                continue;
+            };
             if domain.is_empty() {
                 continue;
             }
@@ -222,7 +241,8 @@ impl FakeIpMap {
                 }
                 IpAddr::V6(v6) => {
                     let num = u128::from(v6);
-                    if num >= inner.v6_next && num <= FAKE_V6_BASE | ((1u128 << FAKE_V6_PREFIX) - 1) {
+                    if num >= inner.v6_next && num <= FAKE_V6_BASE | ((1u128 << FAKE_V6_PREFIX) - 1)
+                    {
                         inner.v6_next = num + 1;
                     }
                 }
@@ -265,7 +285,10 @@ mod tests {
         assert_eq!(a, m.assign_v6("twitter.com"));
         assert!(FakeIpMap::is_fake_v6(IpAddr::V6(a)));
         let text = a.to_string();
-        assert!(text.starts_with("fc00:"), "v6 tokens live in fc00::/18: {text}");
+        assert!(
+            text.starts_with("fc00:"),
+            "v6 tokens live in fc00::/18: {text}"
+        );
     }
 
     #[test]
@@ -312,9 +335,9 @@ mod tests {
     #[test]
     fn real_ips_are_not_fake() {
         assert!(!FakeIpMap::is_fake(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!FakeIpMap::is_fake(
-            IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap())
-        ));
+        assert!(!FakeIpMap::is_fake(IpAddr::V6(
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap()
+        )));
         assert!(!FakeIpMap::is_fake(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

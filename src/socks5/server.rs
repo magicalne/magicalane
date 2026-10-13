@@ -26,9 +26,13 @@ impl<C> Server<C> {
         bandwidth: usize,
     ) -> Result<Self> {
         let port = port.unwrap_or(1080);
-        let host = bind
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| if allow_lan { "0.0.0.0".into() } else { "127.0.0.1".into() });
+        let host = bind.map(|s| s.to_string()).unwrap_or_else(|| {
+            if allow_lan {
+                "0.0.0.0".into()
+            } else {
+                "127.0.0.1".into()
+            }
+        });
         let socket_addr = (host.as_str(), port);
         let listener = TcpListener::bind(&socket_addr).await?;
         info!(

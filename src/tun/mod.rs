@@ -120,7 +120,11 @@ impl TxToken for PhyTx {
         let mut off = 0;
         while off < buf.len() {
             let n = unsafe {
-                libc::write(self.fd, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off)
+                libc::write(
+                    self.fd,
+                    buf[off..].as_ptr() as *const libc::c_void,
+                    buf.len() - off,
+                )
             };
             if n <= 0 {
                 break; // WouldBlock: drop (TCP retransmits)
@@ -135,11 +139,19 @@ impl Device for TunPhy {
     type RxToken<'a> = PhyRx;
     type TxToken<'a> = PhyTx;
 
-    fn receive(&mut self, _t: smoltcp::time::Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _t: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.rx_queue.is_empty() {
             return None;
         }
-        Some((PhyRx { buf: self.rx_queue.remove(0) }, PhyTx { fd: self.fd }))
+        Some((
+            PhyRx {
+                buf: self.rx_queue.remove(0),
+            },
+            PhyTx { fd: self.fd },
+        ))
     }
     fn transmit(&mut self, _t: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
         Some(PhyTx { fd: self.fd })
@@ -183,8 +195,6 @@ pub struct TunStream {
     to_stack: tokio::sync::mpsc::Sender<Vec<u8>>,
     write_space: Arc<Notify>,
 }
-
-
 
 impl AsyncRead for TunStream {
     fn poll_read(
@@ -234,10 +244,16 @@ impl AsyncWrite for TunStream {
             ))),
         }
     }
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> TaskPoll<io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> TaskPoll<io::Result<()>> {
         TaskPoll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> TaskPoll<io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> TaskPoll<io::Result<()>> {
         TaskPoll::Ready(Ok(()))
     }
 }
@@ -272,13 +288,21 @@ pub async fn serve(
     routes::tun_apply(TUN_NAME, TUN_ADDR, TUN_ADDR6, &server_ips)?;
     info!("tun: {TUN_NAME} up ({TUN_ADDR}/{TUN_ADDR6}); default route via {TUN_NAME}");
 
-    let async_fd = tokio::io::unix::AsyncFd::new(unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) })?;
-    let mut phy = TunPhy { fd, rx_queue: Vec::new() };
+    let async_fd =
+        tokio::io::unix::AsyncFd::new(unsafe { std::fs::File::from_raw_fd(libc::dup(fd)) })?;
+    let mut phy = TunPhy {
+        fd,
+        rx_queue: Vec::new(),
+    };
 
     let cfg = IfaceConfig::new(HardwareAddress::Ip);
     let mut iface = Interface::new(cfg, &mut phy, smoltcp::time::Instant::from_millis(0));
     iface.update_ip_addrs(|a| {
-        a.push(IpCidr::new(IpAddress::Ipv4(Ipv4Addr::new(198, 18, 255, 254)), 32)).ok();
+        a.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Addr::new(198, 18, 255, 254)),
+            32,
+        ))
+        .ok();
         a.push(IpCidr::new(
             IpAddress::Ipv6("fc00:ffff:ffff:fffe::1".parse::<Ipv6Addr>().unwrap()),
             128,
@@ -336,7 +360,9 @@ pub async fn serve(
         // ---- pump app->stack channel data into TCP sockets
         let keys: Vec<FlowKey> = tcp_flows.keys().cloned().collect();
         for k in keys {
-            let Some(flow) = tcp_flows.get_mut(&k) else { continue };
+            let Some(flow) = tcp_flows.get_mut(&k) else {
+                continue;
+            };
             let mut woke = false;
             while let Ok(data) = flow.to_stack.try_recv() {
                 let sock = sockets.get_mut::<TcpSocket>(flow.handle);
@@ -385,7 +411,9 @@ pub async fn serve(
         // ---- TCP sockets -> app channels; close detection
         let keys: Vec<FlowKey> = tcp_flows.keys().cloned().collect();
         for k in keys {
-            let Some(flow) = tcp_flows.get_mut(&k) else { continue };
+            let Some(flow) = tcp_flows.get_mut(&k) else {
+                continue;
+            };
             {
                 let sock = sockets.get_mut::<TcpSocket>(flow.handle);
                 let mut q = flow.from_stack.lock().unwrap();
@@ -412,7 +440,9 @@ pub async fn serve(
         // ---- UDP: relay channels both ways
         let keys: Vec<FlowKey> = udp_flows.keys().cloned().collect();
         for k in keys {
-            let Some(flow) = udp_flows.get_mut(&k) else { continue };
+            let Some(flow) = udp_flows.get_mut(&k) else {
+                continue;
+            };
             // relay -> stack
             while let Ok((back_src, data)) = flow.from_relay.try_recv() {
                 let sock = sockets.get_mut::<UdpSocket>(flow.handle);
@@ -498,7 +528,10 @@ fn dispatch_ingress(
             let sport = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
             let dport = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
             let flags = pkt[off + 13];
-            let key = (SocketAddr::new(src_ip, sport), SocketAddr::new(dst_ip, dport));
+            let key = (
+                SocketAddr::new(src_ip, sport),
+                SocketAddr::new(dst_ip, dport),
+            );
             if flags & 0x12 == 0x02 && !tcp_flows.contains_key(&key) {
                 // New connection: listening socket on the ORIGINAL dst.
                 let rx = TcpBuffer::new(vec![0u8; 128 * 1024]);
@@ -546,7 +579,9 @@ fn dispatch_ingress(
             let dst = SocketAddr::new(dst_ip, dport);
             let key = (src, dst);
             let ulen = u16::from_be_bytes([pkt[off + 4], pkt[off + 5]]) as usize;
-            let payload = pkt.get(off + 8..off + ulen.min(pkt.len() - off)).unwrap_or(&[]);
+            let payload = pkt
+                .get(off + 8..off + ulen.min(pkt.len() - off))
+                .unwrap_or(&[]);
 
             if dport == 53 {
                 // Local fake-IP DNS: answer immediately via a flow socket.
@@ -572,7 +607,13 @@ fn dispatch_ingress(
                 let (to_relay_tx, to_relay_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                 let (from_relay_tx, from_relay_rx) =
                     tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(64);
-                spawn_udp_relay(key, to_relay_rx, from_relay_tx, router.clone(), pool.clone());
+                spawn_udp_relay(
+                    key,
+                    to_relay_rx,
+                    from_relay_tx,
+                    router.clone(),
+                    pool.clone(),
+                );
                 ensure_udp_flow(
                     sockets,
                     udp_flows,
@@ -612,14 +653,8 @@ fn ensure_udp_flow(
         return;
     }
     let mut sock = UdpSocket::new(
-        PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; 16],
-            vec![0u8; 65535 * 2],
-        ),
-        PacketBuffer::new(
-            vec![PacketMetadata::EMPTY; 16],
-            vec![0u8; 65535 * 2],
-        ),
+        PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0u8; 65535 * 2]),
+        PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0u8; 65535 * 2]),
     );
     if sock.bind(to_smoltcp_ep(bind_dst)).is_err() {
         warn!("tun: udp bind {bind_dst} failed");
@@ -648,19 +683,14 @@ fn spawn_tcp_relay(
         let dst = key.1;
         let (addr, decision) = route_dst(&router, dst);
         match decision.action {
-            Action::Proxy => {
-                match pool
-                    .connect(decision.server.as_deref(), addr, None)
-                    .await
-                {
-                    Ok(remote) => {
-                        debug!("tun: relay {dst} tunneled");
-                        let proxy = Proxy::new(stream, remote, bandwidth);
-                        let _ = std::pin::pin!(proxy).await;
-                    }
-                    Err(e) => debug!("tun: relay {dst} tunnel failed: {e}"),
+            Action::Proxy => match pool.connect(decision.server.as_deref(), addr, None).await {
+                Ok(remote) => {
+                    debug!("tun: relay {dst} tunneled");
+                    let proxy = Proxy::new(stream, remote, bandwidth);
+                    let _ = std::pin::pin!(proxy).await;
                 }
-            }
+                Err(e) => debug!("tun: relay {dst} tunnel failed: {e}"),
+            },
             Action::Direct => match router.direct.connect(addr).await {
                 Ok(remote) => {
                     debug!("tun: relay {dst} direct");
@@ -795,12 +825,8 @@ fn parse_ip(pkt: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
             if pkt.len() < 48 {
                 return None;
             }
-            let src = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&pkt[8..24]).ok()?,
-            ));
-            let dst = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&pkt[24..40]).ok()?,
-            ));
+            let src = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[8..24]).ok()?));
+            let dst = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[24..40]).ok()?));
             Some((src, dst, pkt[6], 40))
         }
         _ => None,

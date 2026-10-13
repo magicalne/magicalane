@@ -117,9 +117,7 @@ impl Connector for DispatchConnector {
             }
             _ => {
                 let mut local = self.local.clone();
-                Box::pin(async move {
-                    local.connect(a).await.map(Remote::Tcp)
-                })
+                Box::pin(async move { local.connect(a).await.map(Remote::Tcp) })
             }
         }
     }

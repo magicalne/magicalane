@@ -14,11 +14,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::{
-    connector::Connector,
-    proxy::Proxy,
-    socks5::proto::Addr,
-};
+use crate::{connector::Connector, proxy::Proxy, socks5::proto::Addr};
 
 const MAX_HEAD: usize = 16 * 1024;
 
@@ -40,7 +36,10 @@ where
         let mut tmp = vec![0u8; 2048];
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client closed",
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > MAX_HEAD {
@@ -78,7 +77,9 @@ where
                     .ok()
                     .and_then(|v| String::from_utf8(v).ok())
                     .unwrap_or_default();
-                let Some((u, p)) = decoded.split_once(':') else { return false };
+                let Some((u, p)) = decoded.split_once(':') else {
+                    return false;
+                };
                 users.iter().any(|(uu, pp)| uu == u && pp == p)
             })
             .unwrap_or(false);
@@ -110,7 +111,9 @@ where
                 return Ok(());
             }
         };
-        stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await?;
         stream.flush().await?;
         let proxy = Proxy::new(stream, remote, bandwidth);
         let _ = std::pin::pin!(proxy).await;
@@ -121,7 +124,11 @@ where
     let (host, port) = match target.split_once("://") {
         Some((_, rest)) => {
             let authority = rest.split('/').next().unwrap_or("");
-            let default = if target.starts_with("https://") { 443 } else { 80 };
+            let default = if target.starts_with("https://") {
+                443
+            } else {
+                80
+            };
             match parse_host_port(authority, default) {
                 Some((h, p)) => (h, p),
                 None => {
@@ -221,13 +228,22 @@ mod tests {
 
     #[test]
     fn parses_host_port_forms() {
-        assert_eq!(parse_host_port("example.com:8080", 80), Some(("example.com".into(), 8080)));
-        assert_eq!(parse_host_port("example.com", 80), Some(("example.com".into(), 80)));
+        assert_eq!(
+            parse_host_port("example.com:8080", 80),
+            Some(("example.com".into(), 8080))
+        );
+        assert_eq!(
+            parse_host_port("example.com", 80),
+            Some(("example.com".into(), 80))
+        );
         assert_eq!(
             parse_host_port("[2001:db8::1]:443", 80),
             Some(("2001:db8::1".into(), 443))
         );
-        assert_eq!(parse_host_port("[2001:db8::2]", 80), Some(("2001:db8::2".into(), 80)));
+        assert_eq!(
+            parse_host_port("[2001:db8::2]", 80),
+            Some(("2001:db8::2".into(), 80))
+        );
         assert_eq!(parse_host_port("", 80), None);
         assert_eq!(parse_host_port("host:notaport", 80), None);
     }

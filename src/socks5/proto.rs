@@ -4,7 +4,6 @@ use std::{
 };
 
 use bytes::BufMut;
-use log::trace;
 
 use super::{Result, error::Error};
 
@@ -148,11 +147,14 @@ impl Addr {
                 3 => {
                     let size = buf.get(1).map(|l| -> usize { *l as usize });
                     if let Some(size) = size {
-                        trace!(
-                            "buf:[2+size]: {}, buf:[3+size]: {}",
-                            buf[2 + size],
-                            buf[3 + size]
-                        );
+                        // 1 type + 1 len + domain + 2 port: the frame may
+                        // still be incomplete (split across reads) — bounds
+                        // were checked blind here before, panicking the relay
+                        // task on truncated frames (production: index out of
+                        // bounds len=64 index=76, ~176/day).
+                        if buf.len() < 2 + size + 2 {
+                            return None;
+                        }
                         let port = (buf[2 + size] as u16) << 8 | (buf[3 + size] as u16);
                         Some(Self::DomainName(Vec::from(&buf[2..(2 + size)]), port))
                     } else {
@@ -162,6 +164,21 @@ impl Addr {
                 _ => None,
             })
             .ok_or(Error::InvalidAddress)
+    }
+
+    /// Total wire length of the address frame at the front of `buf`.
+    ///
+    /// `None` while the length cannot be determined yet (empty buffer, or
+    /// a domain frame without its size byte); callers can keep reading.
+    /// Unknown address types yield `Some(1)`: the frame is considered
+    /// complete and `Addr::new` rejects it as invalid.
+    pub fn encoded_len(buf: &[u8]) -> Option<usize> {
+        match buf.first()? {
+            1 => Some(1 + 4 + 2),
+            4 => Some(1 + 16 + 2),
+            3 => Some(1 + 1 + *buf.get(1)? as usize + 2),
+            _ => Some(1),
+        }
     }
 
     pub fn encode(&self, buf: &mut impl BufMut) {
@@ -309,5 +326,59 @@ impl Encoder {
         buf.put_u8(rep.encode());
         buf.put_u8(0x00); //reserved
         addr.encode(&mut buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression (2026-10-13, production quic server): a domain frame
+    // split across reads — a 77-byte frame whose first chunk was 64
+    // bytes — hit unchecked indexing here and panicked the relay task
+    // ("index out of bounds: the len is 64 but the index is 76"),
+    // killing that flow. ~176 panics/day on a lightly used server.
+    #[test]
+    fn domain_frame_truncated_never_panics() {
+        let domain =
+            "deepviz-nlb-prod-ap-southeast-1-f64fb66f5d07c49a.elb.ap-southeast-1.amazonaws.com";
+        // production instance of this frame: 73-byte domain, first
+        // read chunk 64 bytes -> "len is 64 but the index is 76"
+        let mut frame = Vec::new();
+        frame.push(3u8);
+        frame.push(domain.len() as u8);
+        frame.extend_from_slice(domain.as_bytes());
+        frame.extend_from_slice(&443u16.to_be_bytes());
+        assert!(frame.len() > 64, "regression frame must exceed one chunk");
+
+        let addr = Addr::new(&frame).expect("full frame decodes");
+        match addr {
+            Addr::DomainName(d, port) => {
+                assert_eq!(d, domain.as_bytes());
+                assert_eq!(port, 443);
+            }
+            other => panic!("expected domain, got {:?}", other),
+        }
+
+        // Every truncated prefix must be a clean error, never a panic.
+        for cut in 1..frame.len() {
+            assert!(
+                Addr::new(&frame[..cut]).is_err(),
+                "cut at {} must not decode",
+                cut
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_len_tracks_partial_frames() {
+        assert_eq!(Addr::encoded_len(&[]), None);
+        assert_eq!(Addr::encoded_len(&[1]), Some(7));
+        assert_eq!(Addr::encoded_len(&[4]), Some(19));
+        // domain: unknown until the size byte arrives
+        assert_eq!(Addr::encoded_len(&[3]), None);
+        assert_eq!(Addr::encoded_len(&[3, 5]), Some(9));
+        // unknown types are "complete" so callers fail via Addr::new
+        assert_eq!(Addr::encoded_len(&[9]), Some(1));
     }
 }

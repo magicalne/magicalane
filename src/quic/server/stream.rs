@@ -56,17 +56,41 @@ where
 
     fn poll_read_addr(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.buf.clear();
-        let n = ready!(poll_read_buf(
-            Pin::new(self.io.as_mut().unwrap()),
-            cx,
-            &mut self.buf
-        ))?;
-        trace!("Read addr: {:?}Bytes: {:?}", n, &self.buf[..n]);
-        let addr = Addr::new(self.buf.chunk())?;
-        trace!("read addr: {:?}", &addr);
-        self.connector_fut = Some(self.connector.connect(addr));
-        self.state = State::OpenRemote;
-        Poll::Ready(Ok(()))
+        // The address frame may arrive split across reads (long domains
+        // exceed common packet/chunk boundaries). Keep reading until
+        // `encoded_len` bytes are buffered before decoding; decoding a
+        // partial chunk used to panic (see `Addr::new`).
+        loop {
+            let complete = match Addr::encoded_len(&self.buf) {
+                // Complete enough to decode (unknown types decode to an
+                // error, not a panic — fall through).
+                Some(len) => self.buf.len() >= len,
+                None => false,
+            };
+            if complete {
+                let addr = Addr::new(self.buf.chunk())?;
+                trace!("read addr: {:?}", &addr);
+                self.connector_fut = Some(self.connector.connect(addr));
+                self.state = State::OpenRemote;
+                return Poll::Ready(Ok(()));
+            }
+            let n = ready!(poll_read_buf(
+                Pin::new(self.io.as_mut().unwrap()),
+                cx,
+                &mut self.buf
+            ))?;
+            trace!("Read addr: +{} bytes", n);
+            if n == 0 {
+                return Poll::Ready(Err(Error::StreamClose));
+            }
+            // 1 type + 1 len + 255 domain + 2 port: anything beyond is
+            // not a valid frame.
+            if self.buf.len() > 259 {
+                return Poll::Ready(Err(Error::from(
+                    crate::socks5::error::Error::InvalidAddress,
+                )));
+            }
+        }
     }
 
     fn poll_open_remote(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -158,5 +182,115 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::socks5::proto::Addr;
+    use futures::FutureExt;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
+
+    /// Serves its bytes one fixed chunk per read, whatever the caller's
+    /// buffer size — forces the split-read conditions of the regression.
+    struct ChunkedIo {
+        chunks: Vec<Vec<u8>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for ChunkedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let me = &mut *self;
+            match me.chunks.first_mut() {
+                None => Poll::Ready(Ok(())), // EOF
+                Some(chunk) => {
+                    let n = chunk.len().min(buf.remaining());
+                    buf.put_slice(&chunk[..n]);
+                    chunk.drain(..n);
+                    if chunk.is_empty() {
+                        me.chunks.remove(0);
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for ChunkedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockConnector {
+        seen: Arc<Mutex<Vec<Addr>>>,
+    }
+
+    impl Connector for MockConnector {
+        type Connection = DuplexStream;
+        fn connect(&mut self, a: Addr) -> BoxFuture<'static, io::Result<DuplexStream>> {
+            self.seen.lock().unwrap().push(a);
+            let (_tx_side_is_dropped_after_connect, rx) = tokio::io::duplex(64);
+            async move { Ok(rx) }.boxed()
+        }
+    }
+
+    // Regression (2026-10-13): a long-domain addr frame delivered as a
+    // 64-byte chunk followed by the remainder used to panic the relay
+    // task at Addr::new (socks5/proto.rs); with the full-frame wait the
+    // relay must connect to the right domain.
+    #[tokio::test]
+    async fn addr_frame_split_across_reads_still_connects() {
+        let domain =
+            "deepviz-nlb-prod-ap-southeast-1-f64fb66f5d07c49a.elb.ap-southeast-1.amazonaws.com";
+        let mut frame = vec![3u8, domain.len() as u8];
+        frame.extend_from_slice(domain.as_bytes());
+        frame.extend_from_slice(&443u16.to_be_bytes());
+
+        // split at the production-observed boundary: 64 then the rest
+        let mut chunks = vec![frame[..64].to_vec(), frame[64..].to_vec()];
+        chunks.push(Vec::new()); // EOF after the frame
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let io = ChunkedIo {
+            chunks,
+            written: written.clone(),
+        };
+        let connector = MockConnector {
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let stream = Stream::new(io, connector.clone(), 1 << 20);
+        stream.await.expect("relay must succeed");
+
+        let seen = connector.seen.lock().unwrap();
+        match &seen[0] {
+            Addr::DomainName(d, port) => {
+                assert_eq!(d.as_slice(), domain.as_bytes());
+                assert_eq!(*port, 443);
+            }
+            other => panic!("expected domain, got {:?}", other),
+        }
+        // success flag must have been written back
+        assert_eq!(written.lock().unwrap()[0], 0u8);
     }
 }

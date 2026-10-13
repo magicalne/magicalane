@@ -86,7 +86,14 @@ impl Default for KcpTuning {
 /// send_window = 16777216    # bytes; None keeps quinn's default
 /// receive_window = 16777216
 /// stream_receive_window = 8388608
+/// max_concurrent_bi_streams = 1024
 /// ```
+///
+/// `max_concurrent_bi_streams` caps simultaneously open relay
+/// streams per connection — every tunneled TCP connection is one
+/// bi-stream, so a LAN gateway serving several devices holds far more
+/// than quinn's stock 100; at the cap `open_bi` pends and every new
+/// connection silently hangs until older ones close. Default 1024.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QuicTuning {
     #[serde(default)]
@@ -97,6 +104,8 @@ pub struct QuicTuning {
     pub receive_window: Option<u64>,
     #[serde(default)]
     pub stream_receive_window: Option<u64>,
+    #[serde(default)]
+    pub max_concurrent_bi_streams: Option<u32>,
 }
 
 impl QuicTuning {

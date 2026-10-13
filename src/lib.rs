@@ -33,6 +33,16 @@ pub const ALPN_QUIC: &[&[u8]] = &[b"magicalane-1"];
 /// quinn's own (cubic congestion control, default windows).
 pub fn transport_config(tuning: Option<&config::QuicTuning>) -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
+    // Raised from quinn's stock 100: every relay is one bi-stream and a
+    // LAN gateway accumulates far more concurrent connections than that
+    // (browsers + several devices). At the cap open_bi() pends and new
+    // connections stall silently until older ones close — observed in
+    // production as intermittent ~minute-long outages of new flows.
+    tc.max_concurrent_bidi_streams(quinn::VarInt::from(
+        tuning
+            .and_then(|t| t.max_concurrent_bi_streams)
+            .unwrap_or(1024),
+    ));
     if let Some(t) = tuning {
         let factory: std::sync::Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
             match t.congestion_name() {

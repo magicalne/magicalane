@@ -46,10 +46,17 @@ where
         let me = &mut *self;
         match me.conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
-                let n = poll_fn(|cx| poll_read_buf(Pin::new(&mut recv), cx, &mut me.buf)).await?;
-                trace!("Read {:?}Bytes", n);
-                if n == 0 {
-                    return Err(Error::StreamClose);
+                // The password frame is [len][passwd] and may arrive split
+                // across reads; decoding a partial frame would look like a
+                // wrong password. Wait for one full frame (the length byte
+                // is validated by compare_passwd).
+                while me.buf.len() < me.passwd.len() + 1 {
+                    let n =
+                        poll_fn(|cx| poll_read_buf(Pin::new(&mut recv), cx, &mut me.buf)).await?;
+                    trace!("Read {:?}Bytes", n);
+                    if n == 0 {
+                        return Err(Error::StreamClose);
+                    }
                 }
                 let buf = me.buf.chunk();
                 let ret = compare_passwd(buf, &me.passwd);

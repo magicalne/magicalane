@@ -26,3 +26,4 @@ congestion = "bbr"          # cubic (default) | bbr | new-reno
 # send_window = 16777216
 # receive_window = 16777216
 # stream_receive_window = 8388608
+# max_concurrent_bi_streams = 1024  # open relays per conn; stock 100 stalls gateways

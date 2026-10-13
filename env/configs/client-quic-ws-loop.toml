@@ -1,0 +1,8 @@
+# Workstation-mode client mirroring the PRODUCTION gateway routing
+# (LAN subnet -> direct) for the UDP self-loop regression (issue #23):
+# any datagram addressed to our own udp_port must be dropped, never
+# relayed back to ourselves.
+password = "test-password"
+bandwidth = 65536
+verbose = true
+kind = { Client = { proxy = { host = "magicalane-server", port = 4433, ca_path = "/etc/magicalane/certs/ca.pem", protocol = "quic" }, socks5_port = 1082, tproxy = { mode = "tproxy", tcp_port = 7897, udp_port = 7898, dns_port = 15355, dns_mode = "fakeip" }, routing = { default = "proxy", aaaa = "auto", rule = [ { ip_cidr = ["10.89.0.0/16"], action = "direct" } ] } } }

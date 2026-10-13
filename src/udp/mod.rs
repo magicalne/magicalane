@@ -46,6 +46,108 @@ pub fn magic_addr() -> crate::socks5::proto::Addr {
 
 const FLOW_IDLE: Duration = Duration::from_secs(60);
 const MAX_DGRAM: usize = 65507;
+/// Hard cap on concurrent UDP flows. Legitimate LAN usage is hundreds
+/// (every device's QUIC/HTTP3, DNS, games); anything past a few
+/// thousand is a runaway class (e.g. a self-relaying loop) — dropping
+/// new flows bounds the damage instead of eating every fd and ~2GB of
+/// heap like the 2026-10 production storm (issue #23).
+const MAX_FLOWS: usize = 4096;
+
+// ---------------------------------------------------------------- local nets
+
+/// Enumerate local interface addresses via getifaddrs(3): every IP plus
+/// each IPv4 subnet's directed-broadcast address (addr | !netmask).
+/// No-op-safe: unavailable or empty → empty vec (checks degrade to the
+/// always-on port/multicast rules only).
+pub fn local_nets() -> (Vec<IpAddr>, Vec<Ipv4Addr>) {
+    let mut ips = Vec::new();
+    let mut broadcasts = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return (ips, broadcasts);
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                        ips.push(IpAddr::V4(ip));
+                        if !ifa.ifa_netmask.is_null() {
+                            let nm = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                            let mask = u32::from_be(nm.sin_addr.s_addr);
+                            let bcast = Ipv4Addr::from(u32::from(ip) | !mask);
+                            if bcast != ip {
+                                broadcasts.push(bcast);
+                            }
+                        }
+                    }
+                    libc::AF_INET6 => {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        ips.push(IpAddr::V6(std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    (ips, broadcasts)
+}
+
+/// Why a datagram was refused at interception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// dst is (a local IP, our own listen port): relaying it means the
+    /// direct/tunnel sender targets our own interceptor → infinite
+    /// self-relay chain (each hop = new flow, new fd, 64KiB buffer).
+    SelfDestined,
+    /// multicast / (directed-)broadcast dst: never legitimate to relay
+    /// (connect() to broadcast fails EPERM anyway — the old behavior
+    /// minted a doomed flow task per LAN mDNS packet, forever).
+    NonUnicast,
+    /// flow table full (MAX_FLOWS): refuse new flows, keep existing.
+    FlowCap,
+}
+
+impl DropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DropReason::SelfDestined => "self-destined",
+            DropReason::NonUnicast => "non-unicast",
+            DropReason::FlowCap => "flow-cap",
+        }
+    }
+}
+
+/// Pure decision core (unit-tested): should a datagram with original
+/// destination `dst` be dropped instead of becoming a flow?
+fn drop_reason(
+    dst: &SocketAddr,
+    listen_port: u16,
+    local_ips: &[IpAddr],
+    broadcasts: &[Ipv4Addr],
+    flows_len: usize,
+) -> Option<DropReason> {
+    let ip = dst.ip();
+    if dst.port() == listen_port && local_ips.contains(&ip) {
+        return Some(DropReason::SelfDestined);
+    }
+    if ip.is_multicast()
+        || ip == IpAddr::V4(Ipv4Addr::BROADCAST)
+        || matches!(ip, IpAddr::V4(v4) if broadcasts.contains(&v4))
+    {
+        return Some(DropReason::NonUnicast);
+    }
+    if flows_len >= MAX_FLOWS {
+        return Some(DropReason::FlowCap);
+    }
+    None
+}
 
 // ---------------------------------------------------------------- raw recvmsg
 
@@ -129,6 +231,45 @@ pub struct UdpInterceptor {
     sock: Arc<UdpSocket>,
     flows: StdMutex<HashMap<FlowKey, mpsc::Sender<Vec<u8>>>>,
     last_used: StdMutex<HashMap<FlowKey, Instant>>,
+    /// Our own listen port + the host's addresses: datagrams addressed
+    /// to (local ip, this port) are aimed at the interceptor itself and
+    /// must be dropped, never relayed (self-relay storm, issue #23).
+    listen_port: u16,
+    local_ips: Vec<IpAddr>,
+    /// Directed-broadcast addresses of local subnets (drop, never relay).
+    broadcasts: Vec<Ipv4Addr>,
+    /// Drops per reason since process start (for rate-limited logging).
+    dropped: StdMutex<[u64; 3]>,
+}
+
+impl UdpInterceptor {
+    /// Classify `dst`; on drop, log rate-limited (first, then every
+    /// 1000th) and return the reason.
+    fn consider(&self, dst: &SocketAddr) -> Option<DropReason> {
+        let flows_len = self.flows.lock().unwrap().len();
+        let reason = drop_reason(
+            dst,
+            self.listen_port,
+            &self.local_ips,
+            &self.broadcasts,
+            flows_len,
+        )?;
+        let idx = match reason {
+            DropReason::SelfDestined => 0,
+            DropReason::NonUnicast => 1,
+            DropReason::FlowCap => 2,
+        };
+        let mut dropped = self.dropped.lock().unwrap();
+        dropped[idx] += 1;
+        if dropped[idx] == 1 || dropped[idx] % 1000 == 0 {
+            warn!(
+                "udp: dropped {} datagram to {dst} (total {})",
+                reason.as_str(),
+                dropped[idx]
+            );
+        }
+        Some(reason)
+    }
 }
 
 pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
@@ -164,10 +305,15 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp interceptor listening on {addr}");
+    let (local_ips, broadcasts) = local_nets();
     Ok(Arc::new(UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
         last_used: StdMutex::new(HashMap::new()),
+        listen_port: port,
+        local_ips,
+        broadcasts,
+        dropped: StdMutex::new([0; 3]),
     }))
 }
 
@@ -211,10 +357,16 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp6 interceptor listening on {addr}");
+    let (local_ips, _) = local_nets();
+    let local_ips: Vec<IpAddr> = local_ips.into_iter().filter(|ip| ip.is_ipv6()).collect();
     Ok(Arc::new(UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
         last_used: StdMutex::new(HashMap::new()),
+        listen_port: port,
+        local_ips,
+        broadcasts: Vec::new(),
+        dropped: StdMutex::new([0; 3]),
     }))
 }
 
@@ -285,6 +437,15 @@ pub async fn serve_client(
             }
         };
         let key = (src, dst);
+        // Refuse datagrams that must never become flows: self-destined
+        // (addressed to this interceptor; relaying = infinite loop,
+        // each hop a new task + fd + 64KiB buffer until fd exhaustion —
+        // the production GB/day RSS ratchet, issue #23), non-unicast,
+        // and beyond the flow cap. Checked BEFORE any map insert so a
+        // dropped class leaves no state behind.
+        if interceptor.consider(&dst).is_some() {
+            continue;
+        }
         interceptor
             .last_used
             .lock()
@@ -706,5 +867,120 @@ impl AsyncWrite for UdpFramedStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 89, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V6("fd00::1".parse().unwrap()),
+        ]
+    }
+
+    fn broadcasts() -> Vec<Ipv4Addr> {
+        vec![
+            Ipv4Addr::new(10, 89, 0, 255),
+            Ipv4Addr::new(192, 168, 0, 255),
+        ]
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Regression (2026-10-13, issue #23): a datagram addressed to our
+    /// own interceptor port on a local IP used to be relayed "direct"
+    /// back to the same port — a self-sustaining chain that minted a
+    /// flow task (fd + 64KiB buffer) per hop until fd exhaustion,
+    /// ~28k hops per storm, GBs of transient heap retained by glibc
+    /// arenas. It must be dropped at interception instead.
+    #[test]
+    fn self_destined_datagram_is_dropped() {
+        let ips = local_ips();
+        let bcasts = broadcasts();
+        // our port on our IP (the storm case, v4 and v6)
+        assert_eq!(
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, 0),
+            Some(DropReason::SelfDestined)
+        );
+        assert_eq!(
+            drop_reason(&sa("[fd00::1]:7896"), 7896, &ips, &bcasts, 0),
+            Some(DropReason::SelfDestined)
+        );
+        // same IP but a different port = some other local service:
+        // relaying to it is legitimate (hairpin to the LAN web UI etc.)
+        assert_eq!(
+            drop_reason(&sa("10.89.0.5:80"), 7896, &ips, &bcasts, 0),
+            None
+        );
+        // our port on a foreign IP = an upstream service that happens to
+        // use the same port number; must NOT be dropped
+        assert_eq!(
+            drop_reason(&sa("8.8.8.8:7896"), 7896, &ips, &bcasts, 0),
+            None
+        );
+    }
+
+    /// Regression (issue #23 acceptance): LAN mDNS/WSD broadcast and
+    /// multicast datagrams must never become flows — the old code
+    /// spawned a doomed direct flow per packet (connect to broadcast =
+    /// EPERM, retried every packet forever: "udp direct connect
+    /// 192.168.0.255:5353 failed" every ~5s in production logs).
+    #[test]
+    fn broadcast_and_multicast_are_dropped() {
+        let ips = local_ips();
+        let bcasts = broadcasts();
+        for dst in [
+            "224.0.0.251:5353",      // mDNS multicast
+            "239.255.255.250:1900",  // SSDP multicast
+            "255.255.255.255:58866", // limited broadcast
+            "192.168.0.255:5353",    // directed broadcast (prod case)
+            "10.89.0.255:5353",      // directed broadcast, other subnet
+            "[ff02::fb]:5353",       // mDNS v6 multicast
+        ] {
+            assert_eq!(
+                drop_reason(&sa(dst), 7896, &ips, &bcasts, 0),
+                Some(DropReason::NonUnicast),
+                "{dst} must be dropped as non-unicast"
+            );
+        }
+        // plain unicast passes
+        assert_eq!(drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, 0), None);
+    }
+
+    /// The flow cap bounds any future runaway class: at MAX_FLOWS every
+    /// new flow is refused instead of eating fds.
+    #[test]
+    fn flow_cap_refuses_new_flows() {
+        let ips = local_ips();
+        let bcasts = broadcasts();
+        assert_eq!(
+            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, MAX_FLOWS),
+            Some(DropReason::FlowCap)
+        );
+        assert_eq!(
+            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, MAX_FLOWS - 1),
+            None
+        );
+        // self-destined wins even when there is flow budget left
+        assert_eq!(
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, 0),
+            Some(DropReason::SelfDestined)
+        );
+    }
+
+    /// local_nets parses real interfaces (smoke: loopback must appear).
+    #[test]
+    fn local_nets_contains_loopback() {
+        let (ips, _) = local_nets();
+        assert!(
+            ips.iter().any(|ip| ip.is_loopback()),
+            "no loopback in {ips:?}"
+        );
     }
 }

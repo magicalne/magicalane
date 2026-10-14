@@ -254,11 +254,14 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     nat.push_str("-A MGL-NAT -d 224.0.0.0/4 -j RETURN\n");
     nat.push_str("-A MGL-NAT -d 255.255.255.255/32 -j RETURN\n");
     // Our own transparent TCP port as a DESTINATION is the interceptor
-    // itself: intercepting it means relaying back into our own listener
-    // (self-loop class; the UDP variant of this loop was the production
-    // fd-exhaustion storm, issue #23). Scoped to LOCAL destinations
-    // (-m addrtype) so a remote service that happens to use the same
-    // port number is still intercepted and follows configured routing.
+    // itself: intercepting it just round-trips the packet through the
+    // transparent plane back into the same wildcard listener. Scoped to
+    // LOCAL destinations (-m addrtype) so a remote service that happens
+    // to use the same port number is still intercepted and follows
+    // configured routing. NOTE: this rule alone does NOT stop the TCP
+    // self-relay class — the authoritative guard is the user-space
+    // self-destination rejection in tproxy::serve/serve6 (see
+    // lib::udp::is_self_destined), the TCP twin of the UDP drop.
     nat.push_str(&format!(
         "-A {CHAIN_NAT} -p tcp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
         spec.tcp_port
@@ -415,11 +418,12 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         }
         // Our own interception ports as DESTINATIONS: never intercept
         // (the UDP storm of 2026-10 relaid datagrams to our own
-        // udp_port until fd exhaustion; the TCP twin of that loop,
-        // plus port-scan noise, dies here too). Scoped to LOCAL
-        // destinations so remote services on the same ports stay
-        // intercepted. The user-space drop in lib::udp remains the
-        // authoritative guard.
+        // udp_port until fd exhaustion). Scoped to LOCAL destinations
+        // so remote services on the same ports stay intercepted. The
+        // authoritative self-relay guards live in user space:
+        // lib::udp::drop_reason (UDP) and tproxy::serve/serve6 via
+        // lib::udp::is_self_destined (TCP), covering both gateway and
+        // v6 paths independent of rule ordering.
         blob.push_str(&format!(
             "-A MGL-PRE -p tcp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
             spec.tcp_port

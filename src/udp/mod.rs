@@ -199,6 +199,23 @@ fn drop_reason(
     None
 }
 
+/// Whether `dst` is this host's own (local IP, `listen_port`) — the TCP
+/// transparent listener's twin of the UDP self-destination guard: a
+/// connection whose original destination is the interceptor itself
+/// must never be relayed (the relay would reconnect into the listener;
+/// the UDP variant of that loop was the production storm, issue #23).
+/// Fail-closed: an enumeration error counts as self-destined (the
+/// suspicious class is never legitimate).
+pub fn is_self_destined(dst: &SocketAddr, listen_port: u16) -> bool {
+    let Ok((ips, _)) = local_nets() else {
+        return true;
+    };
+    matches!(
+        drop_reason(dst, listen_port, &ips, &[]),
+        Some(DropReason::SelfDestined)
+    )
+}
+
 // ---------------------------------------------------------------- raw recvmsg
 
 /// Receive one datagram with MSG_DONTWAIT, returning (n, src, orig_dst).
@@ -357,17 +374,21 @@ impl UdpInterceptor {
         Some(reason)
     }
 
-    /// Reserve a live flow-TASK slot for a new flow. The semaphore has
-    /// MAX_FLOWS permits; each spawned task owns one for its ENTIRE
-    /// lifetime (setup, relay, and any stall) — the flows-map length
-    /// is NOT the cap, because tasks can outlive their map entries
-    /// (zombies blocked in connect or on a silent stream, review
-    /// round 4). None = at the hard task cap, refuse the new flow.
-    fn try_flow_slot(self: &Arc<Self>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    /// Reserve a live flow-TASK slot for a new flow toward `dst`. The
+    /// semaphore has MAX_FLOWS permits; each spawned task owns one for
+    /// its ENTIRE lifetime (setup, relay, and any stall) — the
+    /// flows-map length is NOT the cap, because tasks can outlive their
+    /// map entries (zombies blocked in connect or on a silent stream,
+    /// review round 4). None = at the hard task cap, refuse the new
+    /// flow (logged with the real destination for operators).
+    fn try_flow_slot(
+        self: &Arc<Self>,
+        dst: &SocketAddr,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match Arc::clone(&self.flow_tasks).try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                self.note_drop(DropReason::FlowCap, &"0.0.0.0:0".parse().unwrap());
+                self.note_drop(DropReason::FlowCap, dst);
                 None
             }
         }
@@ -605,7 +626,7 @@ pub async fn serve_client(
                     // Hard live-task cap: the permit is owned for the
                     // task's full lifetime (setup + relay + stalls), so
                     // zombies count and replacements cannot bypass it.
-                    let Some(permit) = interceptor.try_flow_slot() else {
+                    let Some(permit) = interceptor.try_flow_slot(&dst) else {
                         continue;
                     };
                     let mut flows = interceptor.flows.lock().unwrap();
@@ -1149,19 +1170,20 @@ mod tests {
     async fn flow_task_slots_hard_cap_live_tasks() {
         let int = bind_client(0).expect("bind succeeds on a healthy host");
         let mut held = Vec::new();
+        let dst: SocketAddr = "1.2.3.4:53".parse().unwrap();
         for _ in 0..MAX_FLOWS {
             held.push(
-                int.try_flow_slot()
+                int.try_flow_slot(&dst)
                     .expect("permits available below the cap"),
             );
         }
         assert!(
-            int.try_flow_slot().is_none(),
+            int.try_flow_slot(&dst).is_none(),
             "at the cap, a new flow task must be refused"
         );
         drop(held);
         assert!(
-            int.try_flow_slot().is_some(),
+            int.try_flow_slot(&dst).is_some(),
             "finished tasks must return their slot"
         );
     }
@@ -1261,6 +1283,27 @@ mod tests {
     async fn bind_fails_closed_without_local_addresses() {
         let int = bind_client(0).expect("bind succeeds on a healthy host");
         assert!(!int.local_ips.lock().unwrap().is_empty());
+    }
+
+    /// Regression (issue #23 review round 5): the TCP transparent
+    /// listener needs the same self-destination guard as UDP — a conn
+    /// whose original dst is (local ip, listen port) is the interceptor
+    /// itself and must be refused. Remote services on the same port
+    /// number must stay relayed (round-2's addrtype guarantee).
+    #[test]
+    fn is_self_destined_classifies_correctly() {
+        assert!(
+            is_self_destined(&sa("127.0.0.1:7895"), 7895),
+            "own listener endpoint must be refused"
+        );
+        assert!(
+            !is_self_destined(&sa("8.8.8.8:7895"), 7895),
+            "remote service on the same port must stay relayed"
+        );
+        assert!(
+            !is_self_destined(&sa("127.0.0.1:80"), 7895),
+            "other local services are legitimate hairpin relays"
+        );
     }
 
     /// Regression (issue #23 review round 2): a FULL flow channel must

@@ -46,6 +46,175 @@ pub fn magic_addr() -> crate::socks5::proto::Addr {
 
 const FLOW_IDLE: Duration = Duration::from_secs(60);
 const MAX_DGRAM: usize = 65507;
+/// Hard cap on concurrent UDP flows. Legitimate LAN usage is hundreds
+/// (every device's QUIC/HTTP3, DNS, games); anything past a few
+/// thousand is a runaway class (e.g. a self-relaying loop) — dropping
+/// new flows bounds the damage instead of eating every fd and ~2GB of
+/// heap like the 2026-10 production storm (issue #23).
+const MAX_FLOWS: usize = 4096;
+
+// ---------------------------------------------------------------- local nets
+
+/// The directed-broadcast address of one IPv4 interface, or None.
+/// Pure core of the getifaddrs walk (unit-tested):
+/// - if the interface is a broadcast interface (IFF_BROADCAST) and the
+///   kernel provides `ifa_broadaddr`, use it;
+/// - else compute `addr | !netmask` - but only for prefixes shorter
+///   than /31: on an RFC 3021 `/31` the computation yields the PEER
+///   address, not a broadcast (dropping it would break the link), and
+///   a `/32` has no broadcast at all (the guard skips it too).
+fn broadcast_for(
+    addr: Ipv4Addr,
+    mask: u32,
+    flags: u32,
+    broadaddr: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    const IFF_BROADCAST: u32 = libc::IFF_BROADCAST as u32;
+    let prefix_hosts = !mask; // 255 for /24, 1 for /31, 0 for /32
+    if prefix_hosts <= 1 {
+        return None; // /31 (peer) and /32 (host) have no broadcast
+    }
+    if flags & IFF_BROADCAST != 0 {
+        if let Some(b) = broadaddr {
+            return Some(b);
+        }
+    }
+    let computed = Ipv4Addr::from(u32::from(addr) | !mask);
+    (computed != addr).then_some(computed)
+}
+
+/// Enumerate local interface addresses via getifaddrs(3): every IP plus
+/// each IPv4 subnet's directed-broadcast address. FAILS CLOSED: an
+/// enumeration error propagates to the caller (the interceptor refuses
+/// to start) - with an empty list the self-destination guard could
+/// never match, and the self-relay storm would be back.
+pub fn local_nets() -> io::Result<(Vec<IpAddr>, Vec<Ipv4Addr>)> {
+    let mut ips = Vec::new();
+    let mut broadcasts = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                match (*ifa.ifa_addr).sa_family as i32 {
+                    libc::AF_INET => {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                        let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+                        ips.push(IpAddr::V4(ip));
+                        let mask = if !ifa.ifa_netmask.is_null() {
+                            let nm = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                            u32::from_be(nm.sin_addr.s_addr)
+                        } else {
+                            0
+                        };
+                        // The broadcast/dst union member differs by
+                        // platform: glibc exposes the raw union as
+                        // `ifa_ifu` (broadcast iff IFF_BROADCAST, else a
+                        // p2p dst), while macOS/BSD libc expose
+                        // `ifa_dstaddr` directly. Same IFF_BROADCAST
+                        // guard applies on both.
+                        #[cfg(target_os = "linux")]
+                        let broad_or_dst: *mut libc::sockaddr = ifa.ifa_ifu;
+                        #[cfg(not(target_os = "linux"))]
+                        let broad_or_dst: *mut libc::sockaddr = ifa.ifa_dstaddr;
+                        let broad = if !broad_or_dst.is_null()
+                            && ifa.ifa_flags as u32 & (libc::IFF_BROADCAST as u32) != 0
+                            && (*broad_or_dst).sa_family as i32 == libc::AF_INET
+                        {
+                            let ba = &*(broad_or_dst as *const libc::sockaddr_in);
+                            Some(Ipv4Addr::from(u32::from_be(ba.sin_addr.s_addr)))
+                        } else {
+                            None
+                        };
+                        if let Some(b) = broadcast_for(ip, mask, ifa.ifa_flags as u32, broad) {
+                            broadcasts.push(b);
+                        }
+                    }
+                    libc::AF_INET6 => {
+                        let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                        ips.push(IpAddr::V6(std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    Ok((ips, broadcasts))
+}
+
+/// Why a datagram was refused at interception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// dst is (a local IP, our own listen port): relaying it means the
+    /// direct/tunnel sender targets our own interceptor → infinite
+    /// self-relay chain (each hop = new flow, new fd, 64KiB buffer).
+    SelfDestined,
+    /// multicast / (directed-)broadcast dst: never legitimate to relay
+    /// (connect() to broadcast fails EPERM anyway — the old behavior
+    /// minted a doomed flow task per LAN mDNS packet, forever).
+    NonUnicast,
+    /// Live flow-TASK slots exhausted (MAX_FLOWS permits): refuse to
+    /// spawn. The cap is a semaphore owned for each task's full
+    /// LIFETIME (not the flows-map length — stalled or zombie tasks
+    /// outlive their map entries, review round 4).
+    FlowCap,
+}
+
+impl DropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DropReason::SelfDestined => "self-destined",
+            DropReason::NonUnicast => "non-unicast",
+            DropReason::FlowCap => "flow-cap",
+        }
+    }
+}
+
+/// Pure decision core (unit-tested): should a datagram with original
+/// destination `dst` be dropped instead of becoming a flow? (The
+/// flow-TASK cap is a separate lifetime-owned semaphore, see
+/// `try_flow_slot`.)
+fn drop_reason(
+    dst: &SocketAddr,
+    listen_port: u16,
+    local_ips: &[IpAddr],
+    broadcasts: &[Ipv4Addr],
+) -> Option<DropReason> {
+    let ip = dst.ip();
+    if dst.port() == listen_port && local_ips.contains(&ip) {
+        return Some(DropReason::SelfDestined);
+    }
+    if ip.is_multicast()
+        || ip == IpAddr::V4(Ipv4Addr::BROADCAST)
+        || matches!(ip, IpAddr::V4(v4) if broadcasts.contains(&v4))
+    {
+        return Some(DropReason::NonUnicast);
+    }
+    None
+}
+
+/// Whether `dst` is this host's own (local IP, `listen_port`) — the TCP
+/// transparent listener's twin of the UDP self-destination guard: a
+/// connection whose original destination is the interceptor itself
+/// must never be relayed (the relay would reconnect into the listener;
+/// the UDP variant of that loop was the production storm, issue #23).
+/// Fail-closed: an enumeration error counts as self-destined (the
+/// suspicious class is never legitimate).
+pub fn is_self_destined(dst: &SocketAddr, listen_port: u16) -> bool {
+    let Ok((ips, _)) = local_nets() else {
+        return true;
+    };
+    matches!(
+        drop_reason(dst, listen_port, &ips, &[]),
+        Some(DropReason::SelfDestined)
+    )
+}
 
 // ---------------------------------------------------------------- raw recvmsg
 
@@ -129,6 +298,101 @@ pub struct UdpInterceptor {
     sock: Arc<UdpSocket>,
     flows: StdMutex<HashMap<FlowKey, mpsc::Sender<Vec<u8>>>>,
     last_used: StdMutex<HashMap<FlowKey, Instant>>,
+    /// Our own listen port + the host's addresses: datagrams addressed
+    /// to (local ip, this port) are aimed at the interceptor itself and
+    /// must be dropped, never relayed (self-relay storm, issue #23).
+    listen_port: u16,
+    /// Whether this is the v6 sibling (filters refreshed snapshots).
+    v6: bool,
+    /// Live local-address snapshot. Refreshed by the idle-reaper task
+    /// (every FLOW_IDLE/2) so DHCP renewals, reconfigurations, and v6
+    /// temporary-address rotation keep the self-destination guard
+    /// valid for the process lifetime — a bind-time-only snapshot
+    /// would silently stop matching new local addresses (review).
+    local_ips: StdMutex<Vec<IpAddr>>,
+    /// Directed-broadcast addresses of local subnets (drop, never relay).
+    broadcasts: StdMutex<Vec<Ipv4Addr>>,
+    /// Live flow-TASK slots (MAX_FLOWS). One permit per spawned flow
+    /// task, owned for the task's full lifetime — the hard cap counts
+    /// stalled/zombie tasks too, not just map entries (review r4).
+    flow_tasks: Arc<tokio::sync::Semaphore>,
+    /// Drops per reason since process start (for rate-limited logging).
+    dropped: StdMutex<[u64; 3]>,
+}
+
+impl UdpInterceptor {
+    /// Re-enumerate local interfaces and swap the snapshots in place.
+    /// Called at bind time and by the reaper loop. The io::Result lets
+    /// the BIND path fail closed (no snapshot = no self-destination
+    /// guard), while the reaper discards later errors (stale beats
+    /// empty — an empty list would disable the guard mid-run).
+    fn refresh_local_nets(&self) -> io::Result<()> {
+        let (ips, broadcasts) = match local_nets() {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("udp: local interface refresh failed, keeping snapshot: {err}");
+                return Err(err);
+            }
+        };
+        if self.v6 {
+            *self.local_ips.lock().unwrap() = ips.into_iter().filter(|ip| ip.is_ipv6()).collect();
+        } else {
+            *self.local_ips.lock().unwrap() = ips;
+            *self.broadcasts.lock().unwrap() = broadcasts;
+        }
+        Ok(())
+    }
+
+    /// Record + rate-limit-log a drop of `reason` (first, then every
+    /// 1000th occurrence).
+    fn note_drop(&self, reason: DropReason, dst: &SocketAddr) {
+        let idx = match reason {
+            DropReason::SelfDestined => 0,
+            DropReason::NonUnicast => 1,
+            DropReason::FlowCap => 2,
+        };
+        let mut dropped = self.dropped.lock().unwrap();
+        dropped[idx] += 1;
+        if dropped[idx] == 1 || dropped[idx] % 1000 == 0 {
+            warn!(
+                "udp: dropped {} datagram to {dst} (total {})",
+                reason.as_str(),
+                dropped[idx]
+            );
+        }
+    }
+
+    /// Classify `dst` (self-destined / non-unicast); on drop, log
+    /// rate-limited and return the reason.
+    fn consider(&self, dst: &SocketAddr) -> Option<DropReason> {
+        let local_ips = self.local_ips.lock().unwrap();
+        let broadcasts = self.broadcasts.lock().unwrap();
+        let reason = drop_reason(dst, self.listen_port, &local_ips, &broadcasts)?;
+        drop(local_ips);
+        drop(broadcasts);
+        self.note_drop(reason, dst);
+        Some(reason)
+    }
+
+    /// Reserve a live flow-TASK slot for a new flow toward `dst`. The
+    /// semaphore has MAX_FLOWS permits; each spawned task owns one for
+    /// its ENTIRE lifetime (setup, relay, and any stall) — the
+    /// flows-map length is NOT the cap, because tasks can outlive their
+    /// map entries (zombies blocked in connect or on a silent stream,
+    /// review round 4). None = at the hard task cap, refuse the new
+    /// flow (logged with the real destination for operators).
+    fn try_flow_slot(
+        self: &Arc<Self>,
+        dst: &SocketAddr,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match Arc::clone(&self.flow_tasks).try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                self.note_drop(DropReason::FlowCap, dst);
+                None
+            }
+        }
+    }
 }
 
 pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
@@ -164,11 +428,26 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp interceptor listening on {addr}");
-    Ok(Arc::new(UdpInterceptor {
+    // fail closed: without the address list the self-destination guard
+    // cannot work (self-relay storm, issue #23)
+    let int = UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
         last_used: StdMutex::new(HashMap::new()),
-    }))
+        listen_port: port,
+        v6: false,
+        local_ips: StdMutex::new(Vec::new()),
+        broadcasts: StdMutex::new(Vec::new()),
+        flow_tasks: Arc::new(tokio::sync::Semaphore::new(MAX_FLOWS)),
+        dropped: StdMutex::new([0; 3]),
+    };
+    int.refresh_local_nets()?;
+    if int.local_ips.lock().unwrap().is_empty() {
+        return Err(io::Error::other(
+            "local interface enumeration returned no addresses",
+        ));
+    }
+    Ok(Arc::new(int))
 }
 
 /// v6 sibling of `bind_client` (IPV6_TRANSPARENT + IPV6_RECVORIGDSTADDR,
@@ -211,11 +490,23 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp6 interceptor listening on {addr}");
-    Ok(Arc::new(UdpInterceptor {
+    let int = UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
         last_used: StdMutex::new(HashMap::new()),
-    }))
+        listen_port: port,
+        v6: true,
+        local_ips: StdMutex::new(Vec::new()),
+        broadcasts: StdMutex::new(Vec::new()),
+        flow_tasks: Arc::new(tokio::sync::Semaphore::new(MAX_FLOWS)),
+        dropped: StdMutex::new([0; 3]),
+    };
+    // Fail closed on the INITIAL enumeration too (review): an error
+    // must not yield a live interceptor with no self-destination
+    // guard. An empty FILTERED list stays valid (v4-only hosts run no
+    // v6 interceptor traffic to guard).
+    int.refresh_local_nets()?;
+    Ok(Arc::new(int))
 }
 
 impl UdpInterceptor {
@@ -237,6 +528,27 @@ impl UdpInterceptor {
     }
 }
 
+/// What the serve loop should do with a flow entry after try_send.
+/// `Full` means the flow task is alive but its channel is backed up:
+/// the entry MUST be kept (the task still owns the flow) or every
+/// subsequent packet for the key would spawn ANOTHER task while the
+/// stalled one lives — bypassing MAX_FLOWS with flows.len() near one
+/// (review: unbounded tasks/fds). `Closed` means the task is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendStall {
+    Delivered,
+    KeepFlow,
+    DropFlow,
+}
+
+fn send_stall_action(r: Result<(), mpsc::error::TrySendError<Vec<u8>>>) -> SendStall {
+    match r {
+        Ok(()) => SendStall::Delivered,
+        Err(mpsc::error::TrySendError::Full(_)) => SendStall::KeepFlow,
+        Err(mpsc::error::TrySendError::Closed(_)) => SendStall::DropFlow,
+    }
+}
+
 /// Everything the UDP path needs to route a datagram flow.
 #[derive(Clone)]
 pub struct UdpRouter {
@@ -254,7 +566,7 @@ pub async fn serve_client(
     let sock = interceptor.sock.clone();
     let reaper = Arc::downgrade(&interceptor);
     tokio::spawn(async move {
-        // idle flow reaper
+        // idle flow reaper + local-interface refresher
         loop {
             tokio::time::sleep(FLOW_IDLE / 2).await;
             let Some(int) = reaper.upgrade() else { break };
@@ -271,6 +583,12 @@ pub async fn serve_client(
                 .lock()
                 .unwrap()
                 .retain(|_, t| now.duration_since(*t) < FLOW_IDLE * 2);
+            // Keep the self-destination guard valid for the process
+            // lifetime: local addresses change (DHCP, reconfiguration,
+            // v6 temporary-address rotation) and a bind-time-only
+            // snapshot would silently stop matching new ones (review).
+            // Later refresh failures keep the stale snapshot.
+            let _ = int.refresh_local_nets();
         }
     });
 
@@ -285,30 +603,68 @@ pub async fn serve_client(
             }
         };
         let key = (src, dst);
+        // Flow-table lookup first: whether this datagram belongs to an
+        // EXISTING flow decides the flow-cap question (the cap refuses
+        // only new flows — a full table must not starve established
+        // sessions; the idle reaper trims them).
+        let sender = {
+            let flows = interceptor.flows.lock().unwrap();
+            match flows.get(&key) {
+                Some(tx) => tx.clone(),
+                None => {
+                    // New flow: refuse datagrams that must never become
+                    // one — self-destined (addressed to this interceptor;
+                    // relaying = infinite loop, each hop a new task + fd
+                    // + 64KiB buffer until fd exhaustion — the production
+                    // GB/day RSS ratchet, issue #23) and non-unicast.
+                    // Checked BEFORE any map insert so a dropped class
+                    // leaves no state behind.
+                    drop(flows);
+                    if interceptor.consider(&dst).is_some() {
+                        continue;
+                    }
+                    // Hard live-task cap: the permit is owned for the
+                    // task's full lifetime (setup + relay + stalls), so
+                    // zombies count and replacements cannot bypass it.
+                    let Some(permit) = interceptor.try_flow_slot(&dst) else {
+                        continue;
+                    };
+                    let mut flows = interceptor.flows.lock().unwrap();
+                    if let Some(tx) = flows.get(&key) {
+                        // raced in while unlocked: treat as existing;
+                        // the unused slot returns with the permit drop
+                        tx.clone()
+                    } else {
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+                        let pool = pool.clone();
+                        let sock = sock.clone();
+                        let router = router.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            flow_task(key, rx, pool, sock, router).await
+                        });
+                        flows.insert(key, tx.clone());
+                        tx
+                    }
+                }
+            }
+        };
         interceptor
             .last_used
             .lock()
             .unwrap()
             .insert(key, Instant::now());
-        let sender = {
-            let mut flows = interceptor.flows.lock().unwrap();
-            match flows.get(&key) {
-                Some(tx) => tx.clone(),
-                None => {
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-                    let pool = pool.clone();
-                    let sock = sock.clone();
-                    let router = router.clone();
-                    tokio::spawn(flow_task(key, rx, pool, sock, router));
-                    flows.insert(key, tx.clone());
-                    tx
-                }
-            }
-        };
         let payload = buf[..n].to_vec();
-        if sender.try_send(payload).is_err() {
-            // flow is backed up or gone; drop the flow (will be recreated)
-            interceptor.flows.lock().unwrap().remove(&key);
+        match send_stall_action(sender.try_send(payload)) {
+            SendStall::Delivered => {}
+            SendStall::KeepFlow => {
+                // flow alive but backed up: keep the entry, drop the
+                // datagram (UDP semantics); see send_stall_action
+            }
+            SendStall::DropFlow => {
+                // task gone; drop the flow (will be recreated if needed)
+                interceptor.flows.lock().unwrap().remove(&key);
+            }
         }
     }
 }
@@ -423,10 +779,22 @@ async fn udp_tunnel_flow(
     server: Option<std::sync::Arc<str>>,
     sock: Arc<UdpSocket>,
 ) {
-    let mut stream = match pool.connect(server.as_deref(), magic_addr(), None).await {
-        Ok(s) => s,
-        Err(err) => {
+    // Bounded setup: a stalled connect must not pin a flow-task slot
+    // (and its permit) forever — the semaphore cap only recovers when
+    // tasks finish (review r4).
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(30),
+        pool.connect(server.as_deref(), magic_addr(), None),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(err)) => {
             debug!("udp flow to {dst} connect failed: {err}");
+            return;
+        }
+        Err(_) => {
+            debug!("udp flow to {dst} connect timed out");
             return;
         }
     };
@@ -448,7 +816,13 @@ async fn udp_tunnel_flow(
     let mut read_buf = vec![0u8; 65536];
     loop {
         tokio::select! {
-            Some(dg) = rx.recv() => {
+            // Channel closed (reaper removed the entry / all senders
+            // dropped): EXIT, don't disable the branch — a disabled
+            // branch left the task pending on stream.read() forever on
+            // silent relay streams, accumulating zombie tasks past the
+            // cap (review r4).
+            maybe = rx.recv() => {
+                let Some(dg) = maybe else { break };
                 let mut frame = Vec::with_capacity(2 + dg.len());
                 frame.put_u16(dg.len() as u16);
                 frame.extend_from_slice(&dg);
@@ -706,5 +1080,258 @@ impl AsyncWrite for UdpFramedStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::new(10, 89, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V6("fd00::1".parse().unwrap()),
+        ]
+    }
+
+    fn broadcasts() -> Vec<Ipv4Addr> {
+        vec![
+            Ipv4Addr::new(10, 89, 0, 255),
+            Ipv4Addr::new(192, 168, 0, 255),
+        ]
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Regression (2026-10-13, issue #23): a datagram addressed to our
+    /// own interceptor port on a local IP used to be relayed "direct"
+    /// back to the same port — a self-sustaining chain that minted a
+    /// flow task (fd + 64KiB buffer) per hop until fd exhaustion,
+    /// ~28k hops per storm, GBs of transient heap retained by glibc
+    /// arenas. It must be dropped at interception instead.
+    #[test]
+    fn self_destined_datagram_is_dropped() {
+        let ips = local_ips();
+        let bcasts = broadcasts();
+        // our port on our IP (the storm case, v4 and v6)
+        assert_eq!(
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts),
+            Some(DropReason::SelfDestined)
+        );
+        assert_eq!(
+            drop_reason(&sa("[fd00::1]:7896"), 7896, &ips, &bcasts),
+            Some(DropReason::SelfDestined)
+        );
+        // same IP but a different port = some other local service:
+        // relaying to it is legitimate (hairpin to the LAN web UI etc.)
+        assert_eq!(drop_reason(&sa("10.89.0.5:80"), 7896, &ips, &bcasts), None);
+        // our port on a foreign IP = an upstream service that happens to
+        // use the same port number; must NOT be dropped
+        assert_eq!(drop_reason(&sa("8.8.8.8:7896"), 7896, &ips, &bcasts), None);
+    }
+
+    /// Regression (issue #23 acceptance): LAN mDNS/WSD broadcast and
+    /// multicast datagrams must never become flows — the old code
+    /// spawned a doomed direct flow per packet (connect to broadcast =
+    /// EPERM, retried every packet forever: "udp direct connect
+    /// 192.168.0.255:5353 failed" every ~5s in production logs).
+    #[test]
+    fn broadcast_and_multicast_are_dropped() {
+        let ips = local_ips();
+        let bcasts = broadcasts();
+        for dst in [
+            "224.0.0.251:5353",      // mDNS multicast
+            "239.255.255.250:1900",  // SSDP multicast
+            "255.255.255.255:58866", // limited broadcast
+            "192.168.0.255:5353",    // directed broadcast (prod case)
+            "10.89.0.255:5353",      // directed broadcast, other subnet
+            "[ff02::fb]:5353",       // mDNS v6 multicast
+        ] {
+            assert_eq!(
+                drop_reason(&sa(dst), 7896, &ips, &bcasts),
+                Some(DropReason::NonUnicast),
+                "{dst} must be dropped as non-unicast"
+            );
+        }
+        // plain unicast passes
+        assert_eq!(drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts), None);
+    }
+
+    /// Regression (issue #23 review round 4): the flow cap must count
+    /// LIVE TASKS, not flows-map entries — tasks can outlive their map
+    /// entries (blocked in connect, or pending on a silent stream after
+    /// the reaper removed the entry), so a map-length cap let a flood
+    /// accumulate unbounded tasks/fds. The cap is now a semaphore whose
+    /// permits are owned for each task's full lifetime.
+    #[tokio::test]
+    async fn flow_task_slots_hard_cap_live_tasks() {
+        let int = bind_client(0).expect("bind succeeds on a healthy host");
+        let mut held = Vec::new();
+        let dst: SocketAddr = "1.2.3.4:53".parse().unwrap();
+        for _ in 0..MAX_FLOWS {
+            held.push(
+                int.try_flow_slot(&dst)
+                    .expect("permits available below the cap"),
+            );
+        }
+        assert!(
+            int.try_flow_slot(&dst).is_none(),
+            "at the cap, a new flow task must be refused"
+        );
+        drop(held);
+        assert!(
+            int.try_flow_slot(&dst).is_some(),
+            "finished tasks must return their slot"
+        );
+    }
+
+    /// Regression (issue #23 review): the directed-broadcast derivation
+    /// must not misclassify RFC 3021 /31 peers (or /32 hosts) as
+    /// broadcasts — that would DROP legitimate point-to-point traffic.
+    #[test]
+    fn broadcast_for_handles_rfc3021_and_host_routes() {
+        use std::net::Ipv4Addr as I4;
+        // /24: classic directed broadcast
+        assert_eq!(
+            broadcast_for(
+                I4::new(192, 168, 0, 1),
+                u32::from(I4::new(255, 255, 255, 0)),
+                0,
+                None
+            ),
+            Some(I4::new(192, 168, 0, 255))
+        );
+        // /31 (RFC 3021 point-to-point): addr|!mask is the PEER — never a
+        // broadcast, regardless of kernel-provided broadaddr
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 0, 0, 0),
+                u32::from(I4::new(255, 255, 255, 254)),
+                0,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 0, 0, 0),
+                u32::from(I4::new(255, 255, 255, 254)),
+                libc::IFF_BROADCAST as u32,
+                Some(I4::new(10, 0, 0, 1))
+            ),
+            None,
+            "/31 must not yield a broadcast even with a bogus broadaddr"
+        );
+        // /32 host route: no broadcast
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 0, 0, 5),
+                u32::from(I4::new(255, 255, 255, 255)),
+                0,
+                None
+            ),
+            None
+        );
+        // IFF_BROADCAST + kernel broadaddr wins over the computation
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 1, 0, 1),
+                u32::from(I4::new(255, 255, 255, 0)),
+                libc::IFF_BROADCAST as u32,
+                Some(I4::new(10, 9, 9, 9))
+            ),
+            Some(I4::new(10, 9, 9, 9))
+        );
+    }
+
+    /// local_nets parses real interfaces (smoke: loopback must appear).
+    #[test]
+    fn local_nets_contains_loopback() {
+        let (ips, _) = local_nets().expect("getifaddrs must work on this host");
+        assert!(
+            ips.iter().any(|ip| ip.is_loopback()),
+            "no loopback in {ips:?}"
+        );
+    }
+
+    /// Regression (issue #23 review): the local-address snapshot must be
+    /// REFRESHABLE, not bind-time-only — DHCP/reconfiguration/v6
+    /// temporary-address rotation add addresses later, and without a
+    /// refresh the self-destination guard silently stops matching them
+    /// (storm window until MAX_FLOWS). The reaper calls this every
+    /// FLOW_IDLE/2; this test pins the refresh mechanism itself.
+    #[tokio::test]
+    async fn snapshot_refresh_recovers_after_addresses_change() {
+        let int = bind_client(0).expect("bind succeeds on a healthy host");
+        // simulate an interface change wiping the snapshot
+        int.local_ips.lock().unwrap().clear();
+        assert!(int.local_ips.lock().unwrap().is_empty());
+        let _ = int.refresh_local_nets();
+        let ips = int.local_ips.lock().unwrap();
+        assert!(
+            ips.iter().any(|ip| ip.is_loopback()),
+            "refresh must repopulate local addresses"
+        );
+    }
+
+    /// Fail-closed bind (issue #23 review): a healthy host must yield a
+    /// non-empty snapshot — the bind errors rather than running blind.
+    #[tokio::test]
+    async fn bind_fails_closed_without_local_addresses() {
+        let int = bind_client(0).expect("bind succeeds on a healthy host");
+        assert!(!int.local_ips.lock().unwrap().is_empty());
+    }
+
+    /// Regression (issue #23 review round 5): the TCP transparent
+    /// listener needs the same self-destination guard as UDP — a conn
+    /// whose original dst is (local ip, listen port) is the interceptor
+    /// itself and must be refused. Remote services on the same port
+    /// number must stay relayed (round-2's addrtype guarantee).
+    #[test]
+    fn is_self_destined_classifies_correctly() {
+        assert!(
+            is_self_destined(&sa("127.0.0.1:7895"), 7895),
+            "own listener endpoint must be refused"
+        );
+        assert!(
+            !is_self_destined(&sa("8.8.8.8:7895"), 7895),
+            "remote service on the same port must stay relayed"
+        );
+        assert!(
+            !is_self_destined(&sa("127.0.0.1:80"), 7895),
+            "other local services are legitimate hairpin relays"
+        );
+    }
+
+    /// Regression (issue #23 review round 2): a FULL flow channel must
+    /// keep the flow entry (the stalled task still owns it) — dropping
+    /// the entry let a flood spawn unbounded tasks/fds while
+    /// flows.len() stayed near one, bypassing MAX_FLOWS.
+    #[tokio::test]
+    async fn backed_up_flow_keeps_its_entry() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        // fill the 1-slot channel: next try_send is Full while the
+        // receiver is still alive
+        tx.try_send(vec![1]).expect("first send fills the slot");
+        assert_eq!(
+            send_stall_action(tx.try_send(vec![2])),
+            SendStall::KeepFlow,
+            "Full must keep the flow entry (stalled task still owns it)"
+        );
+        drop(rx); // receiver gone
+        assert_eq!(
+            send_stall_action(tx.try_send(vec![3])),
+            SendStall::DropFlow,
+            "Closed must drop the entry (task is gone)"
+        );
+        let (tx2, rx2) = mpsc::channel::<Vec<u8>>(1);
+        assert_eq!(
+            send_stall_action(tx2.try_send(vec![4])),
+            SendStall::Delivered
+        );
+        drop(rx2);
     }
 }

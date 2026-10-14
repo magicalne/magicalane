@@ -127,6 +127,17 @@ pub async fn serve(
                         continue;
                     }
                 };
+                // Self-destination guard (TCP twin of the UDP drop): a
+                // conn whose original dst is THIS listener must never be
+                // relayed — the relay would reconnect into the listener.
+                // Previously only the port-collision heuristic + the
+                // SO_ORIGINAL_DST ENOENT path closed these implicitly;
+                // now explicit, and independent of rule ordering
+                // (review round 5).
+                if dst.port() == port && crate::udp::is_self_destined(&dst, port) {
+                    warn!("tproxy: dropped self-destined conn to {dst}");
+                    continue;
+                }
                 let pool = pool.clone();
                 let router = router.clone();
                 log::info!("tproxy accepted conn, original dst {dst}");
@@ -308,6 +319,11 @@ pub async fn serve6(
                         continue;
                     }
                 };
+                // Self-destination guard, v6 twin (see serve()).
+                if dst.port() == port && crate::udp::is_self_destined(&dst, port) {
+                    warn!("tproxy6: dropped self-destined conn to {dst}");
+                    continue;
+                }
                 let pool = pool.clone();
                 let router = router.clone();
                 log::info!("tproxy6 accepted conn, original dst {dst}");

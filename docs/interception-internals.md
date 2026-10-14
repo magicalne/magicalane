@@ -120,6 +120,30 @@ intercepted.
    permanent retry loop. Interim mitigation in the gateway container:
    `filter OUTPUT -p tcp -m owner --uid-owner <resolved-uid> -j
    REJECT`. Proper fix: answer TCP :53 locally (`serve_client_tcp`).
+5. **The interception ports must never be intercepted as destinations**
+   (and the interceptor must refuse self-destined datagrams). A packet
+   aimed at the gateway's own `udp_port` (or `tcp_port`) that gets
+   TPROXY'd/relayed "direct" back to the same port feeds the
+   interceptor its own output: the wildcard listener receives the
+   forwarded packet (new ephemeral source → new flow key) and relays it
+   again — a **self-sustaining relay chain** that mints a flow task +
+   fd + 64KiB buffer per hop until fd exhaustion (~28k hops in ~5s in
+   production, ~2GB transient heap per storm, retained forever by
+   glibc per-thread arenas — this was the dominant component of issue
+   #23's gateway-client RSS growth, 2026-10; the issue also tracks the
+   remote QUIC server's separate, much slower accumulation and the 48h
+   flat-RSS acceptance run). Three layers: iptables
+   `--dport <tcp_port/udp_port> -m addrtype --dst-type LOCAL` RETURN
+   in MGL-NAT/MGL-OUT/MGL-PRE (+ MGL6 mirrors) — LOCAL-scoped so a
+   remote service on the same port stays intercepted —, the fail-closed
+   user-space drop in `lib::udp` (`drop_reason`: self-destined,
+   non-unicast, flow cap — the cap refuses only NEW flows so a full
+   table never starves established sessions), and a hard `MAX_FLOWS` cap on
+   LIVE flow tasks (a semaphore permit owned for each task's full
+   lifetime — stalled/zombie tasks count, not just map entries). Note the kernel rules alone are NOT
+   enough: the interceptor's listener is a wildcard socket — even
+   un-intercepted packets addressed to it arrive there via normal UDP
+   demux. Regression: `env/tests/041-reg-udp-self-loop.sh`.
 
 ## Debugging (field-tested; what works and what lies)
 

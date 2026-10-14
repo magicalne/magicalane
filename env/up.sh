@@ -173,6 +173,7 @@ ensure_run magicalane-client \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-fakefilter.toml:/etc/magicalane/client-ws-fakefilter.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-provider.toml:/etc/magicalane/client-ws-provider.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-tun.toml:/etc/magicalane/client-ws-tun.toml:ro" \
+    -v "$ENV_DIR/configs/client-$TRANSPORT-ws-loop.toml:/etc/magicalane/client-$TRANSPORT-ws-loop.toml:ro" \
     -v "$ENV_DIR/configs/client-$TRANSPORT-ws-multi.toml:/etc/magicalane/client-ws-multi.toml:ro" \
     -v "$ENV_DIR/certs:/etc/magicalane/certs:ro" \
     "$IMAGE" magicalane --config /etc/magicalane/client.toml

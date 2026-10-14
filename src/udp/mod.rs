@@ -55,17 +55,46 @@ const MAX_FLOWS: usize = 4096;
 
 // ---------------------------------------------------------------- local nets
 
+/// The directed-broadcast address of one IPv4 interface, or None.
+/// Pure core of the getifaddrs walk (unit-tested):
+/// - if the interface is a broadcast interface (IFF_BROADCAST) and the
+///   kernel provides `ifa_broadaddr`, use it;
+/// - else compute `addr | !netmask` - but only for prefixes shorter
+///   than /31: on an RFC 3021 `/31` the computation yields the PEER
+///   address, not a broadcast (dropping it would break the link), and
+///   a `/32` has no broadcast at all (the guard skips it too).
+fn broadcast_for(
+    addr: Ipv4Addr,
+    mask: u32,
+    flags: u32,
+    broadaddr: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    const IFF_BROADCAST: u32 = libc::IFF_BROADCAST as u32;
+    let prefix_hosts = !mask; // 255 for /24, 1 for /31, 0 for /32
+    if prefix_hosts <= 1 {
+        return None; // /31 (peer) and /32 (host) have no broadcast
+    }
+    if flags & IFF_BROADCAST != 0 {
+        if let Some(b) = broadaddr {
+            return Some(b);
+        }
+    }
+    let computed = Ipv4Addr::from(u32::from(addr) | !mask);
+    (computed != addr).then_some(computed)
+}
+
 /// Enumerate local interface addresses via getifaddrs(3): every IP plus
-/// each IPv4 subnet's directed-broadcast address (addr | !netmask).
-/// No-op-safe: unavailable or empty → empty vec (checks degrade to the
-/// always-on port/multicast rules only).
-pub fn local_nets() -> (Vec<IpAddr>, Vec<Ipv4Addr>) {
+/// each IPv4 subnet's directed-broadcast address. FAILS CLOSED: an
+/// enumeration error propagates to the caller (the interceptor refuses
+/// to start) - with an empty list the self-destination guard could
+/// never match, and the self-relay storm would be back.
+pub fn local_nets() -> io::Result<(Vec<IpAddr>, Vec<Ipv4Addr>)> {
     let mut ips = Vec::new();
     let mut broadcasts = Vec::new();
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
-            return (ips, broadcasts);
+            return Err(io::Error::last_os_error());
         }
         let mut cur = ifap;
         while !cur.is_null() {
@@ -76,13 +105,26 @@ pub fn local_nets() -> (Vec<IpAddr>, Vec<Ipv4Addr>) {
                         let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                         let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
                         ips.push(IpAddr::V4(ip));
-                        if !ifa.ifa_netmask.is_null() {
+                        let mask = if !ifa.ifa_netmask.is_null() {
                             let nm = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
-                            let mask = u32::from_be(nm.sin_addr.s_addr);
-                            let bcast = Ipv4Addr::from(u32::from(ip) | !mask);
-                            if bcast != ip {
-                                broadcasts.push(bcast);
-                            }
+                            u32::from_be(nm.sin_addr.s_addr)
+                        } else {
+                            0
+                        };
+                        // glibc exposes the union member as ifa_ifu;
+                        // it is the BROADCAST address only when
+                        // IFF_BROADCAST is set (else it is a p2p dst).
+                        let broad = if !ifa.ifa_ifu.is_null()
+                            && ifa.ifa_flags as u32 & (libc::IFF_BROADCAST as u32) != 0
+                            && (*ifa.ifa_ifu).sa_family as i32 == libc::AF_INET
+                        {
+                            let ba = &*(ifa.ifa_ifu as *const libc::sockaddr_in);
+                            Some(Ipv4Addr::from(u32::from_be(ba.sin_addr.s_addr)))
+                        } else {
+                            None
+                        };
+                        if let Some(b) = broadcast_for(ip, mask, ifa.ifa_flags as u32, broad) {
+                            broadcasts.push(b);
                         }
                     }
                     libc::AF_INET6 => {
@@ -96,7 +138,7 @@ pub fn local_nets() -> (Vec<IpAddr>, Vec<Ipv4Addr>) {
         }
         libc::freeifaddrs(ifap);
     }
-    (ips, broadcasts)
+    Ok((ips, broadcasts))
 }
 
 /// Why a datagram was refused at interception.
@@ -125,12 +167,16 @@ impl DropReason {
 }
 
 /// Pure decision core (unit-tested): should a datagram with original
-/// destination `dst` be dropped instead of becoming a flow?
+/// destination `dst` be dropped instead of becoming a flow? `existing`
+/// says whether a flow for this (src,dst) key already exists — the
+/// flow cap only refuses NEW flows, so a full table never starves
+/// established sessions (they keep renewing; the idle reaper trims).
 fn drop_reason(
     dst: &SocketAddr,
     listen_port: u16,
     local_ips: &[IpAddr],
     broadcasts: &[Ipv4Addr],
+    existing: bool,
     flows_len: usize,
 ) -> Option<DropReason> {
     let ip = dst.ip();
@@ -143,7 +189,7 @@ fn drop_reason(
     {
         return Some(DropReason::NonUnicast);
     }
-    if flows_len >= MAX_FLOWS {
+    if !existing && flows_len >= MAX_FLOWS {
         return Some(DropReason::FlowCap);
     }
     None
@@ -243,15 +289,17 @@ pub struct UdpInterceptor {
 }
 
 impl UdpInterceptor {
-    /// Classify `dst`; on drop, log rate-limited (first, then every
-    /// 1000th) and return the reason.
-    fn consider(&self, dst: &SocketAddr) -> Option<DropReason> {
+    /// Classify `dst` for a datagram whose flow key exists per
+    /// `existing`; on drop, log rate-limited (first, then every 1000th)
+    /// and return the reason.
+    fn consider(&self, dst: &SocketAddr, existing: bool) -> Option<DropReason> {
         let flows_len = self.flows.lock().unwrap().len();
         let reason = drop_reason(
             dst,
             self.listen_port,
             &self.local_ips,
             &self.broadcasts,
+            existing,
             flows_len,
         )?;
         let idx = match reason {
@@ -305,7 +353,9 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp interceptor listening on {addr}");
-    let (local_ips, broadcasts) = local_nets();
+    // fail closed: without the address list the self-destination guard
+    // cannot work (self-relay storm, issue #23)
+    let (local_ips, broadcasts) = local_nets()?;
     Ok(Arc::new(UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
@@ -357,7 +407,7 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp6 interceptor listening on {addr}");
-    let (local_ips, _) = local_nets();
+    let (local_ips, _) = local_nets()?;
     let local_ips: Vec<IpAddr> = local_ips.into_iter().filter(|ip| ip.is_ipv6()).collect();
     Ok(Arc::new(UdpInterceptor {
         sock,
@@ -437,35 +487,49 @@ pub async fn serve_client(
             }
         };
         let key = (src, dst);
-        // Refuse datagrams that must never become flows: self-destined
-        // (addressed to this interceptor; relaying = infinite loop,
-        // each hop a new task + fd + 64KiB buffer until fd exhaustion —
-        // the production GB/day RSS ratchet, issue #23), non-unicast,
-        // and beyond the flow cap. Checked BEFORE any map insert so a
-        // dropped class leaves no state behind.
-        if interceptor.consider(&dst).is_some() {
-            continue;
-        }
+        // Flow-table lookup first: whether this datagram belongs to an
+        // EXISTING flow decides the flow-cap question (the cap refuses
+        // only new flows — a full table must not starve established
+        // sessions; the idle reaper trims them).
+        let sender = {
+            let flows = interceptor.flows.lock().unwrap();
+            match flows.get(&key) {
+                Some(tx) => tx.clone(),
+                None => {
+                    // New flow: refuse datagrams that must never become
+                    // one — self-destined (addressed to this interceptor;
+                    // relaying = infinite loop, each hop a new task + fd
+                    // + 64KiB buffer until fd exhaustion — the production
+                    // GB/day RSS ratchet, issue #23), non-unicast, and
+                    // beyond the flow cap. Checked BEFORE any map insert
+                    // so a dropped class leaves no state behind.
+                    // (Self/non-unicast also apply to existing flows:
+                    // such a flow can never legitimately exist.)
+                    drop(flows);
+                    if interceptor.consider(&dst, false).is_some() {
+                        continue;
+                    }
+                    let mut flows = interceptor.flows.lock().unwrap();
+                    if let Some(tx) = flows.get(&key) {
+                        // raced in while unlocked: treat as existing
+                        tx.clone()
+                    } else {
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+                        let pool = pool.clone();
+                        let sock = sock.clone();
+                        let router = router.clone();
+                        tokio::spawn(flow_task(key, rx, pool, sock, router));
+                        flows.insert(key, tx.clone());
+                        tx
+                    }
+                }
+            }
+        };
         interceptor
             .last_used
             .lock()
             .unwrap()
             .insert(key, Instant::now());
-        let sender = {
-            let mut flows = interceptor.flows.lock().unwrap();
-            match flows.get(&key) {
-                Some(tx) => tx.clone(),
-                None => {
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-                    let pool = pool.clone();
-                    let sock = sock.clone();
-                    let router = router.clone();
-                    tokio::spawn(flow_task(key, rx, pool, sock, router));
-                    flows.insert(key, tx.clone());
-                    tx
-                }
-            }
-        };
         let payload = buf[..n].to_vec();
         if sender.try_send(payload).is_err() {
             // flow is backed up or gone; drop the flow (will be recreated)
@@ -905,23 +969,23 @@ mod tests {
         let bcasts = broadcasts();
         // our port on our IP (the storm case, v4 and v6)
         assert_eq!(
-            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, 0),
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, false, 0),
             Some(DropReason::SelfDestined)
         );
         assert_eq!(
-            drop_reason(&sa("[fd00::1]:7896"), 7896, &ips, &bcasts, 0),
+            drop_reason(&sa("[fd00::1]:7896"), 7896, &ips, &bcasts, false, 0),
             Some(DropReason::SelfDestined)
         );
         // same IP but a different port = some other local service:
         // relaying to it is legitimate (hairpin to the LAN web UI etc.)
         assert_eq!(
-            drop_reason(&sa("10.89.0.5:80"), 7896, &ips, &bcasts, 0),
+            drop_reason(&sa("10.89.0.5:80"), 7896, &ips, &bcasts, false, 0),
             None
         );
         // our port on a foreign IP = an upstream service that happens to
         // use the same port number; must NOT be dropped
         assert_eq!(
-            drop_reason(&sa("8.8.8.8:7896"), 7896, &ips, &bcasts, 0),
+            drop_reason(&sa("8.8.8.8:7896"), 7896, &ips, &bcasts, false, 0),
             None
         );
     }
@@ -944,40 +1008,114 @@ mod tests {
             "[ff02::fb]:5353",       // mDNS v6 multicast
         ] {
             assert_eq!(
-                drop_reason(&sa(dst), 7896, &ips, &bcasts, 0),
+                drop_reason(&sa(dst), 7896, &ips, &bcasts, false, 0),
                 Some(DropReason::NonUnicast),
                 "{dst} must be dropped as non-unicast"
             );
         }
         // plain unicast passes
-        assert_eq!(drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, 0), None);
+        assert_eq!(
+            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, false, 0),
+            None
+        );
     }
 
-    /// The flow cap bounds any future runaway class: at MAX_FLOWS every
-    /// new flow is refused instead of eating fds.
+    /// Regression (issue #23 review): the flow cap must only refuse NEW
+    /// flows — established flows keep renewing so a full table never
+    /// starves active sessions until the reaper trims.
     #[test]
-    fn flow_cap_refuses_new_flows() {
+    fn flow_cap_refuses_only_new_flows() {
         let ips = local_ips();
         let bcasts = broadcasts();
         assert_eq!(
-            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, MAX_FLOWS),
-            Some(DropReason::FlowCap)
+            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, false, MAX_FLOWS),
+            Some(DropReason::FlowCap),
+            "new flow at cap must be refused"
         );
         assert_eq!(
-            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, MAX_FLOWS - 1),
+            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, true, MAX_FLOWS),
+            None,
+            "existing flow at cap must keep flowing"
+        );
+        assert_eq!(
+            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, false, MAX_FLOWS - 1),
             None
         );
         // self-destined wins even when there is flow budget left
         assert_eq!(
-            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, 0),
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, false, 0),
             Some(DropReason::SelfDestined)
+        );
+        // ...and regardless of existence (such a flow must never live)
+        assert_eq!(
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, true, 0),
+            Some(DropReason::SelfDestined)
+        );
+    }
+
+    /// Regression (issue #23 review): the directed-broadcast derivation
+    /// must not misclassify RFC 3021 /31 peers (or /32 hosts) as
+    /// broadcasts — that would DROP legitimate point-to-point traffic.
+    #[test]
+    fn broadcast_for_handles_rfc3021_and_host_routes() {
+        use std::net::Ipv4Addr as I4;
+        // /24: classic directed broadcast
+        assert_eq!(
+            broadcast_for(
+                I4::new(192, 168, 0, 1),
+                u32::from(I4::new(255, 255, 255, 0)),
+                0,
+                None
+            ),
+            Some(I4::new(192, 168, 0, 255))
+        );
+        // /31 (RFC 3021 point-to-point): addr|!mask is the PEER — never a
+        // broadcast, regardless of kernel-provided broadaddr
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 0, 0, 0),
+                u32::from(I4::new(255, 255, 255, 254)),
+                0,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 0, 0, 0),
+                u32::from(I4::new(255, 255, 255, 254)),
+                libc::IFF_BROADCAST as u32,
+                Some(I4::new(10, 0, 0, 1))
+            ),
+            None,
+            "/31 must not yield a broadcast even with a bogus broadaddr"
+        );
+        // /32 host route: no broadcast
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 0, 0, 5),
+                u32::from(I4::new(255, 255, 255, 255)),
+                0,
+                None
+            ),
+            None
+        );
+        // IFF_BROADCAST + kernel broadaddr wins over the computation
+        assert_eq!(
+            broadcast_for(
+                I4::new(10, 1, 0, 1),
+                u32::from(I4::new(255, 255, 255, 0)),
+                libc::IFF_BROADCAST as u32,
+                Some(I4::new(10, 9, 9, 9))
+            ),
+            Some(I4::new(10, 9, 9, 9))
         );
     }
 
     /// local_nets parses real interfaces (smoke: loopback must appear).
     #[test]
     fn local_nets_contains_loopback() {
-        let (ips, _) = local_nets();
+        let (ips, _) = local_nets().expect("getifaddrs must work on this host");
         assert!(
             ips.iter().any(|ip| ip.is_loopback()),
             "no loopback in {ips:?}"

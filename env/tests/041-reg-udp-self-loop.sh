@@ -60,6 +60,15 @@ echo "  info: fds $base_fds -> $now_fds, rss ${rss:-?} kB"
 exec_c sh -c "grep -q 'dropped self-destined' /tmp/ws.log" \
     || fail "no self-destined drop logged in /tmp/ws.log"
 
+# the iptables exemptions must be LOCAL-scoped (review: a dst-port-only
+# RETURN would bypass interception for REMOTE services that happen to
+# use the same port number)
+scoped="$(exec_c sh -c 'iptables-save 2>/dev/null | grep -c "dport 7897.*addrtype.*dst-type LOCAL"')"
+[ "${scoped:-0}" -ge 1 ] || fail "MGL-NAT tcp_port exemption not LOCAL-scoped (addrtype)"
+scoped_u="$(exec_c sh -c 'iptables-save -t mangle 2>/dev/null | grep -c "dport 7898.*addrtype.*dst-type LOCAL"')"
+[ "${scoped_u:-0}" -ge 1 ] || fail "MGL-OUT udp_port exemption not LOCAL-scoped (addrtype)"
+pass "interception-port exemptions are LOCAL-scoped"
+
 # NOTE: the broadcast/multicast drop (LAN mDNS -> EPERM retry loop in
 # production, gateway-mode PREROUTING interception) is not exercisable
 # here: rootless podman cannot TPROXY forwarded traffic (kernel >=

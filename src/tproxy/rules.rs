@@ -256,9 +256,11 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
     // Our own transparent TCP port as a DESTINATION is the interceptor
     // itself: intercepting it means relaying back into our own listener
     // (self-loop class; the UDP variant of this loop was the production
-    // fd-exhaustion storm, issue #23).
+    // fd-exhaustion storm, issue #23). Scoped to LOCAL destinations
+    // (-m addrtype) so a remote service that happens to use the same
+    // port number is still intercepted and follows configured routing.
     nat.push_str(&format!(
-        "-A {CHAIN_NAT} -p tcp --dport {} -j RETURN\n",
+        "-A {CHAIN_NAT} -p tcp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
         spec.tcp_port
     ));
     nat.push_str(&format!(
@@ -334,9 +336,10 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         ));
         // Exclude datagrams addressed TO our own interceptor port:
         // intercepting them feeds the interceptor its own output —
-        // a self-sustaining relay chain (issue #23 storm).
+        // a self-sustaining relay chain (issue #23 storm). LOCAL dst
+        // only: remote services on the same port stay intercepted.
         blob.push_str(&format!(
-            "-A {CHAIN_OUT} -p udp --dport {} -j RETURN\n",
+            "-A {CHAIN_OUT} -p udp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
             spec.udp_port
         ));
         blob.push_str(&format!(
@@ -413,15 +416,17 @@ pub fn apply(spec: &RuleSpec) -> io::Result<()> {
         // Our own interception ports as DESTINATIONS: never intercept
         // (the UDP storm of 2026-10 relaid datagrams to our own
         // udp_port until fd exhaustion; the TCP twin of that loop,
-        // plus port-scan noise, dies here too). The user-space drop in
-        // lib::udp remains the authoritative guard.
+        // plus port-scan noise, dies here too). Scoped to LOCAL
+        // destinations so remote services on the same ports stay
+        // intercepted. The user-space drop in lib::udp remains the
+        // authoritative guard.
         blob.push_str(&format!(
-            "-A MGL-PRE -p tcp --dport {} -j RETURN\n",
+            "-A MGL-PRE -p tcp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
             spec.tcp_port
         ));
         if spec.udp_port != 0 {
             blob.push_str(&format!(
-                "-A MGL-PRE -p udp --dport {} -j RETURN\n",
+                "-A MGL-PRE -p udp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
                 spec.udp_port
             ));
         }
@@ -609,9 +614,10 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
     nat.push_str("-A MGL6-NAT -d ::1/128 -j RETURN\n");
     nat.push_str("-A MGL6-NAT -d fe80::/10 -j RETURN\n");
     nat.push_str("-A MGL6-NAT -d ff00::/8 -j RETURN\n");
-    // Our own transparent TCP port as a destination (see the v4 twin).
+    // Our own transparent TCP port as a destination (see the v4 twin):
+    // LOCAL destinations only, remote same-port services stay proxied.
     nat.push_str(&format!(
-        "-A {CHAIN6_NAT} -p tcp --dport {} -j RETURN\n",
+        "-A {CHAIN6_NAT} -p tcp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
         spec.tcp_port
     ));
     nat.push_str(&format!(
@@ -672,9 +678,10 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
             spec.udp_port + 1
         ));
         // Datagrams addressed to our own v6 interceptor port (port+1)
-        // must not be fed back into it (self-loop, issue #23).
+        // must not be fed back into it (self-loop, issue #23). LOCAL
+        // destinations only.
         blob.push_str(&format!(
-            "-A {CHAIN6_OUT} -p udp --dport {} -j RETURN\n",
+            "-A {CHAIN6_OUT} -p udp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
             spec.udp_port + 1
         ));
         blob.push_str(&format!(
@@ -717,14 +724,14 @@ fn apply_v6(spec: &RuleSpec) -> io::Result<()> {
         }
         // Our own interception ports as destinations (see the v4 twin):
         // self-destined traffic must reach the real listeners, not be
-        // TPROXY'd into them (self-loop class, issue #23).
+        // TPROXY'd into them (self-loop class, issue #23). LOCAL only.
         blob.push_str(&format!(
-            "-A MGL6-PRE -p tcp --dport {} -j RETURN\n",
+            "-A MGL6-PRE -p tcp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
             spec.tcp_port
         ));
         if spec.udp_port != 0 {
             blob.push_str(&format!(
-                "-A MGL6-PRE -p udp --dport {} -j RETURN\n",
+                "-A MGL6-PRE -p udp --dport {} -m addrtype --dst-type LOCAL -j RETURN\n",
                 spec.udp_port + 1
             ));
         }

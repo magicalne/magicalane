@@ -129,11 +129,17 @@ intercepted.
    again — a **self-sustaining relay chain** that mints a flow task +
    fd + 64KiB buffer per hop until fd exhaustion (~28k hops in ~5s in
    production, ~2GB transient heap per storm, retained forever by
-   glibc per-thread arenas — this was the "memory leak" of issue #23,
-   2026-10). Three layers: iptables `--dport <tcp_port/udp_port> RETURN`
-   in MGL-NAT/MGL-OUT/MGL-PRE (+ MGL6 mirrors), the user-space drop in
-   `lib::udp` (`drop_reason`: self-destined, non-unicast, flow cap),
-   and a hard `MAX_FLOWS` cap. Note the kernel rules alone are NOT
+   glibc per-thread arenas — this was the dominant component of issue
+   #23's gateway-client RSS growth, 2026-10; the issue also tracks the
+   remote QUIC server's separate, much slower accumulation and the 48h
+   flat-RSS acceptance run). Three layers: iptables
+   `--dport <tcp_port/udp_port> -m addrtype --dst-type LOCAL` RETURN
+   in MGL-NAT/MGL-OUT/MGL-PRE (+ MGL6 mirrors) — LOCAL-scoped so a
+   remote service on the same port stays intercepted —, the fail-closed
+   user-space drop in `lib::udp` (`drop_reason`: self-destined,
+   non-unicast, flow cap — the cap refuses only NEW flows so a full
+   table never starves established sessions), and a hard `MAX_FLOWS`
+   cap. Note the kernel rules alone are NOT
    enough: the interceptor's listener is a wildcard socket — even
    un-intercepted packets addressed to it arrive there via normal UDP
    demux. Regression: `env/tests/041-reg-udp-self-loop.sh`.

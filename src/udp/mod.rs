@@ -304,15 +304,16 @@ pub struct UdpInterceptor {
 
 impl UdpInterceptor {
     /// Re-enumerate local interfaces and swap the snapshots in place.
-    /// Called at bind time and by the reaper loop; on enumeration
-    /// failure keeps the previous snapshot (stale beats empty — an
-    /// empty list would disable the self-destination guard).
-    fn refresh_local_nets(&self) {
+    /// Called at bind time and by the reaper loop. The io::Result lets
+    /// the BIND path fail closed (no snapshot = no self-destination
+    /// guard), while the reaper discards later errors (stale beats
+    /// empty — an empty list would disable the guard mid-run).
+    fn refresh_local_nets(&self) -> io::Result<()> {
         let (ips, broadcasts) = match local_nets() {
             Ok(v) => v,
             Err(err) => {
                 warn!("udp: local interface refresh failed, keeping snapshot: {err}");
-                return;
+                return Err(err);
             }
         };
         if self.v6 {
@@ -321,6 +322,7 @@ impl UdpInterceptor {
             *self.local_ips.lock().unwrap() = ips;
             *self.broadcasts.lock().unwrap() = broadcasts;
         }
+        Ok(())
     }
 
     /// Classify `dst` for a datagram whose flow key exists per
@@ -401,7 +403,7 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
         broadcasts: StdMutex::new(Vec::new()),
         dropped: StdMutex::new([0; 3]),
     };
-    int.refresh_local_nets();
+    int.refresh_local_nets()?;
     if int.local_ips.lock().unwrap().is_empty() {
         return Err(io::Error::other(
             "local interface enumeration returned no addresses",
@@ -460,10 +462,11 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
         broadcasts: StdMutex::new(Vec::new()),
         dropped: StdMutex::new([0; 3]),
     };
-    int.refresh_local_nets();
-    // A v6-only host (no v6 addresses at all) still binds — v4 traffic
-    // uses the v4 interceptor; the v6 self-destined guard simply has
-    // nothing to match.
+    // Fail closed on the INITIAL enumeration too (review): an error
+    // must not yield a live interceptor with no self-destination
+    // guard. An empty FILTERED list stays valid (v4-only hosts run no
+    // v6 interceptor traffic to guard).
+    int.refresh_local_nets()?;
     Ok(Arc::new(int))
 }
 
@@ -483,6 +486,27 @@ impl UdpInterceptor {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+/// What the serve loop should do with a flow entry after try_send.
+/// `Full` means the flow task is alive but its channel is backed up:
+/// the entry MUST be kept (the task still owns the flow) or every
+/// subsequent packet for the key would spawn ANOTHER task while the
+/// stalled one lives — bypassing MAX_FLOWS with flows.len() near one
+/// (review: unbounded tasks/fds). `Closed` means the task is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendStall {
+    Delivered,
+    KeepFlow,
+    DropFlow,
+}
+
+fn send_stall_action(r: Result<(), mpsc::error::TrySendError<Vec<u8>>>) -> SendStall {
+    match r {
+        Ok(()) => SendStall::Delivered,
+        Err(mpsc::error::TrySendError::Full(_)) => SendStall::KeepFlow,
+        Err(mpsc::error::TrySendError::Closed(_)) => SendStall::DropFlow,
     }
 }
 
@@ -524,7 +548,8 @@ pub async fn serve_client(
             // lifetime: local addresses change (DHCP, reconfiguration,
             // v6 temporary-address rotation) and a bind-time-only
             // snapshot would silently stop matching new ones (review).
-            int.refresh_local_nets();
+            // Later refresh failures keep the stale snapshot.
+            let _ = int.refresh_local_nets();
         }
     });
 
@@ -583,9 +608,16 @@ pub async fn serve_client(
             .unwrap()
             .insert(key, Instant::now());
         let payload = buf[..n].to_vec();
-        if sender.try_send(payload).is_err() {
-            // flow is backed up or gone; drop the flow (will be recreated)
-            interceptor.flows.lock().unwrap().remove(&key);
+        match send_stall_action(sender.try_send(payload)) {
+            SendStall::Delivered => {}
+            SendStall::KeepFlow => {
+                // flow alive but backed up: keep the entry, drop the
+                // datagram (UDP semantics); see send_stall_action
+            }
+            SendStall::DropFlow => {
+                // task gone; drop the flow (will be recreated if needed)
+                interceptor.flows.lock().unwrap().remove(&key);
+            }
         }
     }
 }
@@ -1186,7 +1218,7 @@ mod tests {
         // simulate an interface change wiping the snapshot
         int.local_ips.lock().unwrap().clear();
         assert!(int.local_ips.lock().unwrap().is_empty());
-        int.refresh_local_nets();
+        let _ = int.refresh_local_nets();
         let ips = int.local_ips.lock().unwrap();
         assert!(
             ips.iter().any(|ip| ip.is_loopback()),
@@ -1200,5 +1232,34 @@ mod tests {
     async fn bind_fails_closed_without_local_addresses() {
         let int = bind_client(0).expect("bind succeeds on a healthy host");
         assert!(!int.local_ips.lock().unwrap().is_empty());
+    }
+
+    /// Regression (issue #23 review round 2): a FULL flow channel must
+    /// keep the flow entry (the stalled task still owns it) — dropping
+    /// the entry let a flood spawn unbounded tasks/fds while
+    /// flows.len() stayed near one, bypassing MAX_FLOWS.
+    #[tokio::test]
+    async fn backed_up_flow_keeps_its_entry() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+        // fill the 1-slot channel: next try_send is Full while the
+        // receiver is still alive
+        tx.try_send(vec![1]).expect("first send fills the slot");
+        assert_eq!(
+            send_stall_action(tx.try_send(vec![2])),
+            SendStall::KeepFlow,
+            "Full must keep the flow entry (stalled task still owns it)"
+        );
+        drop(rx); // receiver gone
+        assert_eq!(
+            send_stall_action(tx.try_send(vec![3])),
+            SendStall::DropFlow,
+            "Closed must drop the entry (task is gone)"
+        );
+        let (tx2, rx2) = mpsc::channel::<Vec<u8>>(1);
+        assert_eq!(
+            send_stall_action(tx2.try_send(vec![4])),
+            SendStall::Delivered
+        );
+        drop(rx2);
     }
 }

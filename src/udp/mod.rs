@@ -111,14 +111,21 @@ pub fn local_nets() -> io::Result<(Vec<IpAddr>, Vec<Ipv4Addr>)> {
                         } else {
                             0
                         };
-                        // glibc exposes the union member as ifa_ifu;
-                        // it is the BROADCAST address only when
-                        // IFF_BROADCAST is set (else it is a p2p dst).
-                        let broad = if !ifa.ifa_ifu.is_null()
+                        // The broadcast/dst union member differs by
+                        // platform: glibc exposes the raw union as
+                        // `ifa_ifu` (broadcast iff IFF_BROADCAST, else a
+                        // p2p dst), while macOS/BSD libc expose
+                        // `ifa_dstaddr` directly. Same IFF_BROADCAST
+                        // guard applies on both.
+                        #[cfg(target_os = "linux")]
+                        let broad_or_dst: *mut libc::sockaddr = ifa.ifa_ifu;
+                        #[cfg(not(target_os = "linux"))]
+                        let broad_or_dst: *mut libc::sockaddr = ifa.ifa_dstaddr;
+                        let broad = if !broad_or_dst.is_null()
                             && ifa.ifa_flags as u32 & (libc::IFF_BROADCAST as u32) != 0
-                            && (*ifa.ifa_ifu).sa_family as i32 == libc::AF_INET
+                            && (*broad_or_dst).sa_family as i32 == libc::AF_INET
                         {
-                            let ba = &*(ifa.ifa_ifu as *const libc::sockaddr_in);
+                            let ba = &*(broad_or_dst as *const libc::sockaddr_in);
                             Some(Ipv4Addr::from(u32::from_be(ba.sin_addr.s_addr)))
                         } else {
                             None
@@ -281,24 +288,53 @@ pub struct UdpInterceptor {
     /// to (local ip, this port) are aimed at the interceptor itself and
     /// must be dropped, never relayed (self-relay storm, issue #23).
     listen_port: u16,
-    local_ips: Vec<IpAddr>,
+    /// Whether this is the v6 sibling (filters refreshed snapshots).
+    v6: bool,
+    /// Live local-address snapshot. Refreshed by the idle-reaper task
+    /// (every FLOW_IDLE/2) so DHCP renewals, reconfigurations, and v6
+    /// temporary-address rotation keep the self-destination guard
+    /// valid for the process lifetime — a bind-time-only snapshot
+    /// would silently stop matching new local addresses (review).
+    local_ips: StdMutex<Vec<IpAddr>>,
     /// Directed-broadcast addresses of local subnets (drop, never relay).
-    broadcasts: Vec<Ipv4Addr>,
+    broadcasts: StdMutex<Vec<Ipv4Addr>>,
     /// Drops per reason since process start (for rate-limited logging).
     dropped: StdMutex<[u64; 3]>,
 }
 
 impl UdpInterceptor {
+    /// Re-enumerate local interfaces and swap the snapshots in place.
+    /// Called at bind time and by the reaper loop; on enumeration
+    /// failure keeps the previous snapshot (stale beats empty — an
+    /// empty list would disable the self-destination guard).
+    fn refresh_local_nets(&self) {
+        let (ips, broadcasts) = match local_nets() {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("udp: local interface refresh failed, keeping snapshot: {err}");
+                return;
+            }
+        };
+        if self.v6 {
+            *self.local_ips.lock().unwrap() = ips.into_iter().filter(|ip| ip.is_ipv6()).collect();
+        } else {
+            *self.local_ips.lock().unwrap() = ips;
+            *self.broadcasts.lock().unwrap() = broadcasts;
+        }
+    }
+
     /// Classify `dst` for a datagram whose flow key exists per
     /// `existing`; on drop, log rate-limited (first, then every 1000th)
     /// and return the reason.
     fn consider(&self, dst: &SocketAddr, existing: bool) -> Option<DropReason> {
         let flows_len = self.flows.lock().unwrap().len();
+        let local_ips = self.local_ips.lock().unwrap();
+        let broadcasts = self.broadcasts.lock().unwrap();
         let reason = drop_reason(
             dst,
             self.listen_port,
-            &self.local_ips,
-            &self.broadcasts,
+            &local_ips,
+            &broadcasts,
             existing,
             flows_len,
         )?;
@@ -355,16 +391,23 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     info!("udp interceptor listening on {addr}");
     // fail closed: without the address list the self-destination guard
     // cannot work (self-relay storm, issue #23)
-    let (local_ips, broadcasts) = local_nets()?;
-    Ok(Arc::new(UdpInterceptor {
+    let int = UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
         last_used: StdMutex::new(HashMap::new()),
         listen_port: port,
-        local_ips,
-        broadcasts,
+        v6: false,
+        local_ips: StdMutex::new(Vec::new()),
+        broadcasts: StdMutex::new(Vec::new()),
         dropped: StdMutex::new([0; 3]),
-    }))
+    };
+    int.refresh_local_nets();
+    if int.local_ips.lock().unwrap().is_empty() {
+        return Err(io::Error::other(
+            "local interface enumeration returned no addresses",
+        ));
+    }
+    Ok(Arc::new(int))
 }
 
 /// v6 sibling of `bind_client` (IPV6_TRANSPARENT + IPV6_RECVORIGDSTADDR,
@@ -407,17 +450,21 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
     socket.bind(&addr.into())?;
     let sock = Arc::new(UdpSocket::from_std(socket.into())?);
     info!("udp6 interceptor listening on {addr}");
-    let (local_ips, _) = local_nets()?;
-    let local_ips: Vec<IpAddr> = local_ips.into_iter().filter(|ip| ip.is_ipv6()).collect();
-    Ok(Arc::new(UdpInterceptor {
+    let int = UdpInterceptor {
         sock,
         flows: StdMutex::new(HashMap::new()),
         last_used: StdMutex::new(HashMap::new()),
         listen_port: port,
-        local_ips,
-        broadcasts: Vec::new(),
+        v6: true,
+        local_ips: StdMutex::new(Vec::new()),
+        broadcasts: StdMutex::new(Vec::new()),
         dropped: StdMutex::new([0; 3]),
-    }))
+    };
+    int.refresh_local_nets();
+    // A v6-only host (no v6 addresses at all) still binds — v4 traffic
+    // uses the v4 interceptor; the v6 self-destined guard simply has
+    // nothing to match.
+    Ok(Arc::new(int))
 }
 
 impl UdpInterceptor {
@@ -456,7 +503,7 @@ pub async fn serve_client(
     let sock = interceptor.sock.clone();
     let reaper = Arc::downgrade(&interceptor);
     tokio::spawn(async move {
-        // idle flow reaper
+        // idle flow reaper + local-interface refresher
         loop {
             tokio::time::sleep(FLOW_IDLE / 2).await;
             let Some(int) = reaper.upgrade() else { break };
@@ -473,6 +520,11 @@ pub async fn serve_client(
                 .lock()
                 .unwrap()
                 .retain(|_, t| now.duration_since(*t) < FLOW_IDLE * 2);
+            // Keep the self-destination guard valid for the process
+            // lifetime: local addresses change (DHCP, reconfiguration,
+            // v6 temporary-address rotation) and a bind-time-only
+            // snapshot would silently stop matching new ones (review).
+            int.refresh_local_nets();
         }
     });
 
@@ -1120,5 +1172,33 @@ mod tests {
             ips.iter().any(|ip| ip.is_loopback()),
             "no loopback in {ips:?}"
         );
+    }
+
+    /// Regression (issue #23 review): the local-address snapshot must be
+    /// REFRESHABLE, not bind-time-only — DHCP/reconfiguration/v6
+    /// temporary-address rotation add addresses later, and without a
+    /// refresh the self-destination guard silently stops matching them
+    /// (storm window until MAX_FLOWS). The reaper calls this every
+    /// FLOW_IDLE/2; this test pins the refresh mechanism itself.
+    #[tokio::test]
+    async fn snapshot_refresh_recovers_after_addresses_change() {
+        let int = bind_client(0).expect("bind succeeds on a healthy host");
+        // simulate an interface change wiping the snapshot
+        int.local_ips.lock().unwrap().clear();
+        assert!(int.local_ips.lock().unwrap().is_empty());
+        int.refresh_local_nets();
+        let ips = int.local_ips.lock().unwrap();
+        assert!(
+            ips.iter().any(|ip| ip.is_loopback()),
+            "refresh must repopulate local addresses"
+        );
+    }
+
+    /// Fail-closed bind (issue #23 review): a healthy host must yield a
+    /// non-empty snapshot — the bind errors rather than running blind.
+    #[tokio::test]
+    async fn bind_fails_closed_without_local_addresses() {
+        let int = bind_client(0).expect("bind succeeds on a healthy host");
+        assert!(!int.local_ips.lock().unwrap().is_empty());
     }
 }

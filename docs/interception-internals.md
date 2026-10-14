@@ -138,8 +138,9 @@ intercepted.
    remote service on the same port stays intercepted —, the fail-closed
    user-space drop in `lib::udp` (`drop_reason`: self-destined,
    non-unicast, flow cap — the cap refuses only NEW flows so a full
-   table never starves established sessions), and a hard `MAX_FLOWS`
-   cap. Note the kernel rules alone are NOT
+   table never starves established sessions), and a hard `MAX_FLOWS` cap on
+   LIVE flow tasks (a semaphore permit owned for each task's full
+   lifetime — stalled/zombie tasks count, not just map entries). Note the kernel rules alone are NOT
    enough: the interceptor's listener is a wildcard socket — even
    un-intercepted packets addressed to it arrive there via normal UDP
    demux. Regression: `env/tests/041-reg-udp-self-loop.sh`.

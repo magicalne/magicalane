@@ -159,7 +159,10 @@ enum DropReason {
     /// (connect() to broadcast fails EPERM anyway — the old behavior
     /// minted a doomed flow task per LAN mDNS packet, forever).
     NonUnicast,
-    /// flow table full (MAX_FLOWS): refuse new flows, keep existing.
+    /// Live flow-TASK slots exhausted (MAX_FLOWS permits): refuse to
+    /// spawn. The cap is a semaphore owned for each task's full
+    /// LIFETIME (not the flows-map length — stalled or zombie tasks
+    /// outlive their map entries, review round 4).
     FlowCap,
 }
 
@@ -174,17 +177,14 @@ impl DropReason {
 }
 
 /// Pure decision core (unit-tested): should a datagram with original
-/// destination `dst` be dropped instead of becoming a flow? `existing`
-/// says whether a flow for this (src,dst) key already exists — the
-/// flow cap only refuses NEW flows, so a full table never starves
-/// established sessions (they keep renewing; the idle reaper trims).
+/// destination `dst` be dropped instead of becoming a flow? (The
+/// flow-TASK cap is a separate lifetime-owned semaphore, see
+/// `try_flow_slot`.)
 fn drop_reason(
     dst: &SocketAddr,
     listen_port: u16,
     local_ips: &[IpAddr],
     broadcasts: &[Ipv4Addr],
-    existing: bool,
-    flows_len: usize,
 ) -> Option<DropReason> {
     let ip = dst.ip();
     if dst.port() == listen_port && local_ips.contains(&ip) {
@@ -195,9 +195,6 @@ fn drop_reason(
         || matches!(ip, IpAddr::V4(v4) if broadcasts.contains(&v4))
     {
         return Some(DropReason::NonUnicast);
-    }
-    if !existing && flows_len >= MAX_FLOWS {
-        return Some(DropReason::FlowCap);
     }
     None
 }
@@ -298,6 +295,10 @@ pub struct UdpInterceptor {
     local_ips: StdMutex<Vec<IpAddr>>,
     /// Directed-broadcast addresses of local subnets (drop, never relay).
     broadcasts: StdMutex<Vec<Ipv4Addr>>,
+    /// Live flow-TASK slots (MAX_FLOWS). One permit per spawned flow
+    /// task, owned for the task's full lifetime — the hard cap counts
+    /// stalled/zombie tasks too, not just map entries (review r4).
+    flow_tasks: Arc<tokio::sync::Semaphore>,
     /// Drops per reason since process start (for rate-limited logging).
     dropped: StdMutex<[u64; 3]>,
 }
@@ -325,21 +326,9 @@ impl UdpInterceptor {
         Ok(())
     }
 
-    /// Classify `dst` for a datagram whose flow key exists per
-    /// `existing`; on drop, log rate-limited (first, then every 1000th)
-    /// and return the reason.
-    fn consider(&self, dst: &SocketAddr, existing: bool) -> Option<DropReason> {
-        let flows_len = self.flows.lock().unwrap().len();
-        let local_ips = self.local_ips.lock().unwrap();
-        let broadcasts = self.broadcasts.lock().unwrap();
-        let reason = drop_reason(
-            dst,
-            self.listen_port,
-            &local_ips,
-            &broadcasts,
-            existing,
-            flows_len,
-        )?;
+    /// Record + rate-limit-log a drop of `reason` (first, then every
+    /// 1000th occurrence).
+    fn note_drop(&self, reason: DropReason, dst: &SocketAddr) {
         let idx = match reason {
             DropReason::SelfDestined => 0,
             DropReason::NonUnicast => 1,
@@ -354,7 +343,34 @@ impl UdpInterceptor {
                 dropped[idx]
             );
         }
+    }
+
+    /// Classify `dst` (self-destined / non-unicast); on drop, log
+    /// rate-limited and return the reason.
+    fn consider(&self, dst: &SocketAddr) -> Option<DropReason> {
+        let local_ips = self.local_ips.lock().unwrap();
+        let broadcasts = self.broadcasts.lock().unwrap();
+        let reason = drop_reason(dst, self.listen_port, &local_ips, &broadcasts)?;
+        drop(local_ips);
+        drop(broadcasts);
+        self.note_drop(reason, dst);
         Some(reason)
+    }
+
+    /// Reserve a live flow-TASK slot for a new flow. The semaphore has
+    /// MAX_FLOWS permits; each spawned task owns one for its ENTIRE
+    /// lifetime (setup, relay, and any stall) — the flows-map length
+    /// is NOT the cap, because tasks can outlive their map entries
+    /// (zombies blocked in connect or on a silent stream, review
+    /// round 4). None = at the hard task cap, refuse the new flow.
+    fn try_flow_slot(self: &Arc<Self>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match Arc::clone(&self.flow_tasks).try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                self.note_drop(DropReason::FlowCap, &"0.0.0.0:0".parse().unwrap());
+                None
+            }
+        }
     }
 }
 
@@ -401,6 +417,7 @@ pub fn bind_client(port: u16) -> io::Result<Arc<UdpInterceptor>> {
         v6: false,
         local_ips: StdMutex::new(Vec::new()),
         broadcasts: StdMutex::new(Vec::new()),
+        flow_tasks: Arc::new(tokio::sync::Semaphore::new(MAX_FLOWS)),
         dropped: StdMutex::new([0; 3]),
     };
     int.refresh_local_nets()?;
@@ -460,6 +477,7 @@ pub fn bind_client_v6(port: u16) -> io::Result<Arc<UdpInterceptor>> {
         v6: true,
         local_ips: StdMutex::new(Vec::new()),
         broadcasts: StdMutex::new(Vec::new()),
+        flow_tasks: Arc::new(tokio::sync::Semaphore::new(MAX_FLOWS)),
         dropped: StdMutex::new([0; 3]),
     };
     // Fail closed on the INITIAL enumeration too (review): an error
@@ -577,25 +595,33 @@ pub async fn serve_client(
                     // one — self-destined (addressed to this interceptor;
                     // relaying = infinite loop, each hop a new task + fd
                     // + 64KiB buffer until fd exhaustion — the production
-                    // GB/day RSS ratchet, issue #23), non-unicast, and
-                    // beyond the flow cap. Checked BEFORE any map insert
-                    // so a dropped class leaves no state behind.
-                    // (Self/non-unicast also apply to existing flows:
-                    // such a flow can never legitimately exist.)
+                    // GB/day RSS ratchet, issue #23) and non-unicast.
+                    // Checked BEFORE any map insert so a dropped class
+                    // leaves no state behind.
                     drop(flows);
-                    if interceptor.consider(&dst, false).is_some() {
+                    if interceptor.consider(&dst).is_some() {
                         continue;
                     }
+                    // Hard live-task cap: the permit is owned for the
+                    // task's full lifetime (setup + relay + stalls), so
+                    // zombies count and replacements cannot bypass it.
+                    let Some(permit) = interceptor.try_flow_slot() else {
+                        continue;
+                    };
                     let mut flows = interceptor.flows.lock().unwrap();
                     if let Some(tx) = flows.get(&key) {
-                        // raced in while unlocked: treat as existing
+                        // raced in while unlocked: treat as existing;
+                        // the unused slot returns with the permit drop
                         tx.clone()
                     } else {
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
                         let pool = pool.clone();
                         let sock = sock.clone();
                         let router = router.clone();
-                        tokio::spawn(flow_task(key, rx, pool, sock, router));
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            flow_task(key, rx, pool, sock, router).await
+                        });
                         flows.insert(key, tx.clone());
                         tx
                     }
@@ -732,10 +758,22 @@ async fn udp_tunnel_flow(
     server: Option<std::sync::Arc<str>>,
     sock: Arc<UdpSocket>,
 ) {
-    let mut stream = match pool.connect(server.as_deref(), magic_addr(), None).await {
-        Ok(s) => s,
-        Err(err) => {
+    // Bounded setup: a stalled connect must not pin a flow-task slot
+    // (and its permit) forever — the semaphore cap only recovers when
+    // tasks finish (review r4).
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(30),
+        pool.connect(server.as_deref(), magic_addr(), None),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(err)) => {
             debug!("udp flow to {dst} connect failed: {err}");
+            return;
+        }
+        Err(_) => {
+            debug!("udp flow to {dst} connect timed out");
             return;
         }
     };
@@ -757,7 +795,13 @@ async fn udp_tunnel_flow(
     let mut read_buf = vec![0u8; 65536];
     loop {
         tokio::select! {
-            Some(dg) = rx.recv() => {
+            // Channel closed (reaper removed the entry / all senders
+            // dropped): EXIT, don't disable the branch — a disabled
+            // branch left the task pending on stream.read() forever on
+            // silent relay streams, accumulating zombie tasks past the
+            // cap (review r4).
+            maybe = rx.recv() => {
+                let Some(dg) = maybe else { break };
                 let mut frame = Vec::with_capacity(2 + dg.len());
                 frame.put_u16(dg.len() as u16);
                 frame.extend_from_slice(&dg);
@@ -1053,25 +1097,19 @@ mod tests {
         let bcasts = broadcasts();
         // our port on our IP (the storm case, v4 and v6)
         assert_eq!(
-            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, false, 0),
+            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts),
             Some(DropReason::SelfDestined)
         );
         assert_eq!(
-            drop_reason(&sa("[fd00::1]:7896"), 7896, &ips, &bcasts, false, 0),
+            drop_reason(&sa("[fd00::1]:7896"), 7896, &ips, &bcasts),
             Some(DropReason::SelfDestined)
         );
         // same IP but a different port = some other local service:
         // relaying to it is legitimate (hairpin to the LAN web UI etc.)
-        assert_eq!(
-            drop_reason(&sa("10.89.0.5:80"), 7896, &ips, &bcasts, false, 0),
-            None
-        );
+        assert_eq!(drop_reason(&sa("10.89.0.5:80"), 7896, &ips, &bcasts), None);
         // our port on a foreign IP = an upstream service that happens to
         // use the same port number; must NOT be dropped
-        assert_eq!(
-            drop_reason(&sa("8.8.8.8:7896"), 7896, &ips, &bcasts, false, 0),
-            None
-        );
+        assert_eq!(drop_reason(&sa("8.8.8.8:7896"), 7896, &ips, &bcasts), None);
     }
 
     /// Regression (issue #23 acceptance): LAN mDNS/WSD broadcast and
@@ -1092,48 +1130,39 @@ mod tests {
             "[ff02::fb]:5353",       // mDNS v6 multicast
         ] {
             assert_eq!(
-                drop_reason(&sa(dst), 7896, &ips, &bcasts, false, 0),
+                drop_reason(&sa(dst), 7896, &ips, &bcasts),
                 Some(DropReason::NonUnicast),
                 "{dst} must be dropped as non-unicast"
             );
         }
         // plain unicast passes
-        assert_eq!(
-            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, false, 0),
-            None
-        );
+        assert_eq!(drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts), None);
     }
 
-    /// Regression (issue #23 review): the flow cap must only refuse NEW
-    /// flows — established flows keep renewing so a full table never
-    /// starves active sessions until the reaper trims.
-    #[test]
-    fn flow_cap_refuses_only_new_flows() {
-        let ips = local_ips();
-        let bcasts = broadcasts();
-        assert_eq!(
-            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, false, MAX_FLOWS),
-            Some(DropReason::FlowCap),
-            "new flow at cap must be refused"
+    /// Regression (issue #23 review round 4): the flow cap must count
+    /// LIVE TASKS, not flows-map entries — tasks can outlive their map
+    /// entries (blocked in connect, or pending on a silent stream after
+    /// the reaper removed the entry), so a map-length cap let a flood
+    /// accumulate unbounded tasks/fds. The cap is now a semaphore whose
+    /// permits are owned for each task's full lifetime.
+    #[tokio::test]
+    async fn flow_task_slots_hard_cap_live_tasks() {
+        let int = bind_client(0).expect("bind succeeds on a healthy host");
+        let mut held = Vec::new();
+        for _ in 0..MAX_FLOWS {
+            held.push(
+                int.try_flow_slot()
+                    .expect("permits available below the cap"),
+            );
+        }
+        assert!(
+            int.try_flow_slot().is_none(),
+            "at the cap, a new flow task must be refused"
         );
-        assert_eq!(
-            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, true, MAX_FLOWS),
-            None,
-            "existing flow at cap must keep flowing"
-        );
-        assert_eq!(
-            drop_reason(&sa("1.1.1.1:53"), 7896, &ips, &bcasts, false, MAX_FLOWS - 1),
-            None
-        );
-        // self-destined wins even when there is flow budget left
-        assert_eq!(
-            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, false, 0),
-            Some(DropReason::SelfDestined)
-        );
-        // ...and regardless of existence (such a flow must never live)
-        assert_eq!(
-            drop_reason(&sa("10.89.0.5:7896"), 7896, &ips, &bcasts, true, 0),
-            Some(DropReason::SelfDestined)
+        drop(held);
+        assert!(
+            int.try_flow_slot().is_some(),
+            "finished tasks must return their slot"
         );
     }
 

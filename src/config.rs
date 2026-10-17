@@ -9,6 +9,8 @@ pub struct Config {
     pub bandwidth: usize,
     pub verbose: bool,
     pub tuning: Option<Tuning>,
+    /// Live status page ([status]; client kind — see `StatusConfig`).
+    pub status: Option<StatusConfig>,
 }
 
 /// Transport tuning knobs (see `KcpTuning` / `QuicTuning`).
@@ -436,4 +438,110 @@ pub struct ServerDns {
     pub upstream: Option<OneOrMany>,
     /// Cache entry cap (default 4096; 0 disables caching).
     pub cache_size: Option<usize>,
+}
+
+/// Live status-page configuration (`[status]`, client kind).
+///
+/// Serves a read-only HTML view of client health on a localhost-only
+/// listener: instance info, listeners, routing-pool health, a per-transport
+/// probe matrix over `[[status.target]]` entries (with UDP-vs-TCP
+/// divergence hints), and a ring of recent events. Absent = off.
+///
+/// ```toml
+/// [status]
+/// bind = "127.0.0.1:8280"        # listener (localhost-only default)
+/// refresh = 5                    # page auto-refresh seconds
+/// interval = 30                  # probe cadence per target (staggered)
+/// timeout = 8                    # per-probe timeout seconds
+/// url = "http://api.ipify.org/"  # through-tunnel probe (body = exit IP)
+///
+/// [[status.target]]
+/// name = "korea-quic"            # unique row label
+/// server = "korea"               # grouping key for divergence hints
+/// transport = "quic"             # quic | kcp | tcp
+/// host = "kr.example.com"
+/// port = 4433
+/// # password = "shared-or-own"   # default: top-level `password`
+/// # ca_path = "certs/ca.pem"     # default: primary proxy's CA
+/// # tls = true                   # kcp/tcp transport TLS (default true)
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusConfig {
+    /// HTTP listener for the status page (default "127.0.0.1:8280").
+    /// Kept localhost-only by default: the page shows topology details
+    /// the proxy ports intentionally keep behind auth.
+    #[serde(default = "d_status_bind")]
+    pub bind: String,
+    /// Page auto-refresh in seconds (default 5).
+    #[serde(default = "d_status_refresh")]
+    pub refresh: u64,
+    /// Probe cadence per target in seconds (default 30). Targets are
+    /// staggered across the interval so probes never pile up.
+    #[serde(default = "d_status_interval")]
+    pub interval: u64,
+    /// Per-probe timeout in seconds (default 8).
+    #[serde(default = "d_status_timeout")]
+    pub timeout: u64,
+    /// Through-tunnel probe URL (default `http://api.ipify.org/`): the
+    /// response body is parsed for the exit IP. Any URL works for a
+    /// plain reachability probe.
+    #[serde(default = "d_status_url")]
+    pub url: String,
+    /// Probe matrix rows. Unreferenced by routing — a private pool the
+    /// status module probes on its own cadence.
+    #[serde(default)]
+    pub target: Vec<StatusTarget>,
+}
+
+fn d_status_bind() -> String {
+    "127.0.0.1:8280".into()
+}
+fn d_status_refresh() -> u64 {
+    5
+}
+fn d_status_interval() -> u64 {
+    30
+}
+fn d_status_timeout() -> u64 {
+    8
+}
+fn d_status_url() -> String {
+    "http://api.ipify.org/".into()
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            bind: d_status_bind(),
+            refresh: d_status_refresh(),
+            interval: d_status_interval(),
+            timeout: d_status_timeout(),
+            url: d_status_url(),
+            target: Vec::new(),
+        }
+    }
+}
+
+/// One status-probe row (`[[status.target]]`): a remote tunnel server
+/// × transport to health-check independently of routing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusTarget {
+    /// Unique row label (e.g. "korea-quic").
+    pub name: String,
+    /// Grouping key for divergence hints (e.g. "korea"); default = name.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Transport: `quic` | `kcp` | `tcp`.
+    pub transport: String,
+    pub host: String,
+    pub port: u16,
+    /// Server password; default = top-level `password`.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// CA bundle for the tunnel TLS; default = primary proxy's CA.
+    #[serde(default)]
+    pub ca_path: Option<String>,
+    /// TLS for kcp/tcp transports (default true).
+    #[serde(default)]
+    pub tls: Option<bool>,
 }

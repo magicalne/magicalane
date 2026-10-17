@@ -21,6 +21,35 @@ kind = { Client = { proxy = { host = "my-server.example.com", port = 4433, ca_pa
 upstream = ["1.1.1.1:53", "8.8.8.8:53"]
 cache_size = 4096
 
+# Live status page (localhost-only, read-only diagnostics): instance
+# info, routing-pool health, a per-transport probe matrix with
+# UDP-vs-TCP divergence hints, and recent events. Absent = off.
+[status]
+bind = "127.0.0.1:8280"
+refresh = 5                    # page auto-refresh seconds
+interval = 30                  # probe cadence per target (staggered)
+timeout = 8                    # per-probe timeout seconds
+url = "http://api.ipify.org/"  # through-tunnel probe; body = exit IP
+
+# Probe rows — servers/transports to watch. Independent of routing
+# (a private pool): the primary korea-style default + a tcp/443 twin.
+[[status.target]]
+name = "default-quic"
+server = "primary"            # grouping key for divergence hints
+transport = "quic"
+host = "my-server.example.com"
+port = 4433
+# password = "change-me"      # default: top-level `password`
+ca_path = "/etc/magicalane/certs/ca.pem"
+
+[[status.target]]
+name = "primary-tcp"
+server = "primary"
+transport = "tcp"
+host = "my-server.example.com"
+port = 443
+ca_path = "/etc/magicalane/certs/ca.pem"
+
 [tuning.quic]
 congestion = "bbr"          # cubic (default) | bbr | new-reno
 # send_window = 16777216

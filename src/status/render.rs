@@ -33,6 +33,9 @@ pub struct TargetRow {
     pub last_ok: Option<SystemTime>,
     pub last_error: Option<String>,
     pub fail_stage: Option<FailStage>,
+    /// Connector build failed/timed out — the row cannot probe at all
+    /// (`✕ no connector` + this message).
+    pub build_err: Option<String>,
 }
 
 /// One routing-pool server row.
@@ -73,10 +76,14 @@ pub fn is_udp_transport(transport: &str) -> bool {
 }
 
 /// Classify a server group from its rows' liveness. `None` = healthy
-/// (nothing to hint) or nothing to compare. Pending rows (never
-/// probed) are excluded — they carry no signal yet.
+/// (nothing to hint) or nothing to compare. Rows that merely haven't
+/// been probed yet (starting) carry no signal and are excluded —
+/// build-failed rows are NOT (they are down).
 pub fn group_hint(rows: &[&TargetRow]) -> Option<Hint> {
-    let rows: Vec<_> = rows.iter().filter(|r| !r.pending).collect();
+    let rows: Vec<_> = rows
+        .iter()
+        .filter(|r| !(r.pending && r.build_err.is_none()))
+        .collect();
     if rows.is_empty() || rows.iter().all(|r| r.alive) {
         return None;
     }
@@ -261,8 +268,11 @@ pub fn render_page(s: &Snapshot<'_>) -> String {
             h.push_str(&format!("<div><b>{}</b></div>\n", esc(&g.server)));
             h.push_str("<table><tr><th>target</th><th>transport</th><th>endpoint</th><th>state</th><th>handshake</th><th>total</th><th>exit ip</th><th>last ok</th><th>last error</th></tr>\n");
             for r in &g.rows {
-                let (dot, cls, label) = if r.pending {
-                    ("…", "dim", "pending".to_string())
+                let (dot, cls, label) = if let Some(berr) = &r.build_err {
+                    let _ = berr;
+                    ("✕", "dead", "no connector".to_string())
+                } else if r.pending {
+                    ("…", "dim", "starting".to_string())
                 } else if r.alive && r.consecutive_failures == 0 {
                     ("●", "ok", "alive".to_string())
                 } else if r.alive {
@@ -275,10 +285,11 @@ pub fn render_page(s: &Snapshot<'_>) -> String {
                         format!("DEAD ({} fails)", r.consecutive_failures),
                     )
                 };
-                let err = match (&r.last_error, &r.fail_stage) {
-                    (Some(e), Some(FailStage::Handshake)) => format!("hs: {e}"),
-                    (Some(e), Some(FailStage::Relay)) => format!("relay: {e}"),
-                    (Some(e), None) => e.clone(),
+                let err = match (&r.build_err, &r.last_error, &r.fail_stage) {
+                    (Some(b), _, _) => b.clone(),
+                    (None, Some(e), Some(FailStage::Handshake)) => format!("hs: {e}"),
+                    (None, Some(e), Some(FailStage::Relay)) => format!("relay: {e}"),
+                    (None, Some(e), None) => e.clone(),
                     _ => String::new(),
                 };
                 h.push_str(&format!(
@@ -352,6 +363,7 @@ mod tests {
             transport: transport.into(),
             endpoint: "10.0.0.1:4433".into(),
             alive,
+            build_err: None,
             pending: false,
             consecutive_failures: if alive { 0 } else { 3 },
             latency: Some(Duration::from_millis(120)),
@@ -463,6 +475,48 @@ mod tests {
         });
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn build_failed_row_renders_and_counts_down_for_hints() {
+        let mut q = row("korea-quic", "korea", "quic", false);
+        // connector never landed: never probed AND build failed
+        q.pending = true;
+        q.build_err = Some("build: timeout".into());
+        q.last_error = None;
+        q.fail_stage = None;
+        let t = row("korea-tcp", "korea", "tcp", true);
+
+        // hint: UDP transport down (build failed) + TCP fine -> throttled
+        let hint = group_hint(&[&q, &t]);
+        assert_eq!(hint, Some(Hint::UdpThrottled));
+        let html = render_page(&Snapshot {
+            version: "t",
+            pid: 1,
+            config_path: "c",
+            uptime: Duration::from_secs(1),
+            listeners: &[],
+            pool_default: "default",
+            pool_rows: &[],
+            groups: &[],
+            groups_hint: None,
+            target_groups: vec![GroupView {
+                server: "korea".into(),
+                rows: vec![q, t.clone()],
+                hint,
+            }],
+            events: &[],
+            refresh: 5,
+            generated_at: SystemTime::now(),
+        });
+        assert!(html.contains("no connector"));
+        assert!(html.contains("build: timeout"));
+        assert!(html.contains(Hint::UdpThrottled.text()));
+        // a starting row (pending, no build error) stays excluded
+        let mut st = row("korea-kcp", "korea", "kcp", true);
+        st.pending = true;
+        st.build_err = None;
+        assert_eq!(group_hint(&[&st, &t]), None);
     }
 
     #[test]

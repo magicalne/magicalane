@@ -163,11 +163,14 @@ struct TargetShared {
     last_ok: Option<SystemTime>,
     last_error: Option<String>,
     fail_stage: Option<FailStage>,
+    /// Connector build failed/timed out (the row cannot even probe;
+    /// distinct from a probe handshake failure). Cleared when a
+    /// retried build lands.
+    build_err: Option<String>,
 }
 
 struct TargetRuntime {
     cfg: StatusTarget,
-    connector: TunnelConnector,
     shared: Arc<Mutex<TargetShared>>,
 }
 
@@ -181,8 +184,11 @@ struct ServerState {
 }
 
 /// Build target connectors, bind the listener, spawn probe + server
-/// tasks. Errors are returned for the caller to log — the client keeps
-/// running either way.
+/// tasks. The listener binds FIRST (#27): the page must always come
+/// up — connector builds happen inside per-target supervisor tasks
+/// with a timeout, so a degraded server can only ever mark its own
+/// row `no connector`. Bind errors are returned for the caller to
+/// log — the client keeps running either way.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn(
     cfg: StatusConfig,
@@ -194,6 +200,10 @@ pub async fn spawn(
     quic_tuning: Option<crate::config::QuicTuning>,
     ring: Arc<EventRing>,
 ) -> io::Result<()> {
+    // Bind before ANY target work: even if every connector build
+    // hangs, the page (and its ring) stays reachable.
+    let listener = TcpListener::bind(&cfg.bind).await?;
+
     let mut targets = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for t in &cfg.target {
@@ -201,27 +211,8 @@ pub async fn spawn(
             log::warn!("status: duplicate target {:?} skipped", t.name);
             continue;
         }
-        let pw = t
-            .password
-            .clone()
-            .map(String::into_bytes)
-            .unwrap_or_else(|| default_password.to_vec());
-        let ca = t.ca_path.clone().or_else(|| default_ca.map(str::to_string));
-        let connector = crate::tunnel::build_connector(
-            &t.host,
-            t.port,
-            &t.transport,
-            ca,
-            t.tls.unwrap_or(true),
-            &pw,
-            &kcp_tuning,
-            &quic_tuning,
-        )
-        .await
-        .map_err(|e| io::Error::other(format!("status target {:?}: {e}", t.name)))?;
         targets.push(TargetRuntime {
             cfg: t.clone(),
-            connector,
             shared: Arc::new(Mutex::new(TargetShared {
                 alive: true,
                 ..Default::default()
@@ -229,7 +220,6 @@ pub async fn spawn(
         });
     }
 
-    let listener = TcpListener::bind(&cfg.bind).await?;
     let state = Arc::new(ServerState {
         started: Instant::now(),
         info,
@@ -241,19 +231,40 @@ pub async fn spawn(
     ring.push("status", format!("listening on http://{}", state.cfg.bind));
     log::info!("status: page at http://{}", state.cfg.bind);
 
-    // Probe tasks: staggered across the interval, one in flight per
-    // target forever.
+    // Per-target supervisor tasks: staggered, each owns its (retried)
+    // connector build + probe loop. One hung server can never block
+    // the page or the other targets.
     let n = state.targets.len().max(1) as u64;
     for (i, t) in state.targets.iter().enumerate() {
-        let offset = Duration::from_secs(state.cfg.interval * (i as u64) / n);
-        tokio::spawn(probe_task(
-            t.connector.clone(),
-            t.cfg.clone(),
+        let pw = t
+            .cfg
+            .password
+            .clone()
+            .map(String::into_bytes)
+            .unwrap_or_else(|| default_password.to_vec());
+        let ca = t
+            .cfg
+            .ca_path
+            .clone()
+            .or_else(|| default_ca.map(str::to_string));
+        let spec = TargetSpec {
+            name: t.cfg.name.clone(),
+            host: t.cfg.host.clone(),
+            port: t.cfg.port,
+            transport: t.cfg.transport.clone(),
+            ca,
+            tls: t.cfg.tls.unwrap_or(true),
+            password: pw,
+            kcp_tuning: kcp_tuning.clone(),
+            quic_tuning: quic_tuning.clone(),
+            interval: Duration::from_secs(state.cfg.interval.max(1)),
+            timeout: Duration::from_secs(state.cfg.timeout.max(1)),
+            url: state.cfg.url.clone(),
+            offset: Duration::from_secs(state.cfg.interval * (i as u64) / n),
+        };
+        tokio::spawn(target_supervisor(
+            spec,
             t.shared.clone(),
-            state.cfg.interval,
-            state.cfg.timeout,
-            state.cfg.url.clone(),
-            offset,
             state.ring.clone(),
         ));
     }
@@ -279,25 +290,113 @@ pub async fn spawn(
     Ok(())
 }
 
-/// Per-target probe loop: sleep(stagger) → probe → record → sleep(interval).
-#[allow(clippy::too_many_arguments)]
-async fn probe_task(
-    connector: TunnelConnector,
-    cfg: StatusTarget,
-    shared: Arc<Mutex<TargetShared>>,
-    interval: u64,
-    timeout: u64,
+/// Everything a target supervisor needs to (re)build its connector
+/// and run its probe loop — owned by the task, so a build that hangs
+/// can only ever block its own target (#27).
+struct TargetSpec {
+    name: String,
+    host: String,
+    port: u16,
+    transport: String,
+    ca: Option<String>,
+    tls: bool,
+    password: Vec<u8>,
+    kcp_tuning: Option<crate::config::KcpTuning>,
+    quic_tuning: Option<crate::config::QuicTuning>,
+    interval: Duration,
+    timeout: Duration,
     url: String,
     offset: Duration,
+}
+
+/// Per-target supervisor: (re)build the connector with a timeout,
+/// then run the probe loop forever. A build that hangs or fails marks
+/// the row `no connector` (latch reset on success) and retries on the
+/// probe interval — the target recovers without a process restart.
+async fn target_supervisor(
+    spec: TargetSpec,
+    shared: Arc<Mutex<TargetShared>>,
     ring: Arc<EventRing>,
 ) {
-    tokio::time::sleep(offset).await;
-    let interval = Duration::from_secs(interval.max(1));
+    tokio::time::sleep(spec.offset).await;
     loop {
-        let out = probe_once(&connector, &url, Duration::from_secs(timeout.max(1))).await;
-        record(&cfg, &shared, out, &ring);
-        tokio::time::sleep(interval).await;
+        let built = tokio::time::timeout(
+            spec.timeout,
+            crate::tunnel::build_connector(
+                &spec.host,
+                spec.port,
+                &spec.transport,
+                spec.ca.clone(),
+                spec.tls,
+                &spec.password,
+                &spec.kcp_tuning,
+                &spec.quic_tuning,
+            ),
+        )
+        .await;
+        let connector = match built {
+            Ok(Ok(c)) => {
+                {
+                    let mut s = shared.lock().unwrap();
+                    // Latch reset: fresh probe state for the new
+                    // connector; `ever_probed=false` renders "starting"
+                    // until the first probe lands.
+                    s.build_err = None;
+                    s.ever_probed = false;
+                    s.alive = true;
+                    s.consecutive_failures = 0;
+                    s.latency = None;
+                    s.handshake = None;
+                    s.last_error = None;
+                    s.fail_stage = None;
+                }
+                ring.push(
+                    "probe",
+                    format!("{} connector established ({})", spec.name, spec.transport),
+                );
+                c
+            }
+            Ok(Err(e)) => {
+                mark_build_failed(&shared, format!("build: {e}"));
+                ring.push(
+                    "probe",
+                    format!("{} connector build failed: {e}", spec.name),
+                );
+                tokio::time::sleep(spec.interval).await;
+                continue;
+            }
+            Err(_) => {
+                mark_build_failed(&shared, "build: timeout".into());
+                ring.push(
+                    "probe",
+                    format!(
+                        "{} connector build timed out ({}s)",
+                        spec.name,
+                        spec.timeout.as_secs()
+                    ),
+                );
+                tokio::time::sleep(spec.interval).await;
+                continue;
+            }
+        };
+        loop {
+            let out = probe_once(&connector, &spec.url, spec.timeout).await;
+            record(&spec.name, &shared, out, &ring);
+            tokio::time::sleep(spec.interval).await;
+        }
     }
+}
+
+/// Mark a target as having no usable connector (build failed/timed
+/// out): down for hints, error visible on the row; probe counters
+/// untouched (nothing was probed).
+fn mark_build_failed(shared: &Arc<Mutex<TargetShared>>, err: String) {
+    let mut s = shared.lock().unwrap();
+    s.alive = false;
+    s.build_err = Some(err);
+    s.latency = None;
+    s.handshake = None;
+    s.exit_ip = None;
 }
 
 /// Staged outcome of one probe.
@@ -406,12 +505,7 @@ fn parse_exit_ip(body: &[u8]) -> Option<String> {
 
 /// Apply a probe outcome to the shared state; emit ring events on
 /// transitions (alive↔dead, exit-IP change, first result).
-fn record(
-    cfg: &StatusTarget,
-    shared: &Arc<Mutex<TargetShared>>,
-    out: ProbeOutcome,
-    ring: &Arc<EventRing>,
-) {
+fn record(name: &str, shared: &Arc<Mutex<TargetShared>>, out: ProbeOutcome, ring: &Arc<EventRing>) {
     let mut s = shared.lock().unwrap();
     let was_alive = s.alive && s.ever_probed;
     let prev_ip = s.exit_ip.clone();
@@ -450,7 +544,7 @@ fn record(
             "probe",
             format!(
                 "{} first result: {} {}",
-                cfg.name,
+                name,
                 if out.ok { "ok" } else { "FAIL" },
                 if out.ok {
                     format!(
@@ -468,7 +562,7 @@ fn record(
             "probe",
             format!(
                 "{} is DEAD ({}: {})",
-                cfg.name,
+                name,
                 stage(&out),
                 out.error.as_deref().unwrap_or("?")
             ),
@@ -476,7 +570,7 @@ fn record(
     } else if !was_alive && now_alive {
         ring.push(
             "probe",
-            format!("{} is ALIVE ({}ms)", cfg.name, out.total.as_millis()),
+            format!("{name} is ALIVE ({}ms)", out.total.as_millis()),
         );
     }
     if out.ok && out.exit_ip.is_some() && prev_ip.is_some() && out.exit_ip != prev_ip {
@@ -484,7 +578,7 @@ fn record(
             "exitip",
             format!(
                 "{}: {} -> {}",
-                cfg.name,
+                name,
                 prev_ip.as_deref().unwrap_or("?"),
                 out.exit_ip.as_deref().unwrap_or("?")
             ),
@@ -585,6 +679,7 @@ fn render_page_state(state: &ServerState) -> String {
             last_ok: s.last_ok,
             last_error: s.last_error.clone(),
             fail_stage: s.fail_stage.clone(),
+            build_err: s.build_err.clone(),
             pending: !s.ever_probed,
         });
     }
@@ -717,6 +812,69 @@ mod tests {
         assert!(!out.ok);
         assert_eq!(out.stage, Some(FailStage::Handshake));
         assert!(out.error.is_some());
+    }
+
+    /// Regression (#27): a target whose connector build cannot complete
+    /// must NOT prevent the page from binding — the listener binds
+    /// first and the row shows starting / no-connector.
+    #[tokio::test]
+    async fn page_binds_while_target_build_hangs() {
+        // 10.255.255.1: unroutable — the QUIC handshake hangs until the
+        // build timeout (environment-dependent whether it hangs or
+        // errors; both must leave the page up either way).
+        let cfg = crate::config::StatusConfig {
+            bind: "127.0.0.1:18280".into(),
+            interval: 2,
+            timeout: 2,
+            ..Default::default()
+        };
+        let target = crate::config::StatusTarget {
+            name: "hung-quic".into(),
+            server: Some("nowhere".into()),
+            transport: "quic".into(),
+            host: "10.255.255.1".into(),
+            port: 4433,
+            password: None,
+            ca_path: None,
+            tls: None,
+        };
+        let mut cfg = cfg;
+        cfg.target = vec![target];
+        let pool = crate::tunnel::ProxyPool::single(crate::tunnel::TunnelConnector::Kcp(
+            crate::kcp::connector::KcpConnector::new("127.0.0.1".into(), 1, None, vec![], false, None)
+                .unwrap(),
+        ));
+        let info = InstanceInfo {
+            version: "test",
+            pid: 1,
+            config_path: "test.toml".into(),
+            listeners: vec![],
+        };
+        let ring = Arc::new(EventRing::with_cap(50));
+        let body = tokio::time::timeout(Duration::from_secs(20), async {
+            spawn(cfg, &pool, info, b"pw", None, None, None, ring.clone())
+                .await
+                .expect("spawn binds immediately");
+            // Page must answer while the target build is still pending.
+            let mut s = tokio::net::TcpStream::connect("127.0.0.1:18280")
+                .await
+                .expect("status listener reachable");
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            s.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await
+        .expect("page up while connector build is stuck");
+        assert!(body.starts_with("HTTP/1.1 200"), "not 200: {body}");
+        assert!(body.contains("hung-quic"));
+        assert!(
+            body.contains("starting") || body.contains("no connector"),
+            "row neither starting nor failed: {body}"
+        );
     }
 
     #[test]

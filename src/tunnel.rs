@@ -135,6 +135,9 @@ pub struct Health {
     pub alive: bool,
     pub latency: Option<std::time::Duration>,
     pub consecutive_failures: u32,
+    /// When the last successful probe completed (age → “last ok");
+    /// wall-clock so the status page can render it.
+    pub last_ok: Option<std::time::SystemTime>,
 }
 
 impl Default for Health {
@@ -143,6 +146,7 @@ impl Default for Health {
             alive: true,
             latency: None,
             consecutive_failures: 0,
+            last_ok: None,
         }
     }
 }
@@ -165,6 +169,7 @@ pub fn record_probe(h: &mut Health, r: ProbeResult) -> bool {
             h.alive = true;
             h.latency = Some(d);
             h.consecutive_failures = 0;
+            h.last_ok = Some(std::time::SystemTime::now());
         }
         ProbeResult::Failed => {
             h.latency = None;
@@ -602,6 +607,61 @@ fn find_cycle(
 }
 
 // ---------------------------------------------------------------- probes
+
+/// Build a tunnel connector for one server/transport (client side).
+/// Shared by the routing pool and the status-page probe matrix.
+/// `password` is per-entry (the top-level config password by default).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_connector(
+    host: &str,
+    port: u16,
+    protocol: &str,
+    ca_path: Option<String>,
+    tls: bool,
+    password: &[u8],
+    kcp_tuning: &Option<crate::config::KcpTuning>,
+    quic_tuning: &Option<crate::config::QuicTuning>,
+) -> crate::error::Result<TunnelConnector> {
+    match crate::config::Protocol::from_opt(&Some(protocol.to_string()))
+        .unwrap_or(crate::config::Protocol::Quic)
+    {
+        crate::config::Protocol::Quic => {
+            let quic_client = crate::quic::client::ClientActorHndler::new(
+                host.to_string(),
+                port,
+                ca_path.map(std::path::PathBuf::from),
+                password.to_vec(),
+                quic_tuning.clone(),
+            )
+            .await?;
+            Ok(TunnelConnector::Quic(crate::connector::QuicConnector::new(
+                quic_client,
+            )))
+        }
+        crate::config::Protocol::Kcp => {
+            let c = crate::kcp::connector::KcpConnector::new(
+                host.to_string(),
+                port,
+                ca_path.map(std::path::PathBuf::from),
+                password.to_vec(),
+                tls,
+                kcp_tuning.clone(),
+            )?;
+            c.prewarm();
+            Ok(TunnelConnector::Kcp(c))
+        }
+        crate::config::Protocol::Tcp => {
+            let c = crate::tcp::connector::TcpConnector::new(
+                host,
+                port,
+                ca_path.map(std::path::PathBuf::from),
+                password.to_vec(),
+                tls,
+            )?;
+            Ok(TunnelConnector::Tcp(c))
+        }
+    }
+}
 
 /// Spawn one health-probe task per group (immediate probe, then on
 /// `interval`). Servers not referenced by any group are never probed

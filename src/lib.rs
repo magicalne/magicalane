@@ -19,6 +19,7 @@ pub(crate) mod proxy;
 pub mod quic;
 pub mod routing;
 pub mod socks5;
+pub mod status;
 pub mod tcp;
 pub mod tproxy;
 #[cfg(feature = "tun-mode")]

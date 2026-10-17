@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use lib::config::{Config, Kind, Protocol};
-use lib::kcp::connector::KcpConnector;
-use lib::{connector, generate_key_and_cert_pem};
+
+use lib::generate_key_and_cert_pem;
 use std::net::ToSocketAddrs;
 use structopt::StructOpt;
 
@@ -33,7 +33,36 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
     let server_dns = config.dns;
     let kind = config.kind;
     let tuning = config.tuning.clone().unwrap_or_default();
-    env_logger::init();
+    let status_cfg = config.status;
+    // Logger: when the status page is on (client kind), fan INFO+ log
+    // lines into its event ring; otherwise plain env_logger. Built
+    // explicitly (never env_logger::init) so a second initialization
+    // (test binaries) degrades to "ring capture off" instead of
+    // panicking.
+    let status_ring = match &status_cfg {
+        Some(sc) => {
+            let ring = std::sync::Arc::new(lib::status::EventRing::with_cap(300));
+            let inner = env_logger::Builder::from_default_env().build();
+            let lvl = inner.filter();
+            let logger = Box::new(lib::status::RingLogger {
+                inner,
+                ring: ring.clone(),
+            });
+            if log::set_boxed_logger(logger).is_ok() {
+                // At least Info so the ring sees failover/reconnect lines;
+                // env_logger's own filter still gates stderr output.
+                log::set_max_level(lvl.max(log::LevelFilter::Info));
+            } else {
+                log::warn!("status: logger already set; ring capture disabled");
+            }
+            let _ = sc; // presence is the switch; details used below
+            Some(ring)
+        }
+        None => {
+            env_logger::init();
+            None
+        }
+    };
     install_crypto_provider();
 
     // Teardown stale tproxy rules BEFORE any network activity (F1 fix):
@@ -146,60 +175,9 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
             let kcp_tuning = tuning.kcp.clone();
             let quic_tuning = tuning.quic.clone();
 
-            // Build one connector per server (mixed transports allowed).
-            #[allow(clippy::too_many_arguments)]
-            async fn build_connector(
-                host: &str,
-                port: u16,
-                protocol: &str,
-                ca_path: Option<String>,
-                tls: bool,
-                password: &[u8],
-                kcp_tuning: &Option<lib::config::KcpTuning>,
-                quic_tuning: &Option<lib::config::QuicTuning>,
-            ) -> Result<lib::tunnel::TunnelConnector> {
-                match lib::config::Protocol::from_opt(&Some(protocol.to_string()))
-                    .unwrap_or(lib::config::Protocol::Quic)
-                {
-                    lib::config::Protocol::Quic => {
-                        let quic_client = lib::quic::client::ClientActorHndler::new(
-                            host.to_string(),
-                            port,
-                            ca_path.map(std::path::PathBuf::from),
-                            password.to_vec(),
-                            quic_tuning.clone(),
-                        )
-                        .await?;
-                        Ok(lib::tunnel::TunnelConnector::Quic(
-                            connector::QuicConnector::new(quic_client),
-                        ))
-                    }
-                    lib::config::Protocol::Kcp => {
-                        let c = KcpConnector::new(
-                            host.to_string(),
-                            port,
-                            ca_path.map(std::path::PathBuf::from),
-                            password.to_vec(),
-                            tls,
-                            kcp_tuning.clone(),
-                        )?;
-                        c.prewarm();
-                        Ok(lib::tunnel::TunnelConnector::Kcp(c))
-                    }
-                    lib::config::Protocol::Tcp => {
-                        let c = lib::tcp::connector::TcpConnector::new(
-                            host,
-                            port,
-                            ca_path.map(std::path::PathBuf::from),
-                            password.to_vec(),
-                            tls,
-                        )?;
-                        Ok(lib::tunnel::TunnelConnector::Tcp(c))
-                    }
-                }
-            }
-
-            let primary = build_connector(
+            // One connector per server (mixed transports allowed);
+            // shared with the status-page probe matrix.
+            let primary = lib::tunnel::build_connector(
                 &proxy.host,
                 proxy.port,
                 proxy.protocol.as_deref().unwrap_or("quic"),
@@ -213,7 +191,7 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
             let mut entries: Vec<(std::sync::Arc<str>, lib::tunnel::TunnelConnector)> =
                 vec![(std::sync::Arc::from("default"), primary)];
             for s in &extra_servers {
-                let c = build_connector(
+                let c = lib::tunnel::build_connector(
                     &s.host,
                     s.port,
                     s.protocol.as_deref().unwrap_or("quic"),
@@ -239,6 +217,38 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
             pool.log_layout();
             // Health-probe task for groups (url-test / fallback / lb).
             lib::tunnel::spawn_probes(pool.clone());
+
+            // Live status page (read-only diagnostics; never fatal).
+            if let Some(sc) = status_cfg.clone() {
+                let listeners = lib::status::describe_listeners(
+                    socks5_port,
+                    bind.as_deref(),
+                    allow_lan.unwrap_or(false),
+                    &tproxy_cfg,
+                );
+                let info = lib::status::InstanceInfo {
+                    version: env!("CARGO_PKG_VERSION"),
+                    pid: std::process::id(),
+                    config_path: config_path.clone().unwrap_or_default(),
+                    listeners,
+                };
+                let res = lib::status::spawn(
+                    sc,
+                    &pool,
+                    info,
+                    password.as_bytes(),
+                    proxy.ca_path.as_deref(),
+                    tuning.kcp.clone(),
+                    tuning.quic.clone(),
+                    status_ring.unwrap_or_else(|| {
+                        std::sync::Arc::new(lib::status::EventRing::with_cap(300))
+                    }),
+                )
+                .await;
+                if let Err(e) = res {
+                    log::error!("status page failed to start (continuing): {e}");
+                }
+            }
 
             // All server IPs need interception exceptions (primary +
             // extras): resolve pins first, hosts via system DNS (still

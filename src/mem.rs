@@ -62,22 +62,33 @@ pub fn start_hygiene_loop() {
         log::debug!("mem: periodic trim disabled (MAGICALANE_MEM_TRIM_SECS=0)");
         return;
     }
-    log::info!("mem: periodic malloc_trim every {interval:?}");
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(interval).await;
-            let r = tokio::task::spawn_blocking(|| unsafe {
-                // 0 = release as much as possible at every arena top.
-                libc::malloc_trim(0)
-            })
-            .await;
-            match r {
-                Ok(rc) if rc != 0 => {}
-                Ok(_) => log::trace!("mem: malloc_trim returned 0 (nothing to release)"),
-                Err(e) => log::debug!("mem: trim task failed: {e}"),
+    #[cfg(not(target_os = "linux"))]
+    {
+        // glibc-specific facility; other allocators (macOS, BSDs)
+        // either trim eagerly or don't expose an equivalent.
+        let _ = interval;
+        log::debug!("mem: periodic trim not supported on this platform");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        log::info!("mem: periodic malloc_trim every {interval:?}");
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let r = tokio::task::spawn_blocking(|| unsafe {
+                    // 0 = release as much as possible at every arena top.
+                    libc::malloc_trim(0)
+                })
+                .await;
+                match r {
+                    Ok(rc) if rc != 0 => {}
+                    Ok(_) => log::trace!("mem: malloc_trim returned 0 (nothing to release)"),
+                    Err(e) => log::debug!("mem: trim task failed: {e}"),
+                }
             }
-        }
-    });
+        });
+    }
 }
 
 /// Apply the optional arena cap. Effective only if called before other

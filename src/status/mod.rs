@@ -841,8 +841,15 @@ mod tests {
         let mut cfg = cfg;
         cfg.target = vec![target];
         let pool = crate::tunnel::ProxyPool::single(crate::tunnel::TunnelConnector::Kcp(
-            crate::kcp::connector::KcpConnector::new("127.0.0.1".into(), 1, None, vec![], false, None)
-                .unwrap(),
+            crate::kcp::connector::KcpConnector::new(
+                "127.0.0.1".into(),
+                1,
+                None,
+                vec![],
+                false,
+                None,
+            )
+            .unwrap(),
         ));
         let info = InstanceInfo {
             version: "test",

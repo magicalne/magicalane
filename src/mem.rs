@@ -68,7 +68,6 @@ pub fn start_hygiene_loop() {
         // either trim eagerly or don't expose an equivalent.
         let _ = interval;
         log::debug!("mem: periodic trim not supported on this platform");
-        return;
     }
     #[cfg(target_os = "linux")]
     {

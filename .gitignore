@@ -10,3 +10,8 @@ env/.build/
 
 # benchmark results
 env/bench-results/
+
+# memory soak harness artifacts
+env/soak/
+env/soak-base*/
+env/soak-results/

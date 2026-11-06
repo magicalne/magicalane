@@ -85,7 +85,31 @@ where
     C: Connector<Connection = IO> + Send + 'static,
 {
     pub async fn run(&mut self) -> Result<()> {
+        // Debug counters (env MAGICALANE_DEBUG_COUNTERS=1): log
+        // accepted-connection total and live connections so teardown
+        // retention is visible from the outside (issue #29 tooling).
+        let counters = std::env::var("MAGICALANE_DEBUG_COUNTERS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if counters {
+            let endpoint = self.endpoint.clone();
+            spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    log::info!("counters: open_connections={}", endpoint.open_connections());
+                }
+            });
+        }
+        let mut accepted: u64 = 0;
         while let Some(incoming) = self.endpoint.accept().await {
+            accepted += 1;
+            if counters {
+                log::info!(
+                    "counters: accepted={accepted} open={}",
+                    self.endpoint.open_connections()
+                );
+            }
             let connector = self.connector.clone();
             let passwd = self.passwd.clone();
             let bandwidth = self.bandwidth;

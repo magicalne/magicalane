@@ -94,6 +94,14 @@ async fn start_with_config(config: Config, config_path: Option<String>) -> Resul
             protocol,
             tls,
         } => {
+            // Memory hygiene (issue #29): churn under multi-threaded load
+            // strands freed chunks in glibc arenas; trim them back
+            // periodically. The arena cap is best-effort here (worker
+            // threads already exist); the robust path is the
+            // MALLOC_ARENA_MAX env in the systemd unit (see
+            // docs/deploy-gateway.md).
+            lib::mem::apply_arena_cap();
+            lib::mem::start_hygiene_loop();
             // Layered resolver for server-side lookups: [dns] upstream
             // list (racing + failover) or every nameserver; answer cache.
             let upstreams: Vec<std::net::SocketAddr> = server_dns

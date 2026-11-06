@@ -83,3 +83,44 @@ Defaults (env-overridable): instance `magicalane-gw` at `192.168.2.90`
   require loose reverse-path filtering.
 - The container needs `iptables` installed (`create`/`verify` install
   it automatically) and NET_ADMIN (incus default capabilities suffice).
+
+## Server unit hardening (memory guard)
+
+The remote server has wedged in production after days-to-weeks of
+uptime (memory exhaustion → swap thrash → all transports stop
+accepting while the box still answers ICMP — issue #29). The root
+causes are fixed in the proxy itself (UDP/DNS flow teardown retention
++ periodic `malloc_trim`), but small instances should still ship with
+an explicit blast radius: never let one service take the box down.
+
+Recommended `/etc/systemd/system/magicalane-server.service.d/limits.conf`
+(adjust to the instance size; example for a 439 MB box):
+
+```ini
+[Service]
+# Soft limit: throttle allocation before the OOM killer wakes up.
+MemoryHigh=350M
+# Hard limit: kill and restart instead of swap-thrashing the box.
+MemoryMax=420M
+# Self-heal in seconds rather than wedging for days.
+Restart=always
+RestartSec=3
+# Cap glibc arenas on many-core hosts (bounded stranding; see #29).
+# 2-4 is plenty for a proxy; the trim timer does the rest.
+Environment=MALLOC_ARENA_MAX=2
+```
+
+Notes:
+
+- `magicalane-server.service` must already exist with
+  `ExecStart=/usr/local/bin/magicalane --config /etc/magicalane/server.toml`;
+  the drop-in only adds limits. `systemctl daemon-reload` after editing.
+- The proxy's own hygiene knobs (both optional, defaults sane):
+  `MAGICALANE_MEM_TRIM_SECS` (periodic `malloc_trim`, default 60, `0`
+  disables) and `MAGICALANE_MALLOC_ARENA_MAX` (runtime `mallopt` cap).
+- `MemoryMax` beats swap death: a restart costs one TLS handshake, a
+  wedged box costs the incident. Verify with
+  `systemctl show magicalane-server -p MemoryHigh,MemoryMax,Restart`.
+- To watch retention live under churn, see `env/soak.sh` (issue #29
+  harness) and `MAGICALANE_DEBUG_COUNTERS=1` (logs accepted/live QUIC
+  connections).

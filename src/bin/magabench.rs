@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::Rng;
+use rand::{Rng, thread_rng};
 use structopt::StructOpt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -34,6 +34,10 @@ use tokio::{
 };
 
 const CHUNK: usize = 64 * 1024;
+
+/// A closed port on loopback: targets that must fail server-side
+/// connect (error-path teardown churn).
+const UNREACHABLE_TARGET: &str = "127.0.0.1:1";
 
 #[derive(StructOpt)]
 #[structopt(name = "magabench", about = "magicalane transport benchmark")]
@@ -56,6 +60,52 @@ enum Cmd {
         /// UDP echo port (0 = off).
         #[structopt(long, default_value = "9002")]
         udp: u16,
+    },
+    /// Churn driver: open fresh proxied connections, do one tiny
+    /// request, drop; repeat. Samples a target pid's RSS / fd / thread
+    /// count per batch. Memory-leak repro harness for the server
+    /// binary (issue #29).
+    Churn {
+        #[structopt(long, default_value = "127.0.0.1:1080")]
+        socks: String,
+        #[structopt(long, default_value = "127.0.0.1:9807")]
+        target: String,
+        /// Batches (one RSS sample after each).
+        #[structopt(long, default_value = "10")]
+        batches: usize,
+        /// socks5 connections per batch.
+        #[structopt(long, default_value = "500")]
+        batch_size: usize,
+        /// Parallel in-flight connections (1 = serial).
+        #[structopt(long, default_value = "1")]
+        concurrency: usize,
+        #[structopt(long, default_value = "64")]
+        ping_bytes: usize,
+        /// Seconds to let teardown settle before sampling.
+        #[structopt(long = "settle", default_value = "2")]
+        settle_secs: u64,
+        /// Server pid to sample (RSS / fd / threads) after each batch.
+        #[structopt(long)]
+        sample_pid: Option<u32>,
+        /// Fraction of iterations dropped right after CONNECT succeeds
+        /// (abandoned-relay teardown churn), 0.0-1.0.
+        #[structopt(long = "abandon", default_value = "0.0")]
+        abandon_rate: f64,
+        /// Fraction of iterations aimed at a closed port (server-side
+        /// open-remote failure churn), 0.0-1.0.
+        #[structopt(long = "unreachable", default_value = "0.0")]
+        unreachable_rate: f64,
+        /// Target is the server-side UDP magic relay (magicalane-udp):
+        /// each iteration writes a valid [dst][datagram] frame pair
+        /// instead of a framed ping (exercises UdpFramedStream churn).
+        #[structopt(long)]
+        udp_magic: bool,
+        /// Target is the server-side DNS magic relay (magicalane-dns):
+        /// each iteration writes one raw DNS query and reads the reply.
+        #[structopt(long)]
+        dns_magic: bool,
+        #[structopt(long)]
+        pairs: bool,
     },
     /// Drive the benchmark through the socks5 client.
     Run {
@@ -103,6 +153,38 @@ fn main() -> anyhow::Result<()> {
         match cmd {
             Cmd::Echo { listen } => echo_server(&listen).await,
             Cmd::Serve { http, tcp, udp } => serve(http, tcp, udp).await,
+            Cmd::Churn {
+                socks,
+                target,
+                batches,
+                batch_size,
+                concurrency,
+                ping_bytes,
+                settle_secs,
+                sample_pid,
+                abandon_rate,
+                unreachable_rate,
+                udp_magic,
+                dns_magic,
+                pairs,
+            } => {
+                churn(
+                    &socks,
+                    &target,
+                    batches,
+                    batch_size,
+                    concurrency,
+                    ping_bytes,
+                    settle_secs,
+                    sample_pid,
+                    abandon_rate,
+                    unreachable_rate,
+                    udp_magic,
+                    dns_magic,
+                    pairs,
+                )
+                .await
+            }
             Cmd::Run {
                 socks,
                 target,
@@ -686,4 +768,274 @@ fn pct(v: &[f64], p: f64) -> f64 {
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let idx = ((s.len() as f64 - 1.0) * p).round() as usize;
     s[idx.min(s.len() - 1)]
+}
+
+// ---------------------------------------------------------------- churn
+
+/// One /proc sample of the measured process.
+#[derive(Clone, Copy, Default)]
+struct ProcSample {
+    rss_kb: f64,
+    fd: usize,
+    threads: usize,
+}
+
+fn sample_proc(pid: u32) -> Option<ProcSample> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut rss_kb = None;
+    let mut threads = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok());
+        } else if let Some(rest) = line.strip_prefix("Threads:") {
+            threads = rest.trim().parse::<usize>().ok();
+        }
+    }
+    let fd = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    Some(ProcSample {
+        rss_kb: rss_kb?,
+        fd,
+        threads: threads?,
+    })
+}
+
+/// One churn iteration: socks5 CONNECT (+ optional ping) and drop.
+/// Returns true when the iteration completed without driver-side error.
+#[allow(clippy::too_many_arguments)]
+async fn churn_one(
+    socks: &str,
+    target: &str,
+    ping_bytes: usize,
+    abandon: bool,
+    udp_magic: bool,
+    dns_magic: bool,
+) -> bool {
+    let conn = socks_connect(socks, target).await;
+    let mut s = match conn {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if udp_magic {
+        // Wire format of the server-side UDP relay (src/udp/mod.rs):
+        // [u16 dst-len]["ip:port"][u16 dg-len][datagram], then replies.
+        // TEST-NET-3 unicast (never routable; the relay just times out).
+        const DST: &[u8] = b"198.180.14.3:53";
+        let mut hello = Vec::with_capacity(2 + DST.len() + 2 + 4);
+        hello.extend_from_slice(&(DST.len() as u16).to_be_bytes());
+        hello.extend_from_slice(DST);
+        hello.extend_from_slice(&(4u16).to_be_bytes());
+        hello.extend_from_slice(b"MGL!");
+        let ok = s.write_all(&hello).await.is_ok();
+        let _ = s.flush().await;
+        return ok;
+    }
+    if dns_magic {
+        // One raw DNS A query for churn.invalid (id 0x1234).
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["churn", "invalid"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        if s.write_all(&q).await.is_err() {
+            return false;
+        }
+        let _ = s.flush().await;
+        let mut resp = [0u8; 512];
+        return matches!(tokio::time::timeout(
+            Duration::from_secs(5),
+            s.read(&mut resp)
+        ).await, Ok(Ok(n)) if n > 0);
+    }
+    if abandon {
+        return true; // drop right after CONNECT succeeds
+    }
+    let mut scratch = vec![0u8; ping_bytes];
+    thread_rng().fill(scratch.as_mut_slice());
+    scratch[0] = 0x01;
+    let ok = matches!(write_frame(&mut s, &scratch).await, Ok(()));
+    ok && matches!(read_frame(&mut s).await, Ok(f) if f.len() == ping_bytes)
+}
+
+/// Least-squares slope of `ys` over batch index; skips the first
+/// `skip` points (warmup). Returns (slope_per_batch, r_squared).
+fn slope(ys: &[f64], skip: usize) -> (f64, f64) {
+    let pts: Vec<(f64, f64)> = ys
+        .iter()
+        .enumerate()
+        .skip(skip)
+        .map(|(i, y)| (i as f64, *y))
+        .collect();
+    if pts.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let n = pts.len() as f64;
+    let mx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (x, y) in &pts {
+        num += (x - mx) * (y - my);
+        den += (x - mx) * (x - mx);
+    }
+    if den == 0.0 {
+        return (0.0, 0.0);
+    }
+    let slope = num / den;
+    let ss_tot: f64 = pts.iter().map(|(_, y)| (y - my) * (y - my)).sum();
+    let ss_res: f64 = pts
+        .iter()
+        .map(|(x, y)| {
+            let e = y - (my + slope * (x - mx));
+            e * e
+        })
+        .sum();
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        1.0
+    };
+    (slope, r2)
+}
+
+/// Run churn batches and sample the server process after each. Emits
+/// one `batch=` line per batch (pairs mode) plus a final summary.
+#[allow(clippy::too_many_arguments)]
+async fn churn(
+    socks: &str,
+    target: &str,
+    batches: usize,
+    batch_size: usize,
+    concurrency: usize,
+    ping_bytes: usize,
+    settle_secs: u64,
+    sample_pid: Option<u32>,
+    abandon_rate: f64,
+    unreachable_rate: f64,
+    udp_magic: bool,
+    dns_magic: bool,
+    pairs: bool,
+) -> anyhow::Result<()> {
+    let mut rss_series: Vec<f64> = Vec::new();
+    let mut fd_series: Vec<usize> = Vec::new();
+    let mut thr_series: Vec<usize> = Vec::new();
+    let mut ok_total = 0usize;
+    let mut err_total = 0usize;
+
+    let workers = concurrency.max(1);
+    let per_worker = batch_size.div_ceil(workers);
+
+    for b in 0..batches {
+        let t0 = Instant::now();
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let socks = socks.to_string();
+            let target = target.to_string();
+            handles.push(tokio::spawn(async move {
+                let mut ok = 0usize;
+                let mut err = 0usize;
+                for _ in 0..per_worker {
+                    let (unreachable, abandon) = {
+                        let mut rng = thread_rng();
+                        (
+                            rng.gen_bool(unreachable_rate.clamp(0.0, 1.0)),
+                            rng.gen_bool(abandon_rate.clamp(0.0, 1.0)) && !udp_magic && !dns_magic,
+                        )
+                    };
+                    let tgt = if unreachable {
+                        UNREACHABLE_TARGET
+                    } else {
+                        &target
+                    };
+                    if churn_one(&socks, tgt, ping_bytes, abandon, udp_magic, dns_magic).await {
+                        ok += 1;
+                    } else {
+                        err += 1;
+                    }
+                }
+                (ok, err)
+            }));
+        }
+        for h in handles {
+            let (ok, err) = h.await?;
+            ok_total += ok;
+            err_total += err;
+        }
+        if settle_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(settle_secs)).await;
+        }
+        let sample = sample_pid.and_then(sample_proc);
+        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if let Some(s) = sample {
+            rss_series.push(s.rss_kb);
+            fd_series.push(s.fd);
+            thr_series.push(s.threads);
+            if pairs {
+                println!(
+                    "batch={} rss_kb={:.0} fd={} thr={} ok={} err={} wall_ms={:.0}",
+                    b, s.rss_kb, s.fd, s.threads, ok_total, err_total, wall_ms
+                );
+            } else {
+                eprintln!(
+                    "batch {} done: rss={:.1}MB fd={} thr={} ok={} err={} ({:.0}ms)",
+                    b,
+                    s.rss_kb / 1024.0,
+                    s.fd,
+                    s.threads,
+                    ok_total,
+                    err_total,
+                    wall_ms
+                );
+            }
+        } else {
+            eprintln!(
+                "batch {} done: ok={} err={} ({:.0}ms) [no sample]",
+                b, ok_total, err_total, wall_ms
+            );
+        }
+    }
+
+    if let Some(_pid) = sample_pid {
+        // Warmup: skip the first 2 batches (allocator ramp, pools).
+        let (rss_slope, r2) = slope(&rss_series, 2);
+        let mb_per_batch = rss_slope / 1024.0;
+        // Assume the natural cadence of the harness for the summary;
+        // the soak script computes MB/h from real wall time.
+        if pairs {
+            println!("summary_rss_mb_per_batch={:.4}", mb_per_batch);
+            println!("summary_rss_r2={:.3}", r2);
+            if let Some(first) = rss_series.first() {
+                println!("summary_rss_first_kb={:.0}", first);
+            }
+            if let Some(last) = rss_series.last() {
+                println!("summary_rss_last_kb={:.0}", last);
+            }
+            if let (Some(f), Some(l)) = (fd_series.first(), fd_series.last()) {
+                println!("summary_fd_first={}", f);
+                println!("summary_fd_last={}", l);
+            }
+            if let (Some(f), Some(l)) = (thr_series.first(), thr_series.last()) {
+                println!("summary_thr_first={}", f);
+                println!("summary_thr_last={}", l);
+            }
+        } else {
+            println!(
+                "rss slope: {:.3} MB/batch (r2={:.3}); fd {}->{}; thr {}->{}",
+                mb_per_batch,
+                r2,
+                fd_series.first().unwrap_or(&0),
+                fd_series.last().unwrap_or(&0),
+                thr_series.first().unwrap_or(&0),
+                thr_series.last().unwrap_or(&0),
+            );
+        }
+    }
+    Ok(())
 }

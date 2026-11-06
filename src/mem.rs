@@ -93,15 +93,21 @@ pub fn start_hygiene_loop() {
 /// Apply the optional arena cap. Effective only if called before other
 /// arenas exist (i.e. first thing in main). No-op where unsupported.
 pub fn apply_arena_cap() {
-    if let Some(n) = arena_max() {
+    if let Some(_n) = arena_max() {
         #[cfg(target_os = "linux")]
         {
+            let n = _n;
             let rc = unsafe { libc::mallopt(M_ARENA_MAX, n) };
             if rc == 0 {
                 log::warn!("mem: mallopt(M_ARENA_MAX, {n}) failed");
             } else {
                 log::info!("mem: glibc arena count capped at {n}");
             }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // arena_max() only returns Some on linux; unreachable guard
+            // kept so the binding is used on every platform.
         }
     }
 }

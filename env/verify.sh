@@ -114,7 +114,7 @@ fail_dump() {
         # timeout: `podman logs` on a container that does not exist in
         # this profile hangs indefinitely on some podman versions — a
         # failing test must not wedge the whole suite.
-        timeout 5 $CE logs --tail 8 "$c" 2>/dev/null | sed "s/^/  [$c] /" >&2
+        timeout -k 2 5 $CE logs --tail 8 "$c" 2>/dev/null | sed "s/^/  [$c] /" >&2
     done
     echo "  --- end diagnostics ---" >&2
 }

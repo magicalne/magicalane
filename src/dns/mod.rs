@@ -395,6 +395,9 @@ pub struct DnsRelayStream {
     pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
     /// Failover list (sequential, short timeout each).
     upstreams: Vec<SocketAddr>,
+    /// Shutdown signaled by the relay: after buffered bytes drain,
+    /// poll_read reports EOF instead of parking forever.
+    shutdown: bool,
 }
 
 impl DnsRelayStream {
@@ -408,6 +411,7 @@ impl DnsRelayStream {
             } else {
                 upstreams
             },
+            shutdown: false,
         }
     }
 
@@ -459,6 +463,17 @@ impl Default for DnsRelayStream {
     }
 }
 
+impl Drop for DnsRelayStream {
+    fn drop(&mut self) {
+        // Same teardown discipline as UdpFramedStream: an in-flight
+        // upstream exchange (up to 2s per failover upstream) must not
+        // outlive the relay that owned it (issue #29).
+        if let Some(handle) = self.pending.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl tokio::io::AsyncRead for DnsRelayStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -493,7 +508,14 @@ impl tokio::io::AsyncRead for DnsRelayStream {
                         std::task::Poll::Pending => return Poll::Pending,
                     }
                 }
-                None => return Poll::Pending,
+                None => {
+                    if self.shutdown {
+                        // Shutdown + everything delivered: EOF lets the
+                        // relay complete (issue #29).
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -530,6 +552,16 @@ impl tokio::io::AsyncWrite for DnsRelayStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // The tunnel side is done (client gone / relay closing). Abort the
+        // in-flight upstream exchange so the relay future can complete now
+        // instead of waiting out the per-upstream timeouts holding an fd
+        // (issue #29). Remaining buffered response bytes still drain via
+        // poll_read before it reports EOF.
+        this.shutdown = true;
+        if let Some(handle) = this.pending.take() {
+            handle.abort();
+        }
         Poll::Ready(Ok(()))
     }
 }

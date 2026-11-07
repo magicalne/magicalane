@@ -111,7 +111,10 @@ ensure_env() { # transport tproxy(0|1) [ipv6(0|1)]
 fail_dump() {
     echo "  --- diagnostics ---" >&2
     for c in magicalane-client magicalane-server magicalane-tproxy-client; do
-        $CE logs --tail 8 "$c" 2>/dev/null | sed "s/^/  [$c] /" >&2
+        # timeout: `podman logs` on a container that does not exist in
+        # this profile hangs indefinitely on some podman versions — a
+        # failing test must not wedge the whole suite.
+        timeout 5 $CE logs --tail 8 "$c" 2>/dev/null | sed "s/^/  [$c] /" >&2
     done
     echo "  --- end diagnostics ---" >&2
 }
@@ -150,6 +153,7 @@ run_test() { # file transport|any
 COUNT=0
 FAILED=0
 START=$(date +%s)
+declare -A RAN_ANY=()
 
 declare -a phase1=() phase2=() phase3=() phase4=()
 for f in "${TESTS[@]}"; do
@@ -183,6 +187,10 @@ run_phase() { # file-array-name transport_label mode
             run_test "$f" "any"
         elif has_token "$transports" "$2"; then
             run_test "$f" "$2"
+        elif has_token "$transports" any && [ -z "${RAN_ANY[$f]:-}" ]; then
+            # transport-agnostic test: run once (phase 1), not per phase
+            RAN_ANY["$f"]=1
+            run_test "$f" "any"
         fi
     done
 }

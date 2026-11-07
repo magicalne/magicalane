@@ -867,6 +867,9 @@ pub struct UdpFramedStream {
     read_pending: Option<tokio::task::JoinHandle<io::Result<Vec<u8>>>>,
     /// Domain dst being resolved (fake-IP flows carry domains).
     pending_resolve: Option<tokio::task::JoinHandle<io::Result<SocketAddr>>>,
+    /// Shutdown signaled by the relay: aborts in-flight reads; after
+    /// buffered bytes drain, poll_read reports EOF.
+    shutdown: bool,
 }
 
 impl UdpFramedStream {
@@ -879,6 +882,7 @@ impl UdpFramedStream {
             outq: Vec::new(),
             read_pending: None,
             pending_resolve: None,
+            shutdown: false,
         }
     }
 
@@ -947,6 +951,23 @@ impl Default for UdpFramedStream {
     }
 }
 
+impl Drop for UdpFramedStream {
+    fn drop(&mut self) {
+        // The relay drops this stream as soon as the tunnel side closes;
+        // without aborting, the spawned recv task keeps the socket (fd)
+        // and its 64KiB buffer alive for the full FLOW_IDLE timeout —
+        // 60s of pinned fd + memory per departed flow. Under flow churn
+        // that pins rate x 60s fds/MBs (production fd exhaustion /
+        // memory wedge, issue #29). Abort = immediate teardown.
+        if let Some(handle) = self.read_pending.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.pending_resolve.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl UdpFramedStream {
     /// Try to push queued upstream datagrams out; returns Ok(true) if all
     /// sent, Ok(false) if the socket is currently full.
@@ -1003,6 +1024,11 @@ impl AsyncRead for UdpFramedStream {
                 let n = self.rbuf.remaining().min(buf.remaining());
                 let data = self.rbuf.split_to(n);
                 buf.put_slice(&data);
+                return Poll::Ready(Ok(()));
+            }
+            if self.shutdown {
+                // Shutdown + everything delivered: EOF lets the relay
+                // complete instead of parking on a fresh recv (issue #29).
                 return Poll::Ready(Ok(()));
             }
             if self.read_pending.is_none() {
@@ -1079,6 +1105,20 @@ impl AsyncWrite for UdpFramedStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // The tunnel side is done (client gone / relay closing). Abort the
+        // in-flight recv: otherwise it holds the socket (fd) + 64KiB
+        // buffer for the full FLOW_IDLE timeout after the flow's client
+        // departed — under churn that pinned fds and memory at rate x 60s
+        // (production wedge, issue #29). Buffered response bytes still
+        // drain via poll_read before it reports EOF.
+        this.shutdown = true;
+        if let Some(handle) = this.read_pending.take() {
+            handle.abort();
+        }
+        if let Some(handle) = this.pending_resolve.take() {
+            handle.abort();
+        }
         Poll::Ready(Ok(()))
     }
 }

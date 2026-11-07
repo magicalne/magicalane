@@ -15,6 +15,7 @@ pub mod error;
 pub mod httpfetch;
 pub mod httpin;
 pub mod kcp;
+pub mod mem;
 pub(crate) mod proxy;
 pub mod quic;
 pub mod routing;

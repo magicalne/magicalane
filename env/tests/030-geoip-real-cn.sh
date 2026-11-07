@@ -5,6 +5,7 @@
 # connections to two REAL internet IPs by literal address:
 #   223.5.5.5 (AliDNS, China)  -> must route DIRECT (client egress)
 #   8.8.8.8   (Google, non-CN) -> must route through the TUNNEL
+# (port 443: tcp/53 is now claimed by the DNS-over-TCP interceptor)
 # Classification is asserted from the client's relay log; the full live
 # list exercises the interval engine at real scale (~9.6k CIDRs).
 # Falls back to the committed real-data snapshot if the download fails.
@@ -49,7 +50,7 @@ import socket
 out = []
 for ip in ["223.5.5.5", "8.8.8.8"]:
     try:
-        s = socket.create_connection((ip, 53), timeout=8)
+        s = socket.create_connection((ip, 443), timeout=8)
         s.close()
         out.append(ip + ":connected")
     except Exception as e:
@@ -59,13 +60,13 @@ print(" ".join(out))
 
 ws_stop
 
-cn_route="$(exec_c sh -c 'grep -a "tproxy relay 223.5.5.5:53: " /tmp/ws.log | grep -a "via" | tail -1')"
+cn_route="$(exec_c sh -c 'grep -a "tproxy relay 223.5.5.5:443: " /tmp/ws.log | grep -a "via" | tail -1')"
 case "$cn_route" in
     *"direct via"*) pass "geoip CN: 223.5.5.5 (AliDNS) routed DIRECT by real china list" ;;
     *"tunnel via"*) fail "geoip CN: 223.5.5.5 was tunneled, not direct" ;;
     *) fail "geoip CN: no relay log for 223.5.5.5 ($result)" ;;
 esac
-gl_route="$(exec_c sh -c 'grep -a "tproxy relay 8.8.8.8:53: " /tmp/ws.log | grep -a "via" | tail -1')"
+gl_route="$(exec_c sh -c 'grep -a "tproxy relay 8.8.8.8:443: " /tmp/ws.log | grep -a "via" | tail -1')"
 case "$gl_route" in
     *"tunnel via"*) pass "geoip non-CN: 8.8.8.8 routed through tunnel" ;;
     *"direct via"*) fail "geoip non-CN: 8.8.8.8 was routed direct" ;;

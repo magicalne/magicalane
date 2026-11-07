@@ -8,9 +8,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        dnsutils \
         iperf3 \
         iproute2 \
         iptables \
+        iputils-ping \
         nftables \
         procps \
         python3 \

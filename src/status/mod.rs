@@ -893,6 +893,7 @@ mod tests {
             dns_port: Some(15353),
             dns_mode: Some("fakeip".into()),
             gateway: Some(true),
+            bypass_router: None,
         };
         let l = describe_listeners(1080, None, true, &tproxy);
         assert!(l.iter().any(|s| s.contains("socks5+http :1080 (lan)")));

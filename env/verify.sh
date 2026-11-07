@@ -114,7 +114,10 @@ fail_dump() {
         # timeout: `podman logs` on a container that does not exist in
         # this profile hangs indefinitely on some podman versions — a
         # failing test must not wedge the whole suite.
-        timeout 5 $CE logs --tail 8 "$c" 2>/dev/null | sed "s/^/  [$c] /" >&2
+        # `|| true`: errexit is ON here (run_test re-enables it); a wedged
+        # podman killed by timeout(1) exits 125 and would kill the whole
+        # suite mid-diagnostics.
+        { timeout -k 2 5 $CE logs --tail 8 "$c" 2>/dev/null | sed "s/^/  [$c] /" >&2 || true; }
     done
     echo "  --- end diagnostics ---" >&2
 }

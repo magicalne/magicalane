@@ -266,6 +266,14 @@ pub struct TransparentProxyConfig {
     /// single-NIC gateways rely on the source-address exemption since
     /// server responses share the LAN interface.
     pub gateway: Option<bool>,
+    /// Bypass-router mode (default `false`, implies `gateway = true`):
+    /// make the gateway usable as a LAN device's DEFAULT ROUTE and DNS
+    /// server ("one-box bypass router"): enables IPv4 forwarding, a
+    /// FORWARD accept rule and POSTROUTING MASQUERADE for traffic the
+    /// transparent plane does not intercept (ICMP, other IP protocols),
+    /// plus DNS-over-TCP on dns_port (udp/53 AND tcp/53 redirected).
+    /// IPv4 plane only; the v6 plane keeps its own behavior.
+    pub bypass_router: Option<bool>,
     /// `"tunnel"` (default) — queries relayed through the tunnel;
     /// `"fakeip"` — answered locally with fake tokens (see src/dns/fakeip.rs);
     /// `"off"` — dns_port is ignored.
@@ -277,7 +285,15 @@ impl TransparentProxyConfig {
         self.mode.unwrap_or(TproxyMode::Off)
     }
     pub fn gateway(&self) -> bool {
-        self.gateway.unwrap_or(false)
+        // bypass_router implies gateway mode (field doc): a config with
+        // only `bypass_router = true` must get the full gateway story
+        // (PRINTEROUTING interception, wildcard DNS) plus the bypass
+        // extras — previously it silently installed neither.
+        self.gateway.unwrap_or(false) || self.bypass_router.unwrap_or(false)
+    }
+    /// Raw bypass-router flag (`gateway()` already includes it).
+    pub fn bypass_router(&self) -> bool {
+        self.bypass_router.unwrap_or(false)
     }
     pub fn dns_port(&self) -> u16 {
         self.dns_port.unwrap_or(0)
@@ -544,4 +560,42 @@ pub struct StatusTarget {
     /// TLS for kcp/tcp transports (default true).
     #[serde(default)]
     pub tls: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tproxy(toml: &str) -> TransparentProxyConfig {
+        let text = format!(
+            "password = \"x\"\nbandwidth = 65536\nverbose = true\nkind = {{ Client = {{ proxy = {{ host = \"h\", port = 4433 }}, socks5_port = 1080, tproxy = {{ tcp_port = 7895, udp_port = 7896, {toml} }} }} }}"
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        match cfg.kind {
+            Kind::Client { tproxy, .. } => tproxy,
+            _ => panic!("expected client"),
+        }
+    }
+
+    /// PR #20 review: `bypass_router = true` is documented to imply
+    /// gateway mode. Previously `bypass_router()` ANDed in `gateway()`,
+    /// so a config with only `bypass_router = true` silently enabled
+    /// NEITHER (no PREROUTING interception, loopback DNS, no
+    /// forwarding/MASQ) — contradicting the field documentation.
+    #[test]
+    fn bypass_router_implies_gateway() {
+        let t = tproxy("mode = \"tproxy\", bypass_router = true");
+        assert!(t.bypass_router(), "raw bypass flag");
+        assert!(t.gateway(), "bypass_router alone must imply gateway mode");
+
+        let t = tproxy("mode = \"tproxy\", gateway = true");
+        assert!(t.gateway());
+        assert!(!t.bypass_router(), "gateway alone does not imply bypass");
+
+        let t = tproxy("mode = \"tproxy\", gateway = true, bypass_router = true");
+        assert!(t.gateway() && t.bypass_router());
+
+        let t = tproxy("mode = \"tproxy\"");
+        assert!(!t.gateway() && !t.bypass_router());
+    }
 }
